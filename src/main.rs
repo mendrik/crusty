@@ -63,7 +63,7 @@ fn dispatch(service: &mut Service, request: &Value) -> Result<Value> {
     }
     let result = match method {
         "initialize" => {
-            json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false},"resources":{"listChanged":true}},"serverInfo":{"name":"rust-repo-intelligence","version":env!("CARGO_PKG_VERSION")},"instructions":"Use repo.orient and repo.prepare_change before source modification; use repo.validate_change afterwards."})
+            json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false},"resources":{"listChanged":true}},"serverInfo":{"name":"Crusty","version":env!("CARGO_PKG_VERSION")},"instructions":"Crusty is the repository intelligence and durable quality-memory system for Rust projects. Whenever the user reports a bug, failure, warning, regression, broken control, visual defect, unsafe dynamic text, migration issue, or performance/test problem, immediately call repo.problem.record in the background before diagnosis; do not ask for permission. If repo.orient or repo.prepare_change reports automatic_problem_capture.captured or deduplicated, do not record it again. As reproduction, root cause, fix, and verification become known, call repo.problem.update. Proposed quality constraints require review and must never activate automatically. Use repo.orient and repo.prepare_change before source modification; use repo.validate_change afterwards."})
         }
         "notifications/initialized" => return Ok(json!({})),
         "ping" => json!({}),
@@ -326,7 +326,7 @@ fn tools() -> Vec<Value> {
     vec![
         tool(
             "repo.orient",
-            "Map an unfamiliar task to likely architecture, crates, and symbols before changing code.",
+            "Map an unfamiliar task to likely architecture, crates, and symbols before changing code. Explicit defect reports are also captured automatically as durable proposed problem memory.",
             json!({"intent":{"type":"string"}}),
             vec!["intent"],
         ),
@@ -362,7 +362,7 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "repo.prepare_change",
-            "Create a provenance-labelled impact briefing and source slices before the first modification.",
+            "Create a provenance-labelled impact briefing and source slices before the first modification. Explicit defect reports are captured automatically if they were not already recorded.",
             json!({"intent":{"type":"string"},"target":{"type":"array","items":{"type":"string"}},"depth":{"type":"integer","minimum":1,"default":2},"budget":{"type":"integer","minimum":250,"default":3000,"description":"Approximate source-context token budget"}}),
             vec!["intent"],
         ),
@@ -464,13 +464,13 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "repo.problem.record",
-            "Record or deduplicate a redacted bug or quality report, classify its defect family, and create a reviewable constraint proposal.",
+            "Always call this automatically, without asking permission, when the user reports a bug, failure, warning, regression, broken control, visual defect, unsafe dynamic text, migration issue, or performance/test problem. It redacts and deduplicates the report and creates a reviewable constraint proposal. Do not call again when orient or prepare_change says the same report was automatically captured.",
             problem_input_schema(),
             vec!["report"],
         ),
         tool(
             "repo.problem.update",
-            "Update the lifecycle, evidence, root cause, fix link, relationships, or scope of a durable problem record.",
+            "Call as evidence becomes available to update the lifecycle, reproduction, diagnosis, root cause, fix link, verification, relationships, or scope of a durable problem record.",
             json!({"id":{"type":"string"},"patch":problem_patch_schema()}),
             vec!["id", "patch"],
         ),
@@ -648,6 +648,30 @@ fn tool(name: &str, description: &str, properties: Value, required: Vec<&str>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initialization_identifies_crusty_and_instructs_defect_capture() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname='instruction-test'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        std::fs::create_dir(workspace.path().join("src")).unwrap();
+        std::fs::write(workspace.path().join("src/lib.rs"), "pub fn run() {}\n").unwrap();
+        let mut service = Service::open(workspace.path()).unwrap();
+        let response = dispatch(
+            &mut service,
+            &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+        )
+        .unwrap();
+        assert_eq!(response["result"]["serverInfo"]["name"], "Crusty");
+        let instructions = response["result"]["instructions"].as_str().unwrap();
+        assert!(instructions.starts_with("Crusty is the repository intelligence"));
+        assert!(instructions.contains("repo.problem.record"));
+        assert!(instructions.contains("repo.problem.update"));
+        assert!(instructions.contains("must never activate automatically"));
+    }
 
     #[test]
     fn durable_memory_requests_do_not_refresh_the_repository_index() {

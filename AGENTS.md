@@ -1,4 +1,4 @@
-# Repository intelligence policy
+# Crusty repository intelligence policy
 
 Before recursively searching source code or modifying source files:
 

@@ -26,6 +26,12 @@ CREATE TABLE IF NOT EXISTS problem_occurrences(
     id INTEGER PRIMARY KEY, problem_id TEXT NOT NULL REFERENCES problem_records(id) ON DELETE CASCADE,
     report TEXT NOT NULL, evidence_json TEXT NOT NULL, revision TEXT NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS automatic_problem_captures(
+    report_fingerprint TEXT NOT NULL, revision TEXT NOT NULL,
+    problem_id TEXT NOT NULL REFERENCES problem_records(id) ON DELETE CASCADE,
+    source TEXT NOT NULL, created_at TEXT NOT NULL,
+    PRIMARY KEY(report_fingerprint,revision)
+);
 CREATE TABLE IF NOT EXISTS problem_links(
     problem_id TEXT NOT NULL REFERENCES problem_records(id) ON DELETE CASCADE,
     related_id TEXT NOT NULL REFERENCES problem_records(id) ON DELETE CASCADE,
@@ -303,6 +309,92 @@ pub(crate) fn append_search_index(db: &Connection) -> Result<()> {
 }
 
 impl Service {
+    pub(crate) fn automatic_problem_capture(&self, report: &str, source: &str) -> Result<Value> {
+        let Some((family, confidence, reason)) = automatic_capture_candidate(report) else {
+            return Ok(json!({
+                "captured": false,
+                "deduplicated": false,
+                "reason": "intent is not an explicit user-reported defect",
+                "source": source,
+            }));
+        };
+        let report = redact_text(report.trim());
+        let revision = self.revision().workspace_digest;
+        let report_fingerprint = format!(
+            "b3:{}",
+            blake3::hash(normalize_selector(&report).as_bytes()).to_hex()
+        );
+        if let Some(problem_id) = self
+            .db
+            .query_row(
+                "SELECT problem_id FROM automatic_problem_captures WHERE report_fingerprint=?1 AND revision=?2",
+                params![report_fingerprint, revision],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return Ok(json!({
+                "captured": false,
+                "deduplicated": true,
+                "reason": "this report was already captured for the current repository revision",
+                "source": source,
+                "problem": self.problem_resource(&problem_id)?,
+                "constraint": self.constraint_for_problem(&problem_id)?,
+            }));
+        }
+
+        // An agent may have obeyed the MCP instruction and called repo.problem.record
+        // before entering the normal orient/prepare workflow. Reuse that record rather
+        // than counting the same user report as a second occurrence.
+        let existing_problem = self
+            .db
+            .query_row(
+                "SELECT id FROM problem_records WHERE original_report=?1 AND revision=?2 AND status!='obsolete' ORDER BY sequence DESC LIMIT 1",
+                params![report, revision],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let recorded = if let Some(problem_id) = existing_problem {
+            json!({
+                "problem": self.problem_resource(&problem_id)?,
+                "constraint": self.constraint_for_problem(&problem_id)?,
+                "deduplicated": true,
+            })
+        } else {
+            self.problem_record(ProblemInput {
+                report: report.clone(),
+                summary: None,
+                defect_family: Some(family.clone()),
+                status: "reported".into(),
+                confidence,
+                scope: QualityScope::default(),
+                reproduction: None,
+                diagnostic_signature: None,
+                root_cause: None,
+                fix_reference: None,
+                evidence: Vec::new(),
+                related: Vec::new(),
+                provenance: format!("AutomaticProblemCapture:{source}"),
+            })?
+        };
+        let problem_id = recorded["problem"]["id"]
+            .as_str()
+            .context("automatic problem capture did not return a problem id")?;
+        self.db.execute(
+            "INSERT INTO automatic_problem_captures(report_fingerprint,revision,problem_id,source,created_at) VALUES (?1,?2,?3,?4,?5)",
+            params![report_fingerprint, revision, problem_id, source, Utc::now().to_rfc3339()],
+        )?;
+        Ok(json!({
+            "captured": true,
+            "deduplicated": recorded["deduplicated"],
+            "reason": reason,
+            "classification": {"family": family, "confidence": confidence},
+            "source": source,
+            "problem": recorded["problem"],
+            "constraint": recorded["constraint"],
+        }))
+    }
+
     pub fn problem_record(&self, mut input: ProblemInput) -> Result<Value> {
         ensure!(
             !input.report.trim().is_empty(),
@@ -1512,6 +1604,108 @@ fn classify_problem(text: &str) -> String {
     .into()
 }
 
+fn automatic_capture_candidate(text: &str) -> Option<(String, f64, &'static str)> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let lower = text.to_ascii_lowercase();
+    let discusses_memory = [
+        "ingest",
+        "record",
+        "remember",
+        "capture",
+        "category",
+        "conversation",
+        "memory",
+    ]
+    .iter()
+    .any(|word| lower.contains(word));
+    let discusses_automation = [
+        "automatic",
+        "automagical",
+        "automagically",
+        "while i report",
+        "when i report",
+        "does crusty",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase));
+    let mentions_defects = lower.contains("bug")
+        || lower.contains("problem")
+        || lower.contains("defect")
+        || lower.contains("issue");
+    if discusses_memory && discusses_automation && mentions_defects {
+        return None;
+    }
+
+    let strong_symptom = [
+        "does not work",
+        "doesn't work",
+        "not working",
+        "non-functional",
+        "is broken",
+        "are broken",
+        "stopped working",
+        "crash",
+        "panic",
+        "hangs",
+        "fails",
+        "failed",
+        "failure",
+        "regression",
+        "warning",
+        "critical",
+        "diagnostic",
+        "incorrect",
+        "wrong result",
+        "looks wrong",
+        "inconsistent",
+        "misaligned",
+        "too slow",
+        "too much padding",
+        "too little padding",
+        "interpreted as markup",
+        "renders as markup",
+        "throws an error",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase));
+    let explicit_defect = ["bug:", "issue:", "problem:", "defect:", "found a bug"]
+        .iter()
+        .any(|phrase| lower.contains(phrase));
+    let family = classify_problem(&lower);
+    let known_family = family != "uncategorized";
+    let feature_request = [
+        "add ",
+        "implement ",
+        "create ",
+        "support ",
+        "allow ",
+        "enable ",
+        "refactor ",
+        "document ",
+        "install ",
+        "build ",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix));
+    if feature_request && !strong_symptom {
+        return None;
+    }
+    if !(strong_symptom || explicit_defect) {
+        return None;
+    }
+    let confidence = if strong_symptom && known_family {
+        0.90
+    } else if strong_symptom || explicit_defect {
+        0.78
+    } else {
+        0.72
+    };
+    Some((family, confidence, "explicit defect signal detected"))
+}
+
 fn match_constraint(constraint: &Value, surface: &ChangeSurface) -> Value {
     let scope: QualityScope =
         serde_json::from_value(constraint["scope"].clone()).unwrap_or_default();
@@ -2093,6 +2287,107 @@ mod tests {
     }
 
     #[test]
+    fn normal_workflow_automatically_captures_a_bug_once_and_survives_restart() {
+        let directory = fixture();
+        {
+            let mut service = Service::open(directory.path()).unwrap();
+            service.refresh_if_stale().unwrap();
+            let report = "The compose button does not work";
+            let oriented = service.orient(report).unwrap();
+            assert_eq!(oriented["automatic_problem_capture"]["captured"], true);
+            assert_eq!(
+                oriented["automatic_problem_capture"]["problem"]["defect_family"],
+                "action_wiring"
+            );
+            assert_eq!(
+                oriented["automatic_problem_capture"]["constraint"]["status"],
+                "proposed"
+            );
+
+            let prepared = service
+                .prepare_change(report, &["data/window.ui".into()], 1, Some(1000))
+                .unwrap();
+            assert_eq!(prepared["automatic_problem_capture"]["deduplicated"], true);
+            assert_eq!(prepared["automatic_problem_capture"]["captured"], false);
+            let occurrences: i64 = service
+                .db
+                .query_row("SELECT COUNT(*) FROM problem_occurrences", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(occurrences, 1);
+        }
+
+        let service = Service::open(directory.path()).unwrap();
+        let problems: i64 = service
+            .db
+            .query_row("SELECT COUNT(*) FROM problem_records", [], |row| row.get(0))
+            .unwrap();
+        let proposed: i64 = service
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM quality_constraints WHERE status='proposed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(problems, 1);
+        assert_eq!(proposed, 1);
+    }
+
+    #[test]
+    fn automatic_capture_ignores_feature_requests_and_memory_meta_discussion() {
+        let directory = fixture();
+        let service = Service::open(directory.path()).unwrap();
+        for intent in [
+            "Add a compose button to the sidebar",
+            "The ingestion has to happen automagically while I report bugs",
+            "Implement durable bug category memory",
+            "Change the database migration retry policy",
+            "Review dynamic markup handling",
+        ] {
+            let capture = service.automatic_problem_capture(intent, "test").unwrap();
+            assert_eq!(capture["captured"], false, "unexpected capture: {intent}");
+        }
+        let problems: i64 = service
+            .db
+            .query_row("SELECT COUNT(*) FROM problem_records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(problems, 0);
+    }
+
+    #[test]
+    fn automatic_capture_reuses_an_explicit_record_from_the_same_revision() {
+        let directory = fixture();
+        let service = Service::open(directory.path()).unwrap();
+        let report = "Bug: the preferences window crashes";
+        let explicit = service
+            .problem_record(ProblemInput {
+                report: report.into(),
+                summary: None,
+                defect_family: None,
+                status: "reported".into(),
+                confidence: 0.8,
+                scope: QualityScope::default(),
+                reproduction: None,
+                diagnostic_signature: None,
+                root_cause: None,
+                fix_reference: None,
+                evidence: Vec::new(),
+                related: Vec::new(),
+                provenance: "HumanReport".into(),
+            })
+            .unwrap();
+        let captured = service
+            .automatic_problem_capture(report, "repo.orient")
+            .unwrap();
+        assert_eq!(captured["captured"], true);
+        assert_eq!(captured["deduplicated"], true);
+        assert_eq!(captured["problem"]["id"], explicit["problem"]["id"]);
+        assert_eq!(captured["problem"]["occurrences"], 1);
+    }
+
+    #[test]
     fn disabled_and_obsolete_constraints_never_queue() {
         let directory = fixture();
         let mut service = Service::open(directory.path()).unwrap();
@@ -2175,8 +2470,10 @@ mod tests {
             )
             .unwrap();
         let tables:i64=service.db.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='quality_constraints'",[],|row|row.get(0)).unwrap();
+        let capture_tables:i64=service.db.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='automatic_problem_captures'",[],|row|row.get(0)).unwrap();
         assert_eq!(decisions, 1);
         assert_eq!(tables, 1);
+        assert_eq!(capture_tables, 1);
     }
 
     #[test]

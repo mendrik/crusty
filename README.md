@@ -1,6 +1,6 @@
-# rust-repo-intelligence
+# Crusty
 
-`rust-repo-intelligence` is a local, read-mostly MCP server that gives coding agents evidence-backed, snapshot-aware intelligence about a Rust workspace. It maps repository concepts to source symbols, dependencies, decisions, history, tests, and documented work while keeping the evidence provenance visible.
+Crusty is a local, read-mostly MCP server that gives coding agents evidence-backed, snapshot-aware intelligence and durable project memory for Rust workspaces. It maps repository concepts to source symbols, dependencies, decisions, history, tests, and documented work while keeping the evidence provenance visible. The compatible Cargo package and executable remain named `rust-repo-intelligence`.
 
 The server is deliberately local: it reads the workspace, invokes Cargo and Git as needed, stores its rebuildable cache beside the workspace, and communicates with the MCP client over JSON-RPC on standard input/output. It does not require a hosted database or a project-specific agent integration.
 
@@ -89,6 +89,13 @@ cargo run -- --workspace /path/to/rust/workspace
 ```
 
 The service uses JSON-RPC over standard input/output. It writes its warm index and repository memory to `.rust-repo-intelligence/index.sqlite3` in the target workspace. SQLite runs in WAL mode with foreign keys enabled. The schema-v7 migration from v4-v6 is additive and preserves decisions, steerings, work items, and existing indexed state while creating the quality-memory tables. Incompatible schema resets remain an explicit emergency escape hatch. Add it to a Codex MCP configuration as a stdio command and follow the repository policy in `AGENTS.md`.
+
+Configure the MCP server under the name `Crusty` so Codex exposes the system by its canonical identity:
+
+```toml
+[mcp_servers.Crusty]
+command = "/absolute/path/to/rust-repo-intelligence"
+```
 
 For a local build:
 

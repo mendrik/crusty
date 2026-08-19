@@ -1845,6 +1845,7 @@ impl Service {
     }
 
     pub fn orient(&self, intent: &str) -> Result<Value> {
+        let automatic_problem_capture = self.automatic_problem_capture(intent, "repo.orient")?;
         let terms = terms(intent);
         let nodes = self.search_nodes(&terms, 12)?;
         let crates: Vec<String> = self
@@ -1858,7 +1859,7 @@ impl Service {
                     row.get(0)
                 })?;
         Ok(
-            json!({"intent":intent,"revision":self.revision(),"architecture":{"crates":crates,"resolved_cargo_dependency_edges":dependency_count,"likely_symbols":nodes,"index_status":self.index_status()},"next":"Call repo.prepare_change before modifying source."}),
+            json!({"intent":intent,"revision":self.revision(),"automatic_problem_capture":automatic_problem_capture,"architecture":{"crates":crates,"resolved_cargo_dependency_edges":dependency_count,"likely_symbols":nodes,"index_status":self.index_status()},"next":"Call repo.prepare_change before modifying source."}),
         )
     }
 
@@ -1869,6 +1870,8 @@ impl Service {
         depth: usize,
         budget: Option<usize>,
     ) -> Result<Value> {
+        let automatic_problem_capture =
+            self.automatic_problem_capture(intent, "repo.prepare_change")?;
         let context_id = format!(
             "ctx_{}",
             &blake3::hash(format!("{}:{:?}:{}", intent, targets, Utc::now()).as_bytes()).to_hex()
@@ -1944,7 +1947,7 @@ impl Service {
             used += slice.source.len();
             slices.push(slice);
         }
-        let payload = json!({"context_id":context_id,"intent":intent,"revision":self.revision(),"snapshot":self.snapshot(),"primary_symbols":target_nodes,"references":references,"reference_provenance":{"semantic":"RustAnalyzer (confidence 1.0), cached by semantic snapshot","fallback":"Syntax-derived, ambiguity-suppressed relationships (confidence labelled)"},"semantic_references":semantic_references,"uncertain_static_references":uncertain_static_references,"runtime_contracts":runtime_contracts,"tests":tests,"use_cases":use_cases,"decisions":decisions,"steerings":steerings,"lifecycle":lifecycle,"obsolete_candidates":obsolete.get("candidates"),"work_items":work.get("items"),"likely_change_surface":likely_surface,"source_slices":slices,"context_budget":{"tokens":token_budget,"estimated_tokens":used.div_ceil(4)},"generation":self.active_generation(),"semantic_snapshot":self.semantic_snapshot_resource(),"risk":risk(&target_nodes, &references),"validation_queue":validation_queue,"unresolved_edges":["Ambiguous static references are reported separately and excluded from likely_change_surface.","Runtime registration, generated code, inactive feature/target profiles, external consumers, and deployment state require profile-specific or runtime verification."],"verification_plan":["cargo check --all-targets","cargo test","Use repo.matrix for no-default, individual-feature, and all-feature checks.","Validate changed GTK UI/Blueprint files with the project GTK tooling.","Compare changed D-Bus XML with runtime introspection and external consumer expectations."],"semantic_note":"rust-analyzer facts are resolved on demand and persisted for the active semantic snapshot. Syntax relationships are AST-derived; unresolved ambiguous names are retained as uncertainty, not impact edges."});
+        let payload = json!({"context_id":context_id,"intent":intent,"revision":self.revision(),"snapshot":self.snapshot(),"automatic_problem_capture":automatic_problem_capture,"primary_symbols":target_nodes,"references":references,"reference_provenance":{"semantic":"RustAnalyzer (confidence 1.0), cached by semantic snapshot","fallback":"Syntax-derived, ambiguity-suppressed relationships (confidence labelled)"},"semantic_references":semantic_references,"uncertain_static_references":uncertain_static_references,"runtime_contracts":runtime_contracts,"tests":tests,"use_cases":use_cases,"decisions":decisions,"steerings":steerings,"lifecycle":lifecycle,"obsolete_candidates":obsolete.get("candidates"),"work_items":work.get("items"),"likely_change_surface":likely_surface,"source_slices":slices,"context_budget":{"tokens":token_budget,"estimated_tokens":used.div_ceil(4)},"generation":self.active_generation(),"semantic_snapshot":self.semantic_snapshot_resource(),"risk":risk(&target_nodes, &references),"validation_queue":validation_queue,"unresolved_edges":["Ambiguous static references are reported separately and excluded from likely_change_surface.","Runtime registration, generated code, inactive feature/target profiles, external consumers, and deployment state require profile-specific or runtime verification."],"verification_plan":["cargo check --all-targets","cargo test","Use repo.matrix for no-default, individual-feature, and all-feature checks.","Validate changed GTK UI/Blueprint files with the project GTK tooling.","Compare changed D-Bus XML with runtime introspection and external consumer expectations."],"semantic_note":"rust-analyzer facts are resolved on demand and persisted for the active semantic snapshot. Syntax relationships are AST-derived; unresolved ambiguous names are retained as uncertainty, not impact edges."});
         self.db.execute("INSERT INTO change_contexts(id, intent, payload, revision, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![context_id, intent, payload.to_string(), self.revision().workspace_digest, Utc::now().to_rfc3339()])?;
         Ok(payload)
     }
