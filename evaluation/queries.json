@@ -1,0 +1,27 @@
+[
+  {
+    "query": "incremental stale workspace refresh",
+    "expected": "refresh_if_stale",
+    "forbidden": ["checkpoint_restore_branch"]
+  },
+  {
+    "query": "full text search ranking",
+    "expected": "search_nodes",
+    "forbidden": ["checkpoint_create"]
+  },
+  {
+    "query": "git checkpoint capture",
+    "expected": "checkpoint_create",
+    "forbidden": ["rust_analyzer_initialization_options"]
+  },
+  {
+    "query": "record architecture decision",
+    "expected": "record_decision",
+    "forbidden": ["watcher_enabled"]
+  },
+  {
+    "query": "git commit co change history",
+    "expected": "history",
+    "forbidden": ["record_steering"]
+  }
+]
