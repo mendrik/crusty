@@ -1,6 +1,8 @@
 //! Repository indexing and change-impact services used by the MCP binary.
 //! Semantic facts returned by a static scan are explicitly marked as such.
 
+pub mod dashboard;
+pub mod observatory;
 mod quality;
 
 pub use quality::{
@@ -9,6 +11,7 @@ pub use quality::{
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
+use fs2::FileExt;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -18,7 +21,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap},
     ffi::OsString,
-    fs,
+    fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
@@ -37,7 +40,7 @@ const INDEX_DIRECTORY: &str = ".rust-repo-intelligence";
 const MAX_SLICE_BYTES: usize = 12_000;
 const MAX_SEARCH_BODY_BYTES: usize = 48_000;
 const SCHEMA_VERSION: &str = "7";
-const INDEXER_VERSION: &str = "7";
+const INDEXER_VERSION: &str = "8";
 const RUST_ANALYZER_THREADS: u64 = 1;
 const RUST_ANALYZER_ENV: &str = "RUST_REPO_INTELLIGENCE_ENABLE_RUST_ANALYZER";
 const RUST_ANALYZER_PATH_ENV: &str = "RUST_REPO_INTELLIGENCE_RUST_ANALYZER_PATH";
@@ -46,6 +49,7 @@ const FEATURES_ENV: &str = "RUST_REPO_INTELLIGENCE_FEATURES";
 const CHECKPOINT_REF_PREFIX: &str = "refs/codex/checkpoints";
 const EMBEDDING_MODEL: &str = "subword-hash-v1";
 const EMBEDDING_DIMENSIONS: usize = 192;
+const SYMBOL_CARD_VERSION: &str = "symbol-card-v1";
 const RRF_K: f64 = 60.0;
 const WATCH_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(20);
@@ -67,6 +71,7 @@ pub struct SourceSlice {
     pub semantic_relationship: String,
     pub provenance: String,
     pub confidence: f64,
+    pub stale: bool,
     pub source: String,
 }
 
@@ -94,11 +99,61 @@ struct SemanticSnapshot {
     rust_analyzer_version: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct SemanticProfile {
+    cargo_lock_hash: Option<String>,
+    target_triple: String,
+    feature_profile: String,
+    build_environment_fingerprint: String,
+    rust_analyzer_version: Option<String>,
+}
+
+impl SemanticSnapshot {
+    fn profile(&self) -> SemanticProfile {
+        SemanticProfile {
+            cargo_lock_hash: self.cargo_lock_hash.clone(),
+            target_triple: self.target_triple.clone(),
+            feature_profile: self.feature_profile.clone(),
+            build_environment_fingerprint: self.build_environment_fingerprint.clone(),
+            rust_analyzer_version: self.rust_analyzer_version.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct HybridHit {
     node: Node,
     score: f64,
     channels: BTreeSet<String>,
+    exact_match: bool,
+    embedding: Option<EmbeddingEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EmbeddingEvidence {
+    model: &'static str,
+    dimensions: usize,
+    card_version: &'static str,
+    card_hash: String,
+    semantic_snapshot: String,
+    similarity: f64,
+}
+
+struct VectorHit {
+    node: Node,
+    similarity: f64,
+    evidence: EmbeddingEvidence,
+}
+
+struct SymbolCard {
+    text: String,
+    hash: String,
+}
+
+#[derive(Default)]
+struct EmbeddingBuildStats {
+    embedded: usize,
+    reused: usize,
 }
 
 struct EdgeRecord<'a> {
@@ -113,7 +168,7 @@ struct EdgeRecord<'a> {
 
 struct EmbeddingCache {
     semantic_snapshot: String,
-    items: Vec<(Node, Vec<f32>)>,
+    items: Vec<(Node, Vec<f32>, String)>,
 }
 
 struct ParsedSymbol {
@@ -467,6 +522,14 @@ pub struct Service {
     embedding_cache: RefCell<Option<EmbeddingCache>>,
 }
 
+struct PublisherLease(File);
+
+impl Drop for PublisherLease {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
 impl Service {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = fs::canonicalize(root.into()).context("resolving workspace path")?;
@@ -621,6 +684,30 @@ impl Service {
             .flatten()
     }
 
+    fn active_semantic_profile_matches(&self, candidate: &SemanticSnapshot) -> Result<bool> {
+        let Some(snapshot_id) = self.active_semantic_snapshot_id() else {
+            return Ok(false);
+        };
+        let profile: Option<SemanticProfile> = self
+            .db
+            .query_row(
+                "SELECT cargo_lock_hash,target_triple,feature_profile,build_environment_fingerprint,rust_analyzer_version \
+                 FROM semantic_snapshots WHERE id=?1",
+                [&snapshot_id],
+                |row| {
+                    Ok(SemanticProfile {
+                        cargo_lock_hash: row.get(0)?,
+                        target_triple: row.get(1)?,
+                        feature_profile: row.get(2)?,
+                        build_environment_fingerprint: row.get(3)?,
+                        rust_analyzer_version: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(profile.is_some_and(|profile| profile == candidate.profile()))
+    }
+
     fn active_generation(&self) -> Option<i64> {
         self.db
             .query_row(
@@ -657,6 +744,11 @@ impl Service {
     }
 
     pub fn reindex(&mut self) -> Result<()> {
+        let _publisher_lease = self.acquire_publisher_lease()?;
+        self.reindex_unlocked()
+    }
+
+    fn reindex_unlocked(&mut self) -> Result<()> {
         self.start_rust_analyzer_if_enabled();
         self.with_savepoint("full_reindex", |service| service.reindex_inner())?;
         self.watcher_trusted = self.watcher.is_some();
@@ -740,6 +832,7 @@ impl Service {
     /// inputs deliberately trigger a complete semantic refresh; documentation alone
     /// never invalidates source symbols or graph edges.
     pub fn refresh_if_stale(&mut self) -> Result<()> {
+        let _publisher_lease = self.acquire_publisher_lease()?;
         self.start_rust_analyzer_if_enabled();
         let previous: BTreeMap<String, (String, String)> = self
             .db
@@ -747,7 +840,7 @@ impl Service {
             .query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?
             .collect::<rusqlite::Result<_>>()?;
         if previous.is_empty() {
-            return self.reindex();
+            return self.reindex_unlocked();
         }
         let indexed_version: Option<String> = self
             .db
@@ -758,7 +851,7 @@ impl Service {
             )
             .optional()?;
         if indexed_version.as_deref() != Some(INDEXER_VERSION) {
-            return self.reindex();
+            return self.reindex_unlocked();
         }
         let (watch_paths, watcher_overflowed) = self.drain_watch_events();
         let reconcile = !self.watcher_trusted
@@ -785,10 +878,9 @@ impl Service {
         }
         let revision = self.revision_from_inputs_and_head(&inputs, current_head);
         let head_changed = indexed_head != revision.head;
-        let semantic_changed = self.active_semantic_snapshot_id().as_deref()
-            != Some(self.semantic_snapshot(&inputs).id.as_str());
-        if semantic_changed {
-            return self.reindex();
+        let semantic = self.semantic_snapshot(&inputs);
+        if !self.active_semantic_profile_matches(&semantic)? {
+            return self.reindex_unlocked();
         }
         let changed: Vec<(String, String)> = inputs
             .iter()
@@ -818,7 +910,7 @@ impl Service {
             return Ok(());
         }
         if changed.iter().any(|(_, kind)| kind == "cargo") {
-            return self.reindex();
+            return self.reindex_unlocked();
         }
         self.with_savepoint("incremental_refresh", |service| {
             service.refresh_changed(&changed, &revision, &inputs, head_changed)
@@ -1147,40 +1239,112 @@ impl Service {
         Ok(output)
     }
 
-    fn rebuild_symbol_embeddings(&self, nodes: &[Node], snapshot_id: &str) -> Result<()> {
-        *self.embedding_cache.borrow_mut() = None;
-        self.db.execute("DELETE FROM symbol_embeddings", [])?;
-        for node in nodes {
-            let source = self
-                .source_slice(node, "embedding card", "EMBEDS")
-                .map(|slice| trim_text(&slice.source, 8_000))
-                .unwrap_or_default();
-            let referenced: Vec<String> = self
-                .db
-                .prepare(
-                    "SELECT target.canonical_name FROM edges edge JOIN nodes target ON target.id=edge.dst WHERE edge.src=?1 ORDER BY edge.confidence DESC LIMIT 24",
-                )?
-                .query_map([node.id], |row| row.get(0))?
-                .filter_map(Result::ok)
-                .collect();
-            let card = format!(
-                "{}\nkind {}\ncrate {}\nreferences {}\n{}",
-                node.canonical_name,
-                node.kind,
-                node.crate_name.as_deref().unwrap_or("workspace"),
-                referenced.join(" "),
-                source
-            );
-            let vector = embed_text(&card);
-            self.db.execute(
-                "INSERT INTO symbol_embeddings(node_id,model,dimensions,vector,content_hash,semantic_snapshot) VALUES (?1,?2,?3,?4,?5,?6)",
-                params![node.id,EMBEDDING_MODEL,EMBEDDING_DIMENSIONS as i64,encode_vector(&vector),node.content_hash,snapshot_id],
-            )?;
-        }
-        Ok(())
+    fn symbol_card(&self, node: &Node) -> Result<SymbolCard> {
+        let source = self
+            .source_slice(node, "embedding card", "EMBEDS")
+            .map(|slice| trim_text(&slice.source, 8_000))
+            .unwrap_or_default();
+        let relationships = self
+            .db
+            .prepare(
+                "SELECT CASE WHEN edge.src=?1 THEN 'outgoing' ELSE 'incoming' END, \
+                        edge.kind, related.canonical_name \
+                 FROM edges edge \
+                 JOIN nodes related ON related.id=CASE WHEN edge.src=?1 THEN edge.dst ELSE edge.src END \
+                 WHERE edge.src=?1 OR edge.dst=?1 \
+                 ORDER BY edge.confidence DESC,edge.kind,related.canonical_name LIMIT 48",
+            )?
+            .query_map([node.id], |row| {
+                Ok(format!(
+                    "{} {} {}",
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let module = node
+            .canonical_name
+            .rsplit_once("::")
+            .map(|(module, _)| module)
+            .unwrap_or("workspace");
+        let text = format!(
+            "card-version {SYMBOL_CARD_VERSION}\n\
+             symbol {}\n\
+             module {module}\n\
+             kind {}\n\
+             visibility {}\n\
+             crate {}\n\
+             file {}\n\
+             relationships {}\n\
+             source\n{}",
+            node.canonical_name,
+            node.kind,
+            node.visibility,
+            node.crate_name.as_deref().unwrap_or("workspace"),
+            node.file,
+            relationships.join("\n"),
+            source
+        );
+        let hash = format!("b3:{}", blake3::hash(text.as_bytes()).to_hex());
+        Ok(SymbolCard { text, hash })
     }
 
-    fn vector_nodes(&self, query: &str, limit: usize) -> Result<Vec<(Node, f64)>> {
+    fn rebuild_symbol_embeddings(
+        &self,
+        nodes: &[Node],
+        snapshot_id: &str,
+    ) -> Result<EmbeddingBuildStats> {
+        *self.embedding_cache.borrow_mut() = None;
+        let mut stats = EmbeddingBuildStats::default();
+        for node in nodes {
+            let card = self.symbol_card(node)?;
+            let existing: Option<(String, usize, String)> = self
+                .db
+                .query_row(
+                    "SELECT model,dimensions,content_hash FROM symbol_embeddings WHERE node_id=?1",
+                    [node.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            if existing.as_ref().is_some_and(|(model, dimensions, hash)| {
+                model == EMBEDDING_MODEL
+                    && *dimensions == EMBEDDING_DIMENSIONS
+                    && hash == &card.hash
+            }) {
+                self.db.execute(
+                    "UPDATE symbol_embeddings SET semantic_snapshot=?1 WHERE node_id=?2",
+                    params![snapshot_id, node.id],
+                )?;
+                stats.reused += 1;
+                continue;
+            }
+            let vector = embed_text(&card.text);
+            self.db.execute(
+                "INSERT INTO symbol_embeddings(node_id,model,dimensions,vector,content_hash,semantic_snapshot) \
+                 VALUES (?1,?2,?3,?4,?5,?6) \
+                 ON CONFLICT(node_id) DO UPDATE SET model=excluded.model,dimensions=excluded.dimensions,vector=excluded.vector,content_hash=excluded.content_hash,semantic_snapshot=excluded.semantic_snapshot",
+                params![node.id,EMBEDDING_MODEL,EMBEDDING_DIMENSIONS,encode_vector(&vector),card.hash,snapshot_id],
+            )?;
+            stats.embedded += 1;
+        }
+        for (key, value) in [
+            ("embedding_model", EMBEDDING_MODEL.to_owned()),
+            ("embedding_dimensions", EMBEDDING_DIMENSIONS.to_string()),
+            ("embedding_card_version", SYMBOL_CARD_VERSION.to_owned()),
+            ("embedding_recomputed", stats.embedded.to_string()),
+            ("embedding_reused", stats.reused.to_string()),
+            ("embedding_updated_at", Utc::now().to_rfc3339()),
+        ] {
+            self.db.execute(
+                "INSERT OR REPLACE INTO metadata(key,value) VALUES (?1,?2)",
+                params![key, value],
+            )?;
+        }
+        Ok(stats)
+    }
+
+    fn vector_nodes(&self, query: &str, limit: usize) -> Result<Vec<VectorHit>> {
         let query_vector = embed_text(query);
         let snapshot = self.active_semantic_snapshot_id().unwrap_or_default();
         let reload = self
@@ -1190,16 +1354,21 @@ impl Service {
             .is_none_or(|cache| cache.semantic_snapshot != snapshot);
         if reload {
             let mut statement = self.db.prepare(
-                "SELECT n.id,n.kind,n.canonical_name,n.crate_name,n.file,n.start_line,n.end_line,n.visibility,n.content_hash,e.vector FROM symbol_embeddings e JOIN nodes n ON n.id=e.node_id WHERE e.model=?1 AND e.semantic_snapshot=?2",
+                "SELECT n.id,n.kind,n.canonical_name,n.crate_name,n.file,n.start_line,n.end_line,n.visibility,n.content_hash,e.vector,e.content_hash \
+                 FROM symbol_embeddings e JOIN nodes n ON n.id=e.node_id \
+                 WHERE e.model=?1 AND e.dimensions=?2 AND e.semantic_snapshot=?3",
             )?;
-            let items = statement
-                .query_map(params![EMBEDDING_MODEL, snapshot], |row| {
-                    let node = node_from_row(row)?;
-                    let bytes: Vec<u8> = row.get(9)?;
-                    Ok((node, decode_vector(&bytes)))
-                })?
-                .filter_map(Result::ok)
-                .collect();
+            let mut items = statement
+                .query_map(
+                    params![EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, snapshot],
+                    |row| {
+                        let node = node_from_row(row)?;
+                        let bytes: Vec<u8> = row.get(9)?;
+                        Ok((node, decode_vector(&bytes), row.get(10)?))
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            items.retain(|(_, vector, _)| vector.len() == EMBEDDING_DIMENSIONS);
             *self.embedding_cache.borrow_mut() = Some(EmbeddingCache {
                 semantic_snapshot: snapshot.clone(),
                 items,
@@ -1210,10 +1379,29 @@ impl Service {
             .as_ref()
             .into_iter()
             .flat_map(|cache| &cache.items)
-            .map(|(node, vector)| (node.clone(), dot_product(&query_vector, vector)))
-            .filter(|(_, score)| *score > 0.0)
+            .map(|(node, vector, card_hash)| {
+                let similarity = dot_product(&query_vector, vector);
+                VectorHit {
+                    node: node.clone(),
+                    similarity,
+                    evidence: EmbeddingEvidence {
+                        model: EMBEDDING_MODEL,
+                        dimensions: EMBEDDING_DIMENSIONS,
+                        card_version: SYMBOL_CARD_VERSION,
+                        card_hash: card_hash.clone(),
+                        semantic_snapshot: snapshot.clone(),
+                        similarity,
+                    },
+                }
+            })
+            .filter(|hit| hit.similarity > 0.0)
             .collect::<Vec<_>>();
-        scored.sort_by(|left, right| right.1.total_cmp(&left.1));
+        scored.sort_by(|left, right| {
+            right
+                .similarity
+                .total_cmp(&left.similarity)
+                .then_with(|| left.node.canonical_name.cmp(&right.node.canonical_name))
+        });
         scored.truncate(limit);
         Ok(scored)
     }
@@ -1252,19 +1440,39 @@ impl Service {
         let vectors = self.vector_nodes(query, limit.saturating_mul(3).max(12))?;
         let mut ranked: HashMap<i64, HybridHit> = HashMap::new();
         for (rank, node) in lexical.iter().enumerate() {
+            let id = node.id;
+            let exact = is_exact_identifier_match(query, node);
             add_rrf_hit(&mut ranked, node.clone(), "lexical", rank, 1.0);
+            if exact {
+                let hit = ranked.get_mut(&id).expect("lexical hit was inserted");
+                hit.exact_match = true;
+                hit.channels.insert("exact_identifier".to_owned());
+            }
         }
-        for (rank, (node, similarity)) in vectors.iter().enumerate() {
+        for (rank, vector) in vectors.iter().enumerate() {
+            let id = vector.node.id;
             add_rrf_hit(
                 &mut ranked,
-                node.clone(),
+                vector.node.clone(),
                 "embedding",
                 rank,
-                0.75 * similarity.max(0.15),
+                0.75 * vector.similarity.max(0.15),
             );
+            ranked
+                .get_mut(&id)
+                .expect("vector hit was inserted")
+                .embedding = Some(vector.evidence.clone());
         }
-        let seed_ids = ranked
-            .values()
+        let mut seed_hits = ranked.values().collect::<Vec<_>>();
+        seed_hits.sort_by(|left, right| {
+            right
+                .exact_match
+                .cmp(&left.exact_match)
+                .then_with(|| right.score.total_cmp(&left.score))
+                .then_with(|| left.node.canonical_name.cmp(&right.node.canonical_name))
+        });
+        let seed_ids = seed_hits
+            .into_iter()
             .map(|hit| hit.node.id)
             .take(10)
             .collect::<Vec<_>>();
@@ -1302,7 +1510,13 @@ impl Service {
             }
         }
         let mut output = ranked.into_values().collect::<Vec<_>>();
-        output.sort_by(|left, right| right.score.total_cmp(&left.score));
+        output.sort_by(|left, right| {
+            right
+                .exact_match
+                .cmp(&left.exact_match)
+                .then_with(|| right.score.total_cmp(&left.score))
+                .then_with(|| left.node.canonical_name.cmp(&right.node.canonical_name))
+        });
         output.truncate(limit);
         Ok(output)
     }
@@ -1330,7 +1544,15 @@ impl Service {
         let ranked_symbols = hits
             .iter()
             .map(|hit| {
-                json!({"symbol":hit.node.canonical_name,"file":hit.node.file,"kind":hit.node.kind,"score":hit.score,"channels":hit.channels})
+                json!({
+                    "symbol":hit.node.canonical_name,
+                    "file":hit.node.file,
+                    "kind":hit.node.kind,
+                    "score":hit.score,
+                    "channels":hit.channels,
+                    "exact_match":hit.exact_match,
+                    "embedding_evidence":hit.embedding,
+                })
             })
             .collect::<Vec<_>>();
         let documentation = budget_values(
@@ -1358,6 +1580,7 @@ impl Service {
         Ok(json!({
             "query":query,
             "retrieval":"BM25 + subword embedding + typed graph expansion, fused with reciprocal-rank fusion",
+            "retrieval_provenance":self.retrieval_provenance(),
             "ranked_symbols":ranked_symbols,
             "source_slices":source_slices,
             "documentation":documentation,
@@ -2392,7 +2615,18 @@ impl Service {
         let mut tests = Vec::new();
         let mut canonical = Vec::new();
         for (node, hit) in nodes.iter().zip(&hybrid) {
-            let item = json!({"id":node.id,"symbol":node.canonical_name,"file":node.file,"kind":node.kind,"visibility":node.visibility,"provenance":"HybridRRF","score":hit.score,"channels":hit.channels});
+            let item = json!({
+                "id":node.id,
+                "symbol":node.canonical_name,
+                "file":node.file,
+                "kind":node.kind,
+                "visibility":node.visibility,
+                "provenance":"HybridRRF",
+                "score":hit.score,
+                "channels":hit.channels,
+                "exact_match":hit.exact_match,
+                "embedding_evidence":hit.embedding,
+            });
             if node.file.contains("test") || short_name(&node.canonical_name).starts_with("test_") {
                 tests.push(item);
             } else if node.visibility == "public" {
@@ -2415,7 +2649,7 @@ impl Service {
             .cloned()
             .unwrap_or_default();
         Ok(
-            json!({"concept":concept,"snapshot":self.snapshot(),"retrieval":"HybridRRF","canonical_candidates":canonical,"implementation_candidates":implementations,"tests":tests,"documentation":docs,"runtime_contracts":runtime_contracts,"full_text_hits":full_text_hits,"governing_decisions":self.decisions_for(concept)?,"known_work":work_items,"source_slices":source_slices,"blind_spots":["Indexed GTK/D-Bus artifacts are searchable but runtime registration, generated code, external consumers, and configuration-selected implementations still require confirmation."],"context_budget":{"items":limit,"source_included":include_source}}),
+            json!({"concept":concept,"snapshot":self.snapshot(),"retrieval":"HybridRRF","retrieval_provenance":self.retrieval_provenance(),"canonical_candidates":canonical,"implementation_candidates":implementations,"tests":tests,"documentation":docs,"runtime_contracts":runtime_contracts,"full_text_hits":full_text_hits,"governing_decisions":self.decisions_for(concept)?,"known_work":work_items,"source_slices":source_slices,"blind_spots":["Indexed GTK/D-Bus artifacts are searchable but runtime registration, generated code, external consumers, and configuration-selected implementations still require confirmation."],"context_budget":{"items":limit,"source_included":include_source}}),
         )
     }
 
@@ -2679,6 +2913,7 @@ impl Service {
         match scope.unwrap_or("workspace") {
             "workspace" | "cargo" => self.reindex()?,
             "git" => {
+                let _publisher_lease = self.acquire_publisher_lease()?;
                 let revision = self.revision();
                 self.with_savepoint("git_only_refresh", |service| {
                     service.refresh_git(&revision.workspace_digest)?;
@@ -2696,6 +2931,19 @@ impl Service {
             ),
         }
         self.status()
+    }
+
+    fn acquire_publisher_lease(&self) -> Result<PublisherLease> {
+        let path = self.root.join(INDEX_DIRECTORY).join("index.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        FileExt::try_lock_exclusive(&lock)
+            .context("another Crusty process owns the index publisher lease")?;
+        Ok(PublisherLease(lock))
     }
 
     pub fn resource(&self, uri: &str) -> Result<Value> {
@@ -2728,7 +2976,39 @@ impl Service {
     }
 
     pub fn index_status(&self) -> Value {
-        json!({"semantic_engine":"rust-analyzer LSP companion (opt-in, on-demand, persisted by semantic snapshot)","rust_analyzer_enabled":self.ra_enabled,"rust_analyzer_running":self.ra.is_some(),"rust_analyzer_start_attempted":self.ra_start_attempted,"rust_analyzer_program":self.ra_program.to_string_lossy(),"rust_analyzer_error":self.ra_start_error,"filesystem_watcher":self.watcher.is_some(),"fallback":"AST Syntax index with ambiguity suppression; unresolved candidates are reported separately","embedding_model":EMBEDDING_MODEL,"embedding_dimensions":EMBEDDING_DIMENSIONS,"retrieval":"BM25 + embedding + typed graph RRF","store":"SQLite FTS5 + graph + vectors"})
+        json!({"semantic_engine":"rust-analyzer LSP companion (opt-in, on-demand, persisted by semantic snapshot)","rust_analyzer_enabled":self.ra_enabled,"rust_analyzer_running":self.ra.is_some(),"rust_analyzer_start_attempted":self.ra_start_attempted,"rust_analyzer_program":self.ra_program.to_string_lossy(),"rust_analyzer_error":self.ra_start_error,"filesystem_watcher":self.watcher.is_some(),"fallback":"AST Syntax index with ambiguity suppression; unresolved candidates are reported separately","embedding_model":EMBEDDING_MODEL,"embedding_dimensions":EMBEDDING_DIMENSIONS,"embedding_card_version":SYMBOL_CARD_VERSION,"embedding":self.embedding_index_status(),"retrieval":"BM25 + embedding + typed graph RRF","store":"SQLite FTS5 + graph + vectors"})
+    }
+
+    fn embedding_index_status(&self) -> Value {
+        let metadata = |key: &str| {
+            self.db
+                .query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()
+                .ok()
+                .flatten()
+        };
+        json!({
+            "model":EMBEDDING_MODEL,
+            "dimensions":EMBEDDING_DIMENSIONS,
+            "card_version":SYMBOL_CARD_VERSION,
+            "vectors":self.db.query_row("SELECT COUNT(*) FROM symbol_embeddings WHERE model=?1 AND dimensions=?2",params![EMBEDDING_MODEL,EMBEDDING_DIMENSIONS],|row|row.get::<_,i64>(0)).unwrap_or(0),
+            "semantic_snapshot":self.active_semantic_snapshot_id(),
+            "last_build":{"recomputed":metadata("embedding_recomputed").and_then(|value|value.parse::<usize>().ok()),"reused":metadata("embedding_reused").and_then(|value|value.parse::<usize>().ok()),"updated_at":metadata("embedding_updated_at")},
+            "storage":"SQLite BLOB; bounded brute-force cosine ranking",
+            "qualification":"Local feature embedding for identifier and vocabulary discovery; typed graph/compiler/runtime evidence remains authoritative."
+        })
+    }
+
+    fn retrieval_provenance(&self) -> Value {
+        json!({
+            "exact_identifier":{"source":"published symbol index","precedence":"always before fused non-exact candidates"},
+            "lexical":{"source":"SQLite FTS5","ranking":"BM25"},
+            "embedding":self.embedding_index_status(),
+            "graph":{"source":"typed edges","provenance":"RustAnalyzer, Syntax, or StaticIndex per edge","role":"expansion evidence, never proof of runtime behavior"},
+            "fusion":{"algorithm":"weighted reciprocal-rank fusion","deterministic":true}
+        })
     }
 
     fn snapshot(&self) -> Value {
@@ -3019,6 +3299,7 @@ impl Service {
         let lines: Vec<_> = text.lines().collect();
         let start = line.min(lines.len());
         let end = (start + 16).min(lines.len());
+        let stale = start == end;
         let mut source = lines[start..end].join("\n");
         if source.len() > MAX_SLICE_BYTES {
             source = trim_text(&source, MAX_SLICE_BYTES);
@@ -3026,12 +3307,13 @@ impl Service {
         Ok(SourceSlice {
             symbol: symbol.to_owned(),
             file: relative(&self.root, path),
-            range: [start + 1, end],
+            range: if stale { [0, 0] } else { [start + 1, end] },
             content_hash: format!("b3:{}", blake3::hash(source.as_bytes()).to_hex()),
             reason: format!("rust-analyzer resolved {relation}"),
             semantic_relationship: relation.to_ascii_uppercase(),
             provenance: "RustAnalyzer".into(),
-            confidence: 1.0,
+            confidence: if stale { 0.5 } else { 1.0 },
+            stale,
             source,
         })
     }
@@ -3051,10 +3333,29 @@ impl Service {
     }
     fn source_slice(&self, node: &Node, reason: &str, relation: &str) -> Result<SourceSlice> {
         let path = self.root.join(&node.file);
-        let text = fs::read_to_string(&path)?;
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SourceSlice {
+                    symbol: node.canonical_name.clone(),
+                    file: node.file.clone(),
+                    range: [0, 0],
+                    content_hash: node.content_hash.clone(),
+                    reason: format!("{reason}; indexed source is unavailable in the live worktree"),
+                    semantic_relationship: relation.into(),
+                    provenance: "StaticIndexStale".into(),
+                    confidence: 0.25,
+                    stale: true,
+                    source: String::new(),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
         let lines: Vec<_> = text.lines().collect();
+        let indexed_start = node.start_line.saturating_sub(1);
         let end = node.end_line.min(lines.len());
-        let start = node.start_line.saturating_sub(1);
+        let start = indexed_start.min(end);
+        let stale = indexed_start >= lines.len() || node.end_line > lines.len();
         let mut source = lines[start..end].join("\n");
         if source.len() > MAX_SLICE_BYTES {
             source = trim_text(&source, MAX_SLICE_BYTES)
@@ -3062,12 +3363,26 @@ impl Service {
         Ok(SourceSlice {
             symbol: node.canonical_name.clone(),
             file: node.file.clone(),
-            range: [node.start_line, end],
+            range: if start == end {
+                [0, 0]
+            } else {
+                [start + 1, end]
+            },
             content_hash: node.content_hash.clone(),
-            reason: reason.into(),
+            reason: if stale {
+                format!("{reason}; indexed line range exceeds the live file")
+            } else {
+                reason.into()
+            },
             semantic_relationship: relation.into(),
-            provenance: "StaticIndex".into(),
-            confidence: 0.9,
+            provenance: if stale {
+                "StaticIndexStale"
+            } else {
+                "StaticIndex"
+            }
+            .into(),
+            confidence: if stale { 0.4 } else { 0.9 },
+            stale,
             source,
         })
     }
@@ -4107,6 +4422,20 @@ fn dot_product(left: &[f32], right: &[f32]) -> f64 {
         .sum()
 }
 
+fn is_exact_identifier_match(query: &str, node: &Node) -> bool {
+    let query = query.trim().trim_matches('`');
+    if query.eq_ignore_ascii_case(&node.canonical_name)
+        || query.eq_ignore_ascii_case(short_name(&node.canonical_name))
+    {
+        return true;
+    }
+    terms(query).into_iter().any(|term| {
+        let looks_intentional =
+            term.contains('_') || term.chars().any(char::is_uppercase) || query.contains("::");
+        looks_intentional && term.eq_ignore_ascii_case(short_name(&node.canonical_name))
+    })
+}
+
 fn add_rrf_hit(
     ranked: &mut HashMap<i64, HybridHit>,
     node: Node,
@@ -4118,6 +4447,8 @@ fn add_rrf_hit(
         node,
         score: 0.0,
         channels: BTreeSet::new(),
+        exact_match: false,
+        embedding: None,
     });
     hit.score += weight / (RRF_K + rank as f64 + 1.0);
     hit.channels.insert(channel.to_owned());
@@ -5009,6 +5340,87 @@ mod tests {
                 .unwrap()
                 .contains("reciprocal-rank")
         );
+        assert_eq!(
+            context["retrieval_provenance"]["embedding"]["card_version"],
+            SYMBOL_CARD_VERSION
+        );
+        let embedded = context["ranked_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|hit| hit["embedding_evidence"].is_object())
+            .unwrap();
+        assert_eq!(embedded["embedding_evidence"]["model"], EMBEDDING_MODEL);
+        assert!(
+            embedded["embedding_evidence"]["card_hash"]
+                .as_str()
+                .unwrap()
+                .starts_with("b3:")
+        );
+    }
+
+    #[test]
+    fn exact_identifiers_precede_fused_semantic_candidates() {
+        let d = fixture();
+        fs::write(
+            d.path().join("src/lib.rs"),
+            "pub fn refresh_if_stale() {}\npub fn refresh_workspace_index() { refresh_if_stale(); }\n",
+        )
+        .unwrap();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+
+        let hits = service.hybrid_nodes("refresh_if_stale impact", 10).unwrap();
+        assert_eq!(short_name(&hits[0].node.canonical_name), "refresh_if_stale");
+        assert!(hits[0].exact_match);
+        assert!(hits[0].channels.contains("exact_identifier"));
+    }
+
+    #[test]
+    fn incremental_refresh_reuses_unchanged_symbol_cards() {
+        let d = fixture();
+        fs::write(
+            d.path().join("src/other.rs"),
+            "pub fn unchanged_symbol_card() {}\n",
+        )
+        .unwrap();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        let before: (Vec<u8>, String, String) = service
+            .db
+            .query_row(
+                "SELECT e.vector,e.content_hash,e.semantic_snapshot \
+                 FROM symbol_embeddings e JOIN nodes n ON n.id=e.node_id \
+                 WHERE n.canonical_name LIKE '%::unchanged_symbol_card'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        fs::write(
+            d.path().join("src/lib.rs"),
+            "pub trait Store { fn load(&self); }\nfn uses(s: &dyn Store) { s.load(); }\npub fn newly_indexed() {}\n",
+        )
+        .unwrap();
+        service.watcher_trusted = false;
+        service.refresh_if_stale().unwrap();
+
+        let after: (Vec<u8>, String, String) = service
+            .db
+            .query_row(
+                "SELECT e.vector,e.content_hash,e.semantic_snapshot \
+                 FROM symbol_embeddings e JOIN nodes n ON n.id=e.node_id \
+                 WHERE n.canonical_name LIKE '%::unchanged_symbol_card'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(after.0, before.0);
+        assert_eq!(after.1, before.1);
+        assert_ne!(after.2, before.2);
+        let status = service.embedding_index_status();
+        assert!(status["last_build"]["reused"].as_u64().unwrap() > 0);
+        assert!(status["last_build"]["recomputed"].as_u64().unwrap() > 0);
     }
 
     #[test]

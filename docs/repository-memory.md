@@ -1,69 +1,70 @@
-# Repository-memory API and migration notes
+# Crusty 0.2 state, retrieval, and migration
 
-## Snapshot contract
+Crusty separates live navigation, rebuildable repository intelligence, and durable human/project memory. This separation is the core authority boundary: current source and runtime/compiler behavior remain authoritative, indexed relationships are freshness-labelled guidance, and autonomous findings remain proposals until a human acts on them.
 
-Every repository-memory query returns the indexed `snapshot`, containing the canonical workspace path, branch, worktree digest, published generation, semantic snapshot, index timestamp/state, extractor version, and Cargo feature/target assumptions. `repo.status` also returns `current_revision` and an explicit `stale` flag so live worktree state is never presented as if it were the indexed generation. Clean tracked inputs use Git blob identities; dirty and untracked inputs use content hashes.
+## Authority and freshness
 
-Full and incremental refreshes are atomic SQLite generations. Filesystem events are bounded, debounced hints; startup and periodic Git/content reconciliation recover missed events. Cargo/toolchain/profile inputs or an extractor-version change force a complete derived-index rebuild; source and document changes update only their affected domains. `repo.refresh(scope="git")` updates history/co-change search data without falsely marking dirty source as indexed.
+`repo.search(mode=exact)` reads Rust source from the live worktree and never refreshes the index. It is the preferred path for identifiers, call sites, and compiler-error navigation.
 
-The semantic snapshot identity includes the source/Cargo digest, `Cargo.lock`, target triple, configured feature profile, selected build-environment fingerprint, and rust-analyzer version. On-demand rust-analyzer references and implementations are persisted only under that identity. Public API, trait, impl, macro, Cargo, target, or feature changes invalidate the broad semantic cache; private-source edits retain only edges whose indexed endpoints survived.
+`repo.search(mode=broad)` and `repo.context` read the last atomically published index generation. Their responses include a freshness envelope containing the live and indexed revisions, generation, staleness, confidence, and an explicit note that no implicit refresh was attempted.
 
-## Hybrid context retrieval
+`index.status` reports that same boundary plus the latest refresh task and publisher lock. `index.refresh` is the only public refresh entry point. It returns a task ID immediately; `task.get` exposes queued, running, completed, or failed state. Readers keep using the previous generation while a single writer builds and publishes the replacement.
 
-`repo.context_pack` combines FTS5/BM25, deterministic local symbol-card embeddings, and intent-directed typed graph expansion. Reciprocal-rank fusion combines ranks without pretending BM25 and cosine scores share a scale. Returned symbols name their contributing channels, and source/artifact evidence is packed under an approximate token budget.
+Cargo/toolchain/profile inputs or an indexer-version change force a full rebuild. Ordinary source changes may use incremental invalidation. The semantic snapshot includes the source/Cargo digest, `Cargo.lock`, target triple, feature profile, build-environment fingerprint, and rust-analyzer version.
 
-The embedding model is `subword-hash-v1`: offline, reproducible, and inexpensive enough to brute-force at the current repository scale. It improves spelling, identifier-shape, and vocabulary overlap; it is not presented as compiler proof or as equivalent to a learned code model. Dependencies are established only by typed edges with provenance and confidence.
+## Storage
 
-Impact traversal is intentionally narrower than search. Parsed qualified paths and uniquely resolvable names may become `Syntax` dependency edges. Ambiguous short names, dynamic dispatch candidates, comments, and string contents do not become affected-file recommendations. Ambiguous AST references are stored as unresolved evidence and returned separately by `repo.prepare_change`; they remain available for human/compiler follow-up without inflating `likely_change_surface`.
+Repository-local state lives under the ignored `.rust-repo-intelligence/` directory:
 
-GTK `.ui`, Blueprint, CSS, XML/D-Bus, desktop/service, Cargo, and common configuration artifacts join the FTS document corpus and Git-aware invalidation set. This lets concept lookup surface markup and boundary contracts, but does not assert that GTK can instantiate the markup, a runtime registered a D-Bus interface, or an external consumer remains compatible.
+- `index.sqlite3` contains rebuildable source, Cargo, Git, document, graph, search, embedding, and prepared-change projections.
+- `memory.sqlite3` contains research runs, evidence, findings, task history, review decisions, and the single human-owned work store.
+- `index.lock` is the filesystem publisher lease used to reject concurrent writers.
 
-When `repo.validate_change` runs checks, changed `.ui`, `.blp`, and `.xml` artifacts are sent to the corresponding locally installed validator (`gtk4-builder-tool`, `blueprint-compiler`, or `xmllint`). Each result is explicit, including unavailable-tool skips. These checks can catch local markup/schema failures; runtime registration, D-Bus consumer compatibility, and deployment behavior remain separate integration obligations.
+Both databases use SQLite WAL mode. Index publication is transactional, while durable-memory operations use short connections and a busy timeout. Indexing never modifies repository source files.
 
-## Lifecycle evidence
+## Hybrid retrieval
 
-`repo.obsolete_candidates` reports lifecycle relationships only when the target has explicit source/document evidence of replacement. It returns current indexed callers, replacement path, evidence, provenance/confidence, removal slice, verification boundary, and unresolved questions.
+`repo.context` and broad search combine FTS5/BM25, deterministic local symbol-card embeddings, and intent-directed typed graph expansion. Reciprocal-rank fusion combines ranks without treating lexical and cosine scores as interchangeable. Exact symbol identities always precede non-exact fused candidates, and ranking ties and graph seeds are deterministic.
 
-Classifications:
+The embedding unit is `symbol-card-v1`, a bounded representation of canonical identity, module, kind, visibility, crate, file, source, and typed incoming/outgoing relationships. The card hash—not merely the source node hash—keys reuse. Incremental refresh moves unchanged vectors to the new semantic snapshot and recomputes changed cards. Status and evaluation output report the model, dimensions, card version, semantic snapshot, recomputed/reused counts, and storage strategy.
 
-- `architecturally-superseded`: explicit source evidence names the canonical replacement.
-- `suspected-stale-fallback`: lifecycle naming/comment evidence exists but a replacement is not proven.
-- `private-unreferenced`: exposed by the existing conservative cleanup query.
+The default `subword-hash-v1` model is offline and reproducible. It improves identifier-shape and vocabulary discovery but is neither a learned code embedding nor compiler proof. Dependency and impact claims require typed edges with provenance and confidence. Ambiguous short names, comments, strings, dynamic dispatch candidates, generated code, runtime registration, and external consumers remain explicit uncertainty.
 
-None implies deletion safety. External consumers, generated code, runtime registration, configuration-selected implementations, and persisted historical formats must be checked separately.
+GTK `.ui`, Blueprint, CSS, XML/D-Bus, desktop/service, Cargo, and common configuration artifacts participate in lexical search and invalidation. Discoverability does not prove that a runtime can instantiate or register those artifacts.
 
-## Work ledger
+## Change preparation and validation
 
-`repo.work.propose` persists an explicit, inspectable work item; `repo.work.update` changes its status/evidence/dependencies; `repo.work.list` and `repo.work.next` retrieve it. Source TODO/FIXME discovery creates only `proposed` work with `SourceDoc` provenance. If an automatically discovered marker disappears, its evidence is replaced with a stale-evidence notice and its confidence is lowered for review; it is not silently accepted or deleted. Work item JSON is stored in SQLite as a rebuildable cache and tied to the snapshot that last validated it.
+`change.prepare` captures a freshness-labelled impact briefing before edits. It returns a task ID; after polling `task.get`, the completed result contains the context ID, likely change surface, source slices, semantic/static provenance, governing evidence, ambiguity, and validation queue.
 
-Automatic marker discovery accepts Rust comment lines and explicitly actionable Markdown/text forms; prose discussing TODO/FIXME behavior, regex definitions, SQL strings, and source fixtures are not treated as plans.
+`change.validate` compares a diff with that prepared context and optionally runs checks. It is also task-backed and never refreshes first. When checks are requested, locally available Rust and artifact validators report explicit pass, failure, or unavailable evidence. Runtime registration, deployment behavior, and external compatibility remain separate obligations.
 
-## Decisions and steerings
+Legacy approved quality constraints may still contribute validation evidence. Crusty 0.2 does not expose the old problem/quality administration API, and historical constraints never create human work or expand implementation scope by themselves.
 
-`repo.record_decision` captures rationale, consequences, scope, lifecycle status, and supersession. `repo.steering.record` captures a scoped instruction with priority, status, and optional expiry; `repo.steering.list` retrieves it through FTS5. Relevant active records are included in prepared change contexts and constraint queries. As an intentional emergency escape hatch, a deliberate schema reset may erase this memory when part of a product needs to restart from a clean conceptual state.
+## Research, findings, and work
 
-## Learned quality constraints
+`research.start` performs a bounded local scan and prepares primary-first web-search queries for the attached agent. Crusty itself has no GitHub, CI, analytics, telemetry, or arbitrary external connector. The attached agent performs `web_search` and submits qualified local, primary-web, or secondary-web evidence through `research.submit`.
 
-Quality learning uses three separate durable records in the existing repository SQLite store:
+Every finding is categorized as technical, product, or design and begins as `proposed`. `finding.review` records a human decision. `finding.promote` can create project work only after acceptance and explicit human confirmation.
 
-- A problem record preserves redacted report evidence, deterministic family classification, lifecycle status, semantic scope, reproduction/diagnostic information, diagnosis and fix references, related records, and provenance. Similar active reports share a stable fingerprint and add occurrences instead of creating noisy duplicates.
-- A learned quality constraint is the reusable rule proposed from one or more problems. It has independent scope and exclusions, activation criteria, a typed recipe, enforcement, confidence, maturity, provenance, expiry/invalidation data, and validation history.
-- A validation obligation is a snapshot-bound activation for one prepared change. It records the selectors that matched, why the rule was selected, the exact command or procedure and expected result, blocking policy, status, evidence, and linked constraint identifiers.
+`work.list`, `work.get`, `work.recommend`, `work.create`, and `work.update` all use `memory.sqlite3`. Recommendations include only human-owned, accepted or in-progress, unblocked work. Crusty's ledger records repository-local intent; it does not replace GitHub issues or a human product backlog.
 
-The deterministic classifier covers compiler and Clippy warnings, runtime/GTK diagnostics, action wiring, visual consistency, dynamic text/markup, migrations, performance, and test regressions. Classifier output is always `proposed`. A constraint affects later changes only after `repo.quality.update` makes it `active` and gives it `approved` or `established` maturity. Scope/exclusions are matched against crates, files, modules, symbols, components, Cargo relationships, concepts, widgets, CSS classes, design tokens, diagnostics, and configuration kinds. Every match returns the exact selectors and affected surfaces; a negative explanation states whether the constraint was inactive, excluded, or unrelated.
+## Migration from 0.1
 
-`repo.prepare_change` persists matching obligations and returns a queue split into repository policy, checks learned from previous defects, and native validators inferred for the pending artifacts. Identical learned recipes share one obligation, and exact duplicates are omitted from the repository-policy section. Focused/structural checks are ordered before broad Cargo/runtime checks. `repo.validate_change(run_checks=true)` records deterministic learned and inferred outcomes; missing tools and manual procedures remain `unavailable` with evidence. Historical constraints add validation only and never expand implementation scope or create work items.
+Crusty 0.2 is a clean-break MCP API. Exact old tool names in `AGENTS.md`, Codex approval rules, or automation must be updated. See the [Codex installation and migration guide](codex-installation.md) for the mapping.
 
-The MCP lifecycle is exposed through `repo.problem.record/update/list`, `repo.quality.propose/update/merge/list/explain`, and `repo.validation.queue/record`. The matching resources are `rustrepo://problem/{id}`, `rustrepo://quality/{id}`, and `rustrepo://validation/{context_id}`. IDs are stable within the repository (`PRB-####`, `QLT-####`, and content-derived `OBL-*`).
+No manual SQL migration is required. On first 0.2 open:
 
-Schema v7 adds quality-memory and obligation tables additively when opening v4-v6 databases. Records survive MCP restarts and are included in FTS. An unknown/incompatible schema may still use the documented emergency reset path, which intentionally removes quality memory along with the other project memory.
+1. Crusty creates `memory.sqlite3`.
+2. Legacy work is copied into the 0.2 work store.
+3. Decisions, steerings, problems, and quality constraints are preserved as legacy records.
+4. The old index database is left in place and is not deleted by the import.
 
-## Git checkpoints
+Derived evidence is intentionally migrated separately. Because 0.2 does not refresh implicitly, each existing project needs one explicit `index.refresh(scope="workspace")`, polled with `task.get`, to publish indexer version 8 and the `symbol-card-v1` backfill. Projects may do this lazily. Live exact search remains available before the refresh; broad results identify the previous generation as stale.
 
-`repo.checkpoint.create` captures the current index plus tracked worktree changes in a temporary Git index and stores the resulting commit under `refs/codex/checkpoints/<label>/<id>`. It does not modify the real index, branch, or working tree. Untracked files require explicit opt-in. `repo.checkpoint.list` and `repo.checkpoint.diff` inspect checkpoints; `repo.checkpoint.restore_branch` creates a reviewable `codex/` branch without checking it out.
+An incompatible or deliberately reset legacy schema may lose legacy memory, so deleting state is an explicit emergency action rather than a normal upgrade step.
 
-Checkpoints are recovery points, not automatic commits on the product branch. They can be expired by deleting their refs when repository policy permits.
+## Compatibility boundaries
 
-## Compatibility
+Crusty can establish what it observed in a particular live worktree or published snapshot. It cannot establish deletion safety, external API compatibility, runtime registration, generated-code consistency, deployment state, behavior under unindexed feature profiles, or product value without additional evidence.
 
-Existing tools and resource URIs remain unchanged. A schema-version reset may deliberately discard repository memory when a project needs an extreme clean start; extractor-version changes normally rebuild derived evidence in place without requiring a schema reset. Normal indexing/query operations modify only the ignored cache, while checkpoint calls explicitly add or inspect hidden Git refs.
+The index, findings, and research output are guidance and provenance. Source, compiler/runtime results, external-system state, and human decisions remain authoritative.

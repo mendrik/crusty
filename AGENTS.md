@@ -1,11 +1,12 @@
-# Crusty repository intelligence policy
+# Crusty repository observatory policy
 
-Before recursively searching source code or modifying source files:
+Before modifying Rust source:
 
-1. Call `repo.orient` for unfamiliar work.
-2. Call `repo.prepare_change` before the first modification.
-3. Use returned source slices and semantic context. Call `repo.expand_context` when it is insufficient.
-4. Do not use recursive grep/find to discover architecture unless the service reports an incomplete index.
-5. After modifications, call `repo.validate_change` with the diff.
+1. Use `repo.context` to map unfamiliar work against the published snapshot.
+2. Call `change.prepare` before the first source modification, poll its task with `task.get`, and record the resulting context ID and freshness envelope.
+3. Use `repo.search` with `mode=exact` for live call sites, identifiers, and compiler-error navigation. Use `repo.context` again when the prepared evidence is insufficient.
+4. After modifications, call `change.validate` with the context ID and diff, then poll its task to completion.
 
-The repository intelligence service is authoritative for indexed symbol references, type relationships, Cargo dependencies, decisions, use cases, and Git co-change history.
+Use `index.refresh` only as an explicit background task; live exact navigation and validation never require it. Treat indexed relationships as provenance-labelled guidance and current source, compiler/runtime behavior, and human decisions as authoritative.
+
+Autonomous research may use local repository evidence and primary-first `web_search` through the attached agent. Keep findings proposed until a human reviews them; promote accepted findings to work only with explicit human confirmation.

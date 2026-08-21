@@ -29,6 +29,7 @@ fn main() -> Result<()> {
     let refresh_started = Instant::now();
     service.refresh_if_stale()?;
     let refresh_us = refresh_started.elapsed().as_micros();
+    let embedding_index = service.status()?["index"]["embedding"].clone();
 
     let mut samples = Vec::new();
     let mut context_samples = Vec::new();
@@ -71,6 +72,7 @@ fn main() -> Result<()> {
         "queries": cases.len(),
         "samples": samples.len(),
         "incremental_refresh_us": refresh_us,
+        "embedding_index": embedding_index,
         "warm_query_p50_us": percentile(&samples, 50),
         "warm_query_p95_us": percentile(&samples, 95),
         "context_pack_p50_us": percentile(&context_samples, 50),

@@ -1,154 +1,167 @@
 # Crusty
 
-Crusty is a local, read-mostly MCP server that gives coding agents evidence-backed, snapshot-aware intelligence and durable project memory for Rust workspaces. It maps repository concepts to source symbols, dependencies, decisions, history, tests, and documented work while keeping the evidence provenance visible. The compatible Cargo package and executable remain named `rust-repo-intelligence`.
+Crusty is a local repository observatory for Rust. It gives an attached coding agent fast source navigation, snapshot-aware change intelligence, durable work memory, and budgeted technical/product/design research without turning an index or an autonomous suggestion into authority.
 
-The server is deliberately local: it reads the workspace, invokes Cargo and Git as needed, stores its rebuildable cache beside the workspace, and communicates with the MCP client over JSON-RPC on standard input/output. It does not require a hosted database or a project-specific agent integration.
+The Cargo package and executable remain named `rust-repo-intelligence`.
 
-> Referenced code can still be architecturally obsolete.
+## What changed
 
-The server only classifies a path as architecturally superseded when source or decision evidence names a replacement. A naming pattern such as `legacy_*` is a low-confidence suspected fallback—not proof that removal is safe.
-
-## Architecture
-
-The implementation is a single Rust package with two entry points:
-
-- `src/main.rs` handles command-line parsing, the stdio JSON-RPC loop, MCP dispatch, and response formatting.
-- `src/lib.rs` contains the `Service`, indexing pipeline, SQLite schema, rust-analyzer client, query methods, and tests.
-
-The main components are:
-
-1. **MCP adapter.** Reads one JSON-RPC request per line, dispatches MCP tool/resource calls, and emits one response per request. Notifications are processed without a response.
-2. **Workspace service.** Resolves the workspace, combines bounded filesystem notifications with periodic Git reconciliation, selects a full or incremental refresh, and commits each derived-index generation atomically.
-3. **Source indexer.** Parses valid Rust with `syn` (retaining a regex fallback for symbol discovery during temporarily invalid edits), includes module/trait/impl ownership in symbol identities, and collects references from the Rust AST rather than raw lines. Qualified paths and unique names become confidence-labelled impact edges; ambiguous short names are retained as unresolved evidence and never fanned out across every same-named symbol.
-4. **Cargo integration.** Uses one `cargo metadata` snapshot per full refresh to record packages, dependency edges, feature sets, cfg/dependency-kind context, and Cargo-related refresh boundaries.
-5. **Git integration.** Records recent commits, changed files, normalized file co-change relationships, and non-invasive checkpoints stored below `refs/codex/checkpoints/`.
-6. **Artifact and work indexers.** Index Markdown/text, Cargo/configuration files, GTK `.ui`/Blueprint/CSS, XML (including D-Bus contracts), desktop/service files, infer test use cases, and turn TODO/FIXME markers into explicitly proposed work items.
-7. **Semantic companion.** Optionally starts one long-lived `rust-analyzer` process when explicitly enabled. Reference and implementation answers are persisted as high-confidence edges under an identity containing the source/Cargo digest, lockfile, target, feature profile, build environment, and analyzer version.
-8. **Hybrid retriever.** Builds deterministic symbol-card embeddings locally, performs brute-force cosine ranking, expands typed graph relationships according to query intent, and combines those channels with BM25 using reciprocal-rank fusion. `repo.context_pack` packs the result under an approximate token budget.
-9. **Durable quality learning.** Records redacted bug evidence, deterministic defect families, reviewable scoped invariants, and snapshot-bound validation obligations. Only constraints explicitly made `active` with `approved` or `established` maturity can affect a later change; they add checks, never feature work.
-10. **SQLite FTS, graph, vector, and memory store.** Stores the index and repository-scoped quality memory in `.rust-repo-intelligence/index.sqlite3`. WAL mode, foreign keys, atomic savepoints, explicit published generations, additive schema migrations, and extractor-version invalidation keep evidence consistent.
-
-### Request and refresh flow
+Crusty now separates three kinds of state that previously shared one synchronous request path:
 
 ```text
-MCP client
-   │ JSON-RPC over stdin/stdout
-   ▼
-main.rs ──► Service::refresh_if_stale()
-               │
-               ├─ no watcher/HEAD changes: answer from the published generation
-               ├─ watcher hints: debounce and refresh only affected inputs
-               ├─ periodic reconciliation: verify against Git/content identities
-               ├─ source changes: refresh affected symbols and derived edges
-               └─ Cargo/toolchain/config changes: rebuild the semantic index
-               │
-               ├─ SQLite cache
-               ├─ Cargo metadata / Git history
-               └─ rust-analyzer LSP queries when semantic navigation is needed
+live Rust worktree ── exact search ───────────────► interactive answer
+        │
+        └─ explicit refresh task ─► derived index ─► broad context / change evidence
+
+attached agent ─ local scan + web_search ─► findings ─ human review ─► project work
+                                            │
+                                            └─ durable memory.sqlite3
 ```
 
-The cache is never treated as authoritative for facts it cannot prove. Runtime registration, generated code, dynamic dispatch, external consumers, deployment state, and configuration-selected implementations remain explicit blind spots in responses.
+- Exact source search reads the current worktree and never refreshes.
+- Broad context reads the last atomically published index generation and labels staleness.
+- Refresh, checks, and research are task-backed operations with durable progress and cooperative cancellation.
+- A publisher lease prevents two Crusty processes from publishing the same repository index concurrently.
+- Findings, evidence, research runs, tasks, and human-owned work live outside the rebuildable index.
+- Research uses local evidence plus primary-first `web_search` by the attached agent. Crusty has no GitHub, CI, telemetry, analytics, or product-management connector.
+- Findings cannot become work without human review and explicit promotion.
+- The local dashboard puts the finding inbox first and requires a one-time bootstrap token, an HttpOnly SameSite session, CSRF validation, and a restrictive CSP.
 
-## MCP tooling
+Crusty results are guidance and provenance—not proof. Current source, compiler/runtime behavior, and human decisions remain authoritative.
 
-- `repo.orient`
-- `repo.context_pack`
-- `repo.prepare_change`
-- `repo.expand_context`
-- `repo.history`
-- `repo.checkpoint.create`, `repo.checkpoint.list`, `repo.checkpoint.diff`, `repo.checkpoint.restore_branch`
-- `repo.record_decision`
-- `repo.steering.record`, `repo.steering.list`
-- `repo.validate_change`
-- `repo.cleanup_candidates`
-- `repo.locate`, `repo.explain`, `repo.why`, `repo.constraints`
-- `repo.obsolete_candidates`
-- `repo.work.list`, `repo.work.next`, `repo.work.propose`, `repo.work.update`
-- `repo.problem.record`, `repo.problem.update`, `repo.problem.list`
-- `repo.quality.propose`, `repo.quality.update`, `repo.quality.merge`, `repo.quality.list`, `repo.quality.explain`
-- `repo.validation.queue`, `repo.validation.record`
-- `repo.status`, `repo.refresh`
-- `repo.matrix`
+## Install and connect to Codex
 
-The intended change workflow is:
-
-1. Call `repo.orient` to map an unfamiliar request to likely packages and symbols.
-2. Call `repo.prepare_change` before editing. It creates a snapshot-bound context containing source slices, references, tests, decisions, lifecycle evidence, work items, risk notes, and any applicable learned validation obligations.
-3. Use `repo.expand_context`, `repo.history`, `repo.explain`, or `repo.why` when more evidence is needed.
-4. Make the code change in the client or working tree.
-5. Call `repo.validate_change` with the prepared context and diff. It checks changed-file scope, expected callers, architecture conflicts, legacy paths, and recommended verification. With `run_checks=true`, it also executes deterministic queued recipes and passes changed `.ui`, `.blp`, and `.xml` files to `gtk4-builder-tool`, `blueprint-compiler`, or `xmllint` when installed. Manual or unavailable learned checks remain visible as `unavailable`; they are never silently treated as success.
-
-Problem intake is a separate review loop. `repo.problem.record` redacts evidence, classifies the report, deduplicates it, and creates a `proposed` constraint. Use `repo.quality.update` to narrow or exclude scope, choose `observe`, `validate`, or `block`, and explicitly approve it by setting `status` to `active` and maturity to `approved` or `established`. Manual and visual-only recipes cannot be promoted to blocking. `repo.quality.explain` exposes both positive and negative match evidence, while `repo.validation.queue` separates repository policy, learned checks, and validators inferred from the current change.
-
-The remaining tools support direct discovery (`locate`, `constraints`, `obsolete_candidates`), decision records, cleanup candidates, status/refresh operations, and editable work items. Work-queue and status reads use the durable SQLite cache directly; they do not trigger repository indexing or start the semantic companion. Run `repo.refresh` when automatically discovered work needs to be brought up to date.
-
-## Run and configure
+Install the release binary from a Crusty checkout:
 
 ```bash
-cargo run -- --workspace /path/to/rust/workspace
+cargo install --path . --locked
 ```
 
-The service uses JSON-RPC over standard input/output. It writes its warm index and repository memory to `.rust-repo-intelligence/index.sqlite3` in the target workspace. SQLite runs in WAL mode with foreign keys enabled. The schema-v7 migration from v4-v6 is additive and preserves decisions, steerings, work items, and existing indexed state while creating the quality-memory tables. Incompatible schema resets remain an explicit emergency escape hatch. Add it to a Codex MCP configuration as a stdio command and follow the repository policy in `AGENTS.md`.
+For a new global Codex connection, register the local stdio server with the Codex CLI:
 
-Configure the MCP server under the name `Crusty` so Codex exposes the system by its canonical identity:
+```bash
+CRUSTY_BIN="$(command -v rust-repo-intelligence)"
+codex mcp add Crusty \
+  --env RUST_REPO_INTELLIGENCE_ENABLE_RUST_ANALYZER=1 \
+  -- "$CRUSTY_BIN"
+codex mcp get Crusty
+```
+
+The equivalent manual configuration is:
 
 ```toml
 [mcp_servers.Crusty]
 command = "/absolute/path/to/rust-repo-intelligence"
+
+[mcp_servers.Crusty.env]
+RUST_REPO_INTELLIGENCE_ENABLE_RUST_ANALYZER = "1"
 ```
 
-For a local build:
+Codex stores global MCP configuration in `~/.codex/config.toml`; a trusted project may instead use `.codex/config.toml`. The desktop app, CLI, and IDE extension share the same host configuration. Restart the desktop app or IDE extension after adding or replacing the binary; start a new CLI session so an already-running 0.1 process is not reused. See the [official Codex MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) and the complete [Codex installation and 0.1 migration guide](docs/codex-installation.md).
+
+To upgrade an existing installation in place:
 
 ```bash
-cargo build --release
-./target/release/rust-repo-intelligence --workspace /path/to/rust/workspace
+cargo install --path . --force --locked
+codex mcp get Crusty
 ```
 
-If `--workspace` is omitted, the current directory is used. The default index is static and provenance-labelled. Enable compiler-backed semantic navigation explicitly when the additional memory cost is acceptable:
+The configured command does not change, but the Codex client must restart before it launches the replacement executable.
+
+## Run directly
 
 ```bash
-RUST_REPO_INTELLIGENCE_ENABLE_RUST_ANALYZER=1 cargo run -- --workspace /path/to/rust/workspace
-```
-
-If an explicitly enabled `rust-analyzer` cannot be started, the service continues with its syntax index and reports the attempted program plus the complete startup error in `repo.status`. Resolution prefers an explicit path, then `rustup which rust-analyzer`, then `PATH`:
-
-```bash
-RUST_REPO_INTELLIGENCE_RUST_ANALYZER_PATH=/absolute/path/to/rust-analyzer \
-RUST_REPO_INTELLIGENCE_ENABLE_RUST_ANALYZER=1 \
 cargo run -- --workspace /path/to/rust/workspace
 ```
 
-Filesystem notifications are enabled by default and are used as bounded, debounced hints; database work remains on the service thread. A full Git/content reconciliation runs at startup and periodically to recover from missed or overflowed events. Disable notifications when a filesystem backend is unreliable:
+If `--workspace` is omitted, Crusty uses the current directory. A project-pinned MCP configuration can pass an explicit workspace:
 
-```bash
-RUST_REPO_INTELLIGENCE_ENABLE_WATCHER=0 cargo run -- --workspace /path/to/rust/workspace
+```toml
+[mcp_servers.Crusty]
+command = "/absolute/path/to/rust-repo-intelligence"
+args = ["--workspace", "/absolute/path/to/workspace"]
 ```
 
-Set `RUST_REPO_INTELLIGENCE_FEATURES` and/or `CARGO_BUILD_TARGET` when indexing a non-default semantic profile. Those values are part of semantic-cache identity, so cached compiler facts cannot silently cross profiles.
+Crusty uses the official Rust MCP SDK and negotiates the current protocol supported by that SDK. Standard input/output is reserved for MCP; diagnostics go to standard error.
 
-When enabled, the background analyzer is started lazily on the first index-backed request and configured conservatively: one rust-analyzer worker thread, one Cargo build job, no cache priming, and no editor-style check-on-save diagnostics. Work-queue access never starts it. The normal source indexer is synchronous and single-threaded as well.
+## Public MCP API
 
-The index records source locations, typed syntax/static/semantic edges, local symbol embeddings, Cargo package relationships with feature/cfg contexts, declared package targets and feature definitions, decision targets, Git commits and changed files, file co-change scores, lifecycle evidence, and provenance-labelled use-case/work links. Clean tracked files use Git blob identities; only dirty or untracked inputs are content-hashed. Input changes refresh affected source symbols and derived edges, while Cargo, lockfile, build-script, toolchain, Cargo-config, semantic-profile, schema, or extractor-version changes trigger an atomic full refresh. When enabled, `rust-analyzer` resolves references and implementations on demand and reuses them only within the matching semantic snapshot.
+The 0.2 API is a clean break from the old `repo.*` surface.
 
-Checkpoint creation copies the real Git index into a temporary index, stages tracked worktree changes there, writes a tree and commit object, and updates a hidden checkpoint ref. It never checks out a commit or mutates the user's branch/index. Untracked files are excluded unless `include_untracked=true`; restoration creates a `codex/` branch for review rather than overwriting the current worktree.
+### Navigation and change work
 
-## Evidence model and limitations
+- `repo.search`: `mode=exact` searches live Rust source; `mode=broad` searches the published snapshot.
+- `repo.context`: builds a bounded hybrid context without implicit refresh.
+- `change.prepare`: starts a task that creates a freshness-labelled change briefing before edits.
+- `change.validate`: starts a task that checks a diff against prepared evidence and optionally executes validations; it never refreshes first.
+- `repo.authority`: states Crusty's evidence and ownership boundaries.
 
-- `RustAnalyzer` locations are compiler-backed navigation evidence.
-- Persisted `RustAnalyzer` edges represent resolved references or implementations. `Syntax` edges come from parsed AST paths: qualified and unique resolutions can inform impact, dynamic or ambiguous names cannot.
-- Ambiguous syntax references are recorded separately, exposed in prepared change contexts/status, and excluded from `likely_change_surface`.
-- GTK, Blueprint, CSS, XML/D-Bus, desktop, service, and common configuration artifacts participate in FTS. Searchability is evidence, not proof that runtime registration or external consumers are compatible.
-- `SourceDoc` decisions/lifecycle entries quote source or authored documentation.
-- `Git` entries are historical file-level evidence.
-- `Heuristic` and `AgentInference` entries are never confirmed facts.
-- Work discovered from TODO/FIXME comments is always `proposed`; explicit MCP proposals are attributed to the caller.
-- Deterministic defect classification is a proposal source, not approval. Only reviewed, active learned constraints enter future validation queues, and each obligation retains the matching selectors, original problem links, recipe, enforcement, outcome evidence, and provenance.
-- Problem reports, occurrences, recipes, and validation evidence are redacted before persistence. The built-in redactor removes common email addresses, bearer tokens, access-key/token formats, and secret assignments; callers should still avoid submitting unnecessary private message bodies.
-- The current implementation explicitly reports blind spots for runtime registration, generated code, dynamic dispatch, external consumers, deployment state, and configuration-selected implementations. It does not claim safety from a missing static edge.
+### Index and tasks
+
+- `index.status`, `index.refresh`
+- `task.get`, `task.cancel`
+
+`change.prepare`, `change.validate`, and `index.refresh` return immediately with task IDs. The refresh worker acquires `.rust-repo-intelligence/index.lock`, refreshes in a blocking worker, and publishes atomically. Readers continue using the previous published generation.
+
+### Autonomous research and findings
+
+- `research.start`, `research.get`, `research.packet`, `research.submit`, `research.cancel`
+- `finding.list`, `finding.get`, `finding.review`, `finding.promote`
+
+A research run has explicit maximum web queries, local files, minutes, and findings. `research.start` performs bounded local discovery and prepares questions and web-search queries. The attached agent performs `web_search`, prefers standards, official documentation, maintainers, and original research, then calls `research.submit` with qualified evidence.
+
+Allowed evidence is:
+
+- `local_repository`: a repository path/revision reference;
+- `web_primary`: HTTPS evidence explicitly marked primary;
+- `web_secondary`: HTTPS evidence with a written qualification explaining why it is being used.
+
+Every finding needs evidence and a `technical`, `product`, or `design` category. It starts as `proposed`. A human may review it as `accepted`, `dismissed`, or `needs_evidence`; only an accepted finding can be promoted, and promotion requires explicit human confirmation and reviewer identity.
+
+### Human-owned work
+
+- `work.list`, `work.get`, `work.recommend`, `work.create`, `work.update`
+
+All exact and recommendation queries use the same durable store. `work.recommend` only selects human-owned, accepted or in-progress, unblocked items. Crusty work memory is repository-local intent; it does not replace GitHub issues or a human product backlog.
+
+### Dashboard
+
+- `dashboard.open`
+
+The tool starts an Axum server on a random `127.0.0.1` port and returns a one-time URL. The first viewport is the finding inbox, with review and promotion actions. No external images, scripts, fonts, APIs, or analytics are loaded.
+
+## Storage and migration
+
+Crusty uses two SQLite files:
+
+- `.rust-repo-intelligence/index.sqlite3`: rebuildable source/Cargo/Git/document projections and prepared contexts;
+- `.rust-repo-intelligence/memory.sqlite3`: findings, evidence, research runs, tasks, work, and preserved legacy decision/quality records.
+
+On first 0.2 startup, Crusty copies legacy work into the new work store and preserves decisions, steerings, problem records, and learned quality constraints as JSON legacy records. The old database is never deleted. Both databases use WAL mode; durable memory writes use short connections and a busy timeout.
+
+No manual SQL migration is required. Durable-memory import happens automatically when 0.2 first opens a repository. Because 0.2 never refreshes implicitly, each existing project needs one explicit `index.refresh`, followed through `task.get`, to publish the indexer-v8 backfill and `symbol-card-v1` vectors. Live `repo.search` with `mode=exact` works before that refresh; broad search and context continue to label the last published generation as stale until the task finishes.
+
+The existing syntax/Cargo/Git/rust-analyzer engine remains the broad-intelligence implementation. Compiler-backed evidence is highest-confidence, while ambiguity-suppressed static evidence remains visible but never enters a likely change surface merely because a short name matched.
+
+Broad retrieval now uses versioned symbol cards stored as vectors in the rebuildable SQLite index. Exact identifiers are ordered before non-exact fused candidates; FTS5/BM25, local vector similarity, and typed graph expansion then combine through deterministic reciprocal-rank fusion. Results expose the embedding model, dimensions, card hash/version, semantic snapshot, similarity, and contributing channels. Incremental refresh recomputes changed cards and reuses unchanged vectors. The default `subword-hash-v1` model is offline discovery assistance, not a learned code model or compiler evidence.
+
+## Latency contract
+
+The service-level objectives are:
+
+- live exact navigation: p95 below 150 ms;
+- warm indexed intelligence: p95 below 750 ms;
+- work expected to exceed 2 seconds: asynchronous task acknowledgement rather than an occupied MCP request.
+
+Run the release-mode regression harness against this repository or another indexed Rust workspace:
+
+```bash
+cargo run --release --example observatory_evaluate -- "$PWD"
+```
+
+It warms both paths, samples live exact search and indexed context, prints p50/p95 JSON, and fails when either synchronous SLO is exceeded. The older retrieval-quality harness remains available as `cargo run --release --example evaluate -- "$PWD"`.
 
 ## Development and verification
-
-The project is intentionally dependency-light: SQLite is bundled through `rusqlite`, and the remaining dependencies cover JSON, dates, hashing, regex scanning, and directory traversal. The standard verification commands are:
 
 ```bash
 cargo fmt --all -- --check
@@ -157,17 +170,17 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The regression suite covers FTS and hybrid ranking, ambiguity-suppressed AST references, affected-file precision, GTK/D-Bus artifact retrieval, embeddings, typed structural edges, semantic-cache reuse and startup diagnostics, watcher input hints, generation publication, per-symbol caller attribution, atomic rollback, extractor-version backfill, Git history links, checkpoints, incremental refreshes, decisions, work items, validation diff parsing, lifecycle classification, and bounded rust-analyzer settings. A reproducible release-mode latency/recall/forbidden-hit harness is also available:
+The observatory regression suite covers dirty-worktree visibility, one-store work lookup/recommendation, review-gated promotion, the clean-break tool contract, and the dashboard's no-external-assets rule. The legacy suite continues covering index publication, Cargo and syntax relationships, ambiguity suppression, ranking, migrations, checkpoints, quality learning, and validation.
 
-```bash
-cargo run --release --example evaluate -- "$PWD"
-```
+## Known boundaries
+
+- A stale snapshot can omit current relationships; every indexed answer says so.
+- Exact search is textual Rust navigation, not compiler proof.
+- Static analysis cannot prove dynamic dispatch, generated code, runtime registration, deployment state, external consumers, or unindexed feature profiles.
+- Cooperative cancellation does not interrupt an index transaction during publication.
+- A recorded recurrence is intent only; Crusty does not become an unattended web crawler or install external connectors.
+- External source content is stored as bounded evidence summaries, never executed as instructions.
 
 ## License
 
-Licensed under the GNU General Public License, version 3 or later. See [LICENSE](LICENSE).
-
-## Roadmap
-
-FTS5/vector/graph reciprocal-rank fusion, token-budgeted context packs, semantic-edge caching, Git/watcher-aware invalidation, explicit atomic generations, Git checkpoints, and the Cargo-declared feature/target matrix are implemented. `repo.matrix` now emits a bounded default/no-default/all-features/individual-feature verification plan; it does not pretend those commands were executed or cover every feature interaction. The local embedding model is deliberately deterministic and offline; replacing it with a learned code model is justified only when a broader evaluation corpus demonstrates enough recall gain to offset model downloads and cold-start cost. Target-specific matrix execution, deeper framework validators, contradiction-aware decision extraction, and broader multi-repository corpora remain future work.
-# crusty
+GNU General Public License, version 3 or later. See [LICENSE](LICENSE).
