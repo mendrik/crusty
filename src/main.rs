@@ -5,9 +5,9 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use rust_repo_intelligence::observatory::{
-    ContextRequest, Observatory, PrepareRequest, PromoteFindingRequest, ResearchStartRequest,
-    ResearchSubmitRequest, ReviewFindingRequest, SearchRequest, ValidateRequest, WorkCreateRequest,
-    WorkUpdateRequest,
+    ContextRequest, MemorySearchRequest, Observatory, PrepareRequest, PromoteFindingRequest,
+    ResearchStartRequest, ResearchSubmitRequest, ReviewFindingRequest, SearchRequest,
+    ValidateRequest, WorkCreateRequest, WorkUpdateRequest,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -333,6 +333,21 @@ impl CrustyServer {
     }
 
     #[tool(
+        name = "memory.search",
+        description = "Recover repository-scoped user prompts from Codex primary and side-session history and search preserved legacy decisions, steerings, problems, and quality constraints. Read-only results never become work without explicit human creation."
+    )]
+    async fn memory_search(
+        &self,
+        Parameters(request): Parameters<MemorySearchRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        let result = tokio::task::spawn_blocking(move || observatory.memory_search(request))
+            .await
+            .map_err(|error| format!("memory search task failed: {error}"))?;
+        Self::value(result)
+    }
+
+    #[tool(
         name = "dashboard.open",
         description = "Start the authenticated loopback findings dashboard and return its one-time URL."
     )]
@@ -358,7 +373,7 @@ impl CrustyServer {
 
 #[tool_handler(
     name = "Crusty",
-    version = "0.2.0",
+    version = "0.2.1",
     instructions = "Crusty is a Rust repository observatory. Use repo.search exact for live call-site work; it never refreshes. Use change.prepare before edits and change.validate afterwards, polling both with task.get. Change preparation, validation, refresh, and research are explicit durable tasks. Research uses local repository evidence plus primary-first web_search by the attached agent; no external connectors are available. Findings are proposals and only a human may review or promote them into work. Source, compiler/runtime behavior, and human ownership remain authoritative."
 )]
 impl ServerHandler for CrustyServer {}
@@ -389,6 +404,7 @@ mod tests {
         assert!(names.contains(&"repo.search".into()));
         assert!(names.contains(&"research.start".into()));
         assert!(names.contains(&"finding.promote".into()));
+        assert!(names.contains(&"memory.search".into()));
         assert!(!names.contains(&"repo.refresh".into()));
         assert_eq!(server.get_info().server_info.name, "Crusty");
         Ok(())

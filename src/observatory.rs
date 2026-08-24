@@ -6,14 +6,16 @@
 
 use crate::Service;
 use anyhow::{Context, Result, bail, ensure};
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use rand::random;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    fs,
+    collections::HashSet,
+    env, fs,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
@@ -252,6 +254,16 @@ pub struct WorkUpdateRequest {
     pub title: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct MemorySearchRequest {
+    /// Natural-language or exact text to find in project prompts and preserved memory.
+    pub query: String,
+    #[serde(default = "default_memory_limit")]
+    pub limit: usize,
+    #[serde(default = "default_prompt_chars")]
+    pub max_prompt_chars: usize,
+}
+
 fn default_confidence() -> f64 {
     0.7
 }
@@ -278,6 +290,12 @@ fn default_budget() -> usize {
 }
 fn default_depth() -> usize {
     2
+}
+fn default_memory_limit() -> usize {
+    50
+}
+fn default_prompt_chars() -> usize {
+    12_000
 }
 fn exact() -> String {
     "exact".into()
@@ -347,12 +365,12 @@ impl Observatory {
             |row| row.get(0),
         )?;
         let legacy = self.root.join(STATE_DIRECTORY).join("index.sqlite3");
-        if !migrated && legacy.exists() {
+        if legacy.exists() {
             db.execute(
                 "ATTACH DATABASE ?1 AS legacy",
                 [legacy.to_string_lossy().as_ref()],
             )?;
-            if attached_table_exists(&db, "work_items")? {
+            if !migrated && attached_table_exists(&db, "work_items")? {
                 db.execute_batch(
                     r#"
                     INSERT OR IGNORE INTO work_items(
@@ -370,10 +388,12 @@ impl Observatory {
             }
             migrate_legacy_summaries(&db)?;
             db.execute("DETACH DATABASE legacy", [])?;
-            db.execute(
-                "INSERT OR REPLACE INTO metadata(key,value) VALUES ('legacy_v7_migrated',?1)",
-                [Utc::now().to_rfc3339()],
-            )?;
+            if !migrated {
+                db.execute(
+                    "INSERT OR REPLACE INTO metadata(key,value) VALUES ('legacy_v7_migrated',?1)",
+                    [Utc::now().to_rfc3339()],
+                )?;
+            }
         }
         Ok(())
     }
@@ -966,7 +986,7 @@ impl Observatory {
             .and_then(|items| {
                 items.iter().find(|item| {
                     item["human_owned"] == true
-                        && ["accepted", "in_progress"]
+                        && ["accepted", "active", "in_progress"]
                             .contains(&item["status"].as_str().unwrap_or(""))
                         && item["blocked_by"].as_array().is_none_or(Vec::is_empty)
                 })
@@ -996,6 +1016,79 @@ impl Observatory {
         )?;
         db.execute("UPDATE work_items SET title=?1,status=?2,priority=?3,human_owned=1,provenance='HumanDecision',updated_at=?4 WHERE id=?5", params![request.title.unwrap_or(current.0),request.status.unwrap_or(current.1),request.priority.unwrap_or(current.2),Utc::now().to_rfc3339(),request.work_id])?;
         self.work_get(&request.work_id)
+    }
+
+    pub fn memory_search(&self, request: MemorySearchRequest) -> Result<Value> {
+        ensure!(!request.query.trim().is_empty(), "query cannot be empty");
+        ensure!(
+            request.query.len() <= 500,
+            "query must be at most 500 bytes"
+        );
+        ensure!(
+            request.limit > 0 && request.limit <= 200,
+            "limit must be 1..=200"
+        );
+        ensure!(
+            (200..=50_000).contains(&request.max_prompt_chars),
+            "max_prompt_chars must be 200..=50000"
+        );
+        let records = self.search_legacy_memory(&request.query, request.limit)?;
+        let (prompts, history) = search_codex_prompt_history(
+            self.root.as_path(),
+            &request.query,
+            request.limit,
+            request.max_prompt_chars,
+            codex_home(),
+        )?;
+        Ok(json!({
+            "query": request.query,
+            "repository": self.root,
+            "prompts": prompts,
+            "records": records,
+            "history": history,
+            "authority": {
+                "prompts": "verbatim user-authored Codex session history scoped to this repository",
+                "records": "preserved legacy decisions, steerings, problems, and quality constraints",
+                "work": "recovered prompts and records do not become project work until a human explicitly creates or confirms work"
+            }
+        }))
+    }
+
+    fn search_legacy_memory(&self, query: &str, limit: usize) -> Result<Vec<Value>> {
+        let db = self.db()?;
+        let mut statement = db.prepare(
+            "SELECT kind,id,payload_json,migrated_at FROM legacy_records ORDER BY migrated_at DESC",
+        )?;
+        let mut matches = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .filter_map(rusqlite::Result::ok)
+            .filter_map(|(kind, id, payload, migrated_at)| {
+                search_score(&format!("{kind} {id} {payload}"), query).map(|score| {
+                    (
+                        score,
+                        json!({
+                            "kind": kind,
+                            "id": id,
+                            "payload": json_from(&payload),
+                            "migrated_at": migrated_at,
+                        }),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| right.0.cmp(&left.0));
+        Ok(matches
+            .into_iter()
+            .take(limit)
+            .map(|(_, value)| value)
+            .collect())
     }
 
     pub fn task_get(&self, id: &str) -> Result<Value> {
@@ -1149,18 +1242,347 @@ fn ensure_column(db: &Connection, table: &str, column: &str, kind: &str) -> Resu
 fn migrate_legacy_summaries(db: &Connection) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     if attached_table_exists(db, "decisions")? {
-        db.execute("INSERT OR IGNORE INTO legacy_records(kind,id,payload_json,migrated_at) SELECT 'decision',id,json_object('title',title,'status',status,'rationale',rationale,'applies_to',applies_to,'consequences',consequences,'revision',revision,'created_at',created_at),?1 FROM legacy.decisions", [&now])?;
+        db.execute("INSERT OR REPLACE INTO legacy_records(kind,id,payload_json,migrated_at) SELECT 'decision',id,json_object('title',title,'status',status,'rationale',rationale,'applies_to',applies_to,'consequences',consequences,'revision',revision,'created_at',created_at),?1 FROM legacy.decisions", [&now])?;
     }
     if attached_table_exists(db, "steerings")? {
-        db.execute("INSERT OR IGNORE INTO legacy_records(kind,id,payload_json,migrated_at) SELECT 'steering',id,json_object('title',title,'status',status,'priority',priority,'instruction',instruction,'scope',scope,'revision',revision,'created_at',created_at),?1 FROM legacy.steerings", [&now])?;
+        db.execute("INSERT OR REPLACE INTO legacy_records(kind,id,payload_json,migrated_at) SELECT 'steering',id,json_object('title',title,'status',status,'priority',priority,'instruction',instruction,'scope',scope,'revision',revision,'created_at',created_at),?1 FROM legacy.steerings", [&now])?;
     }
     if attached_table_exists(db, "problem_records")? {
-        db.execute("INSERT OR IGNORE INTO legacy_records(kind,id,payload_json,migrated_at) SELECT 'problem',id,json_object('summary',summary,'family',family,'status',status,'scope',scope_json,'root_cause',root_cause,'fix_reference',fix_reference,'evidence',evidence_json,'revision',revision,'created_at',created_at),?1 FROM legacy.problem_records", [&now])?;
+        db.execute("INSERT OR REPLACE INTO legacy_records(kind,id,payload_json,migrated_at) SELECT 'problem',id,json_object('summary',summary,'family',family,'status',status,'scope',scope_json,'root_cause',root_cause,'fix_reference',fix_reference,'evidence',evidence_json,'revision',revision,'created_at',created_at),?1 FROM legacy.problem_records", [&now])?;
     }
     if attached_table_exists(db, "quality_constraints")? {
-        db.execute("INSERT OR IGNORE INTO legacy_records(kind,id,payload_json,migrated_at) SELECT 'quality_constraint',id,json_object('rule',rule,'category',category,'status',status,'scope',scope_json,'recipe',recipe_json,'enforcement',enforcement,'maturity',maturity,'revision',revision,'created_at',created_at),?1 FROM legacy.quality_constraints", [&now])?;
+        db.execute("INSERT OR REPLACE INTO legacy_records(kind,id,payload_json,migrated_at) SELECT 'quality_constraint',id,json_object('rule',rule,'category',category,'status',status,'scope',scope_json,'recipe',recipe_json,'enforcement',enforcement,'maturity',maturity,'revision',revision,'created_at',created_at),?1 FROM legacy.quality_constraints", [&now])?;
     }
     Ok(())
+}
+
+fn codex_home() -> Option<PathBuf> {
+    env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+}
+
+fn search_codex_prompt_history(
+    repository: &Path,
+    query: &str,
+    limit: usize,
+    max_prompt_chars: usize,
+    codex_home: Option<PathBuf>,
+) -> Result<(Vec<Value>, Value)> {
+    let Some(codex_home) = codex_home else {
+        return Ok((
+            Vec::new(),
+            json!({"available":false,"reason":"Codex home could not be resolved"}),
+        ));
+    };
+    let (thread_ids, rollout_files, side_session_files) =
+        project_session_sources(&codex_home, repository)?;
+    if thread_ids.is_empty() {
+        return Ok((
+            Vec::new(),
+            json!({
+                "available": false,
+                "reason": "No Codex session metadata matched this repository",
+                "session_root": codex_home.join("sessions"),
+            }),
+        ));
+    }
+
+    let history_db = codex_home.join("thread_history_1.sqlite");
+    let (prompts, source, scanned) = if history_db.exists() {
+        match search_thread_history_db(&history_db, &thread_ids, query, limit, max_prompt_chars) {
+            Ok((prompts, scanned)) => (prompts, "thread_history_1.sqlite", scanned),
+            Err(_) => {
+                let (prompts, scanned) =
+                    search_rollout_logs(&rollout_files, query, limit, max_prompt_chars)?;
+                (prompts, "rollout_jsonl_fallback", scanned)
+            }
+        }
+    } else {
+        let (prompts, scanned) =
+            search_rollout_logs(&rollout_files, query, limit, max_prompt_chars)?;
+        (prompts, "rollout_jsonl", scanned)
+    };
+    Ok((
+        prompts,
+        json!({
+            "available": true,
+            "source": source,
+            "project_threads": thread_ids.len(),
+            "project_rollout_files": rollout_files.len(),
+            "side_session_files": side_session_files,
+            "messages_scanned": scanned,
+            "scope": "session metadata cwd exactly matches the current repository",
+            "privacy": "only matching user-authored text is returned; tool output and assistant content are excluded",
+        }),
+    ))
+}
+
+fn project_session_sources(
+    codex_home: &Path,
+    repository: &Path,
+) -> Result<(HashSet<String>, Vec<PathBuf>, usize)> {
+    let sessions = codex_home.join("sessions");
+    if !sessions.exists() {
+        return Ok((HashSet::new(), Vec::new(), 0));
+    }
+    let canonical_repository =
+        fs::canonicalize(repository).unwrap_or_else(|_| repository.to_path_buf());
+    let mut thread_ids = HashSet::new();
+    let mut files = Vec::new();
+    let mut side_session_files = 0;
+    for entry in WalkDir::new(&sessions)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|value| value == "jsonl")
+        })
+    {
+        let file = fs::File::open(entry.path())?;
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let mut metadata = None;
+        for _ in 0..8 {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if value["type"] == "session_meta" {
+                metadata = Some(value);
+                break;
+            }
+        }
+        let Some(metadata) = metadata else {
+            continue;
+        };
+        let Some(cwd) = metadata["payload"]["cwd"].as_str() else {
+            continue;
+        };
+        let session_repository = fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
+        if session_repository != canonical_repository {
+            continue;
+        }
+        if let Some(id) = metadata["payload"]["id"].as_str() {
+            thread_ids.insert(id.to_owned());
+        }
+        if let Some(id) = metadata["payload"]["history_base"]["thread_id"].as_str() {
+            thread_ids.insert(id.to_owned());
+        }
+        if entry
+            .path()
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.contains("_01"))
+        {
+            side_session_files += 1;
+        }
+        files.push(entry.path().to_path_buf());
+    }
+    Ok((thread_ids, files, side_session_files))
+}
+
+fn search_thread_history_db(
+    path: &Path,
+    project_threads: &HashSet<String>,
+    query: &str,
+    limit: usize,
+    max_prompt_chars: usize,
+) -> Result<(Vec<Value>, usize)> {
+    let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut statement = db.prepare(
+        "SELECT thread_id,turn_id,rollout_ordinal,created_at_ms,item_json
+         FROM thread_items WHERE item_type='userMessage'
+         ORDER BY created_at_ms DESC LIMIT 250000",
+    )?;
+    let mut scanned = 0;
+    let mut seen = HashSet::new();
+    let mut matches = Vec::new();
+    for row in statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })? {
+        let (thread_id, turn_id, ordinal, created_at_ms, raw) = row?;
+        if !project_threads.contains(&thread_id) {
+            continue;
+        }
+        scanned += 1;
+        let Some((text, images)) = prompt_from_item_json(&raw) else {
+            continue;
+        };
+        if !is_user_prompt(&text) {
+            continue;
+        }
+        let Some(score) = search_score(&text, query) else {
+            continue;
+        };
+        let dedupe = format!("{thread_id}\n{text}");
+        if !seen.insert(dedupe) {
+            continue;
+        }
+        let original_chars = text.chars().count();
+        let provenance = format!("codex-thread://{thread_id}/{turn_id}/{ordinal}");
+        matches.push((
+            score,
+            created_at_ms,
+            json!({
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "rollout_ordinal": ordinal,
+                "created_at": Utc.timestamp_millis_opt(created_at_ms).single().map(|value| value.to_rfc3339()),
+                "text": bounded(&text, max_prompt_chars),
+                "original_chars": original_chars,
+                "truncated": text.len() > max_prompt_chars,
+                "images": images,
+                "provenance": provenance,
+            }),
+        ));
+    }
+    matches.sort_by(|left, right| right.0.cmp(&left.0).then(right.1.cmp(&left.1)));
+    Ok((
+        matches
+            .into_iter()
+            .take(limit)
+            .map(|(_, _, value)| value)
+            .collect(),
+        scanned,
+    ))
+}
+
+fn search_rollout_logs(
+    files: &[PathBuf],
+    query: &str,
+    limit: usize,
+    max_prompt_chars: usize,
+) -> Result<(Vec<Value>, usize)> {
+    let mut matches = Vec::new();
+    let mut seen = HashSet::new();
+    let mut scanned = 0;
+    for path in files {
+        let file = fs::File::open(path)?;
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if value["type"] != "response_item"
+                || value["payload"]["type"] != "message"
+                || value["payload"]["role"] != "user"
+            {
+                continue;
+            }
+            scanned += 1;
+            let text = value["payload"]["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|part| part["type"] == "input_text")
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !is_user_prompt(&text) || !seen.insert(text.clone()) {
+                continue;
+            }
+            let Some(score) = search_score(&text, query) else {
+                continue;
+            };
+            let timestamp = value["timestamp"].as_str().unwrap_or_default().to_owned();
+            let original_chars = text.chars().count();
+            let session = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("unknown")
+                .to_owned();
+            let provenance = format!("codex-rollout://{session}");
+            matches.push((
+                score,
+                timestamp.clone(),
+                json!({
+                    "session": session,
+                    "created_at": timestamp,
+                    "text": bounded(&text, max_prompt_chars),
+                    "original_chars": original_chars,
+                    "truncated": text.len() > max_prompt_chars,
+                    "provenance": provenance,
+                }),
+            ));
+        }
+    }
+    matches.sort_by(|left, right| right.0.cmp(&left.0).then(right.1.cmp(&left.1)));
+    Ok((
+        matches
+            .into_iter()
+            .take(limit)
+            .map(|(_, _, value)| value)
+            .collect(),
+        scanned,
+    ))
+}
+
+fn prompt_from_item_json(raw: &str) -> Option<(String, Vec<String>)> {
+    let value = serde_json::from_str::<Value>(raw).ok()?;
+    let content = value["content"].as_array()?;
+    let text = content
+        .iter()
+        .filter(|part| part["type"] == "text")
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let images = content
+        .iter()
+        .filter(|part| part["type"] == "localImage")
+        .filter_map(|part| part["path"].as_str())
+        .map(str::to_owned)
+        .collect();
+    (!text.trim().is_empty()).then_some((text, images))
+}
+
+fn is_user_prompt(text: &str) -> bool {
+    let text = text.trim_start();
+    ![
+        "# AGENTS.md instructions",
+        "<codex_internal_context",
+        "<environment_context",
+        "<recommended_plugins",
+        "<turn_aborted",
+        "<user_shell_command",
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix))
+}
+
+fn search_score(text: &str, query: &str) -> Option<usize> {
+    let text = text.to_lowercase();
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Some(1);
+    }
+    let mut score = usize::from(text.contains(&query)) * 100;
+    let mut matched = 0;
+    for term in query
+        .split(|character: char| {
+            !character.is_alphanumeric() && character != '_' && character != '-'
+        })
+        .filter(|term| term.len() >= 2)
+    {
+        if text.contains(term) {
+            matched += 1;
+            score += 10;
+        }
+    }
+    (matched > 0).then_some(score)
 }
 
 fn insert_finding(db: &Connection, run_id: &str, finding: FindingInput) -> Result<String> {
@@ -1437,6 +1859,121 @@ mod tests {
         Ok((directory, observatory))
     }
 
+    #[test]
+    fn prompt_recovery_is_project_scoped_and_includes_side_session_history() -> Result<()> {
+        let (repository, _observatory) = workspace()?;
+        let codex = tempdir()?;
+        let sessions = codex.path().join("sessions/2026/08/24");
+        fs::create_dir_all(&sessions)?;
+        let thread_id = "thread-project";
+        let metadata = json!({
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "cwd": repository.path(),
+                "history_base": {"thread_id": thread_id}
+            }
+        });
+        fs::write(
+            sessions.join("rollout-test_01-side.jsonl"),
+            format!("{}\n", serde_json::to_string(&metadata)?),
+        )?;
+
+        let history = Connection::open(codex.path().join("thread_history_1.sqlite"))?;
+        history.execute_batch(
+            "CREATE TABLE thread_items(
+                thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, item_id TEXT NOT NULL,
+                rollout_ordinal INTEGER NOT NULL, created_at_ms INTEGER NOT NULL,
+                item_json TEXT NOT NULL, item_type TEXT NOT NULL DEFAULT '',
+                updated_at_ordinal INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(thread_id,turn_id,item_id));",
+        )?;
+        let prompt = json!({
+            "type": "userMessage",
+            "content": [
+                {"type":"localImage","path":"/tmp/reference.png"},
+                {"type":"text","text":"Hide secondary Evidence and Activity behind toggles."}
+            ]
+        });
+        history.execute(
+            "INSERT INTO thread_items VALUES (?1,'turn-1','item-1',9,1787520000000,?2,'userMessage',0)",
+            params![thread_id, serde_json::to_string(&prompt)?],
+        )?;
+        let unrelated = json!({
+            "type": "userMessage",
+            "content": [{"type":"text","text":"Hide secondary content in another project."}]
+        });
+        history.execute(
+            "INSERT INTO thread_items VALUES ('thread-other','turn-2','item-2',9,1787520000001,?1,'userMessage',0)",
+            [serde_json::to_string(&unrelated)?],
+        )?;
+        let injected = json!({
+            "type": "userMessage",
+            "content": [{"type":"text","text":"# AGENTS.md instructions\nHide secondary Evidence."}]
+        });
+        history.execute(
+            "INSERT INTO thread_items VALUES (?1,'turn-3','item-3',10,1787520000002,?2,'userMessage',0)",
+            params![thread_id, serde_json::to_string(&injected)?],
+        )?;
+        drop(history);
+
+        let (prompts, provenance) = search_codex_prompt_history(
+            repository.path(),
+            "secondary evidence activity",
+            10,
+            2_000,
+            Some(codex.path().to_path_buf()),
+        )?;
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(
+            prompts[0]["text"],
+            "Hide secondary Evidence and Activity behind toggles."
+        );
+        assert_eq!(prompts[0]["images"][0], "/tmp/reference.png");
+        assert_eq!(provenance["source"], "thread_history_1.sqlite");
+        assert_eq!(provenance["side_session_files"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn later_legacy_decisions_remain_visible_after_the_initial_migration() -> Result<()> {
+        let directory = tempdir()?;
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname='fixture'\nversion='0.1.0'\nedition='2024'\n",
+        )?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "")?;
+        let state = directory.path().join(STATE_DIRECTORY);
+        fs::create_dir(&state)?;
+        let legacy_path = state.join("index.sqlite3");
+        let legacy = Connection::open(&legacy_path)?;
+        legacy.execute_batch(
+            "CREATE TABLE decisions(
+                id TEXT PRIMARY KEY, sequence INTEGER, status TEXT, title TEXT,
+                rationale TEXT, applies_to TEXT, consequences TEXT,
+                supersedes TEXT, revision TEXT, created_at TEXT);
+             INSERT INTO decisions VALUES(
+                'DEC-1',1,'accepted','First','why','[]','[]',NULL,'r1','now');",
+        )?;
+        drop(legacy);
+        drop(Observatory::open(directory.path())?);
+
+        let legacy = Connection::open(&legacy_path)?;
+        legacy.execute_batch(
+            "INSERT INTO decisions VALUES(
+                'DEC-2',2,'accepted','Secondary information','progressive disclosure',
+                '[\"work inspector\"]','[\"collapse evidence\"]',NULL,'r2','later');",
+        )?;
+        drop(legacy);
+
+        let observatory = Observatory::open(directory.path())?;
+        let records = observatory.search_legacy_memory("collapse evidence", 10)?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["id"], "DEC-2");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn exact_search_reads_dirty_worktree_without_refresh() -> Result<()> {
         let (directory, observatory) = workspace()?;
@@ -1505,6 +2042,28 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(
+            observatory.work_recommend(Some(id))?["recommendation"]["id"],
+            id
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn active_work_remains_recommendable() -> Result<()> {
+        let (_directory, observatory) = workspace()?;
+        let created = observatory.work_create(WorkCreateRequest {
+            title: "Continue the active repair".into(),
+            confirm_human: true,
+            status: "active".into(),
+            priority: "critical".into(),
+            kind: "technical".into(),
+            scope: vec!["src/lib.rs".into()],
+            evidence: vec![],
+            acceptance_criteria: vec![],
+            verification: vec![],
+        })?;
+        let id = created["work_id"].as_str().unwrap();
         assert_eq!(
             observatory.work_recommend(Some(id))?["recommendation"]["id"],
             id

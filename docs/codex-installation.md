@@ -90,11 +90,12 @@ Projects can migrate lazily when next opened. Before the refresh, `repo.search(m
 
 ## Verify the installation
 
-A successful 0.2 MCP initialization reports server name `Crusty`, version `0.2.0`, and the clean-break tool surface. A useful smoke sequence is:
+A successful installation reports server name `Crusty`, version `0.2.1`, and the clean-break tool surface. A useful smoke sequence is:
 
 1. `repo.authority`
 2. `index.status`
 3. `repo.search` with `mode=exact`
 4. `repo.context` after an explicit project refresh
+5. `memory.search` with a phrase from a prior project prompt; confirm unrelated repositories and assistant/tool output are absent
 
 Crusty research never opens arbitrary external connectors. `research.start` produces a bounded evidence packet; the attached agent performs primary-first `web_search` and returns qualified evidence through `research.submit`. Findings remain proposals until a human reviews them, and promotion to work requires explicit human confirmation.

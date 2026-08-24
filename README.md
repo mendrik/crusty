@@ -25,6 +25,7 @@ attached agent ─ local scan + web_search ─► findings ─ human review ─�
 - Findings, evidence, research runs, tasks, and human-owned work live outside the rebuildable index.
 - Research uses local evidence plus primary-first `web_search` by the attached agent. Crusty has no GitHub, CI, telemetry, analytics, or product-management connector.
 - Findings cannot become work without human review and explicit promotion.
+- `memory.search` recovers repository-scoped, user-authored Codex prompts from primary and side-session history and searches preserved legacy guidance without copying either into the work queue.
 - The local dashboard puts the finding inbox first and requires a one-time bootstrap token, an HttpOnly SameSite session, CSRF validation, and a restrictive CSP.
 
 Crusty results are guidance and provenance—not proof. Current source, compiler/runtime behavior, and human decisions remain authoritative.
@@ -122,7 +123,13 @@ Every finding needs evidence and a `technical`, `product`, or `design` category.
 
 - `work.list`, `work.get`, `work.recommend`, `work.create`, `work.update`
 
-All exact and recommendation queries use the same durable store. `work.recommend` only selects human-owned, accepted or in-progress, unblocked items. Crusty work memory is repository-local intent; it does not replace GitHub issues or a human product backlog.
+All exact and recommendation queries use the same durable store. `work.recommend` only selects human-owned, accepted or active, unblocked items (and still recognizes the historical `in_progress` spelling). Crusty work memory is repository-local intent; it does not replace GitHub issues or a human product backlog.
+
+### Recovered project memory
+
+- `memory.search`
+
+`memory.search` searches two existing sources without creating another authority: preserved legacy decisions, steerings, problems, and quality constraints in `memory.sqlite3`, plus user-authored Codex prompts in the host's session history. Prompt recovery is scoped to sessions whose recorded working directory exactly matches the active repository. Primary and side-session history are included; assistant text, tool output, injected repository instructions, and unrelated-project prompts are excluded. Results are bounded and read-only. A recovered prompt becomes project work only through an explicit human-confirmed `work.create` call.
 
 ### Dashboard
 
@@ -137,7 +144,7 @@ Crusty uses two SQLite files:
 - `.rust-repo-intelligence/index.sqlite3`: rebuildable source/Cargo/Git/document projections and prepared contexts;
 - `.rust-repo-intelligence/memory.sqlite3`: findings, evidence, research runs, tasks, work, and preserved legacy decision/quality records.
 
-On first 0.2 startup, Crusty copies legacy work into the new work store and preserves decisions, steerings, problem records, and learned quality constraints as JSON legacy records. The old database is never deleted. Both databases use WAL mode; durable memory writes use short connections and a busy timeout.
+On first 0.2 startup, Crusty copies legacy work into the new work store and preserves decisions, steerings, problem records, and learned quality constraints as JSON legacy records. On later opens it refreshes those preserved read-only summaries so guidance added after the initial migration remains discoverable. The old database is never deleted. Both databases use WAL mode; durable memory writes use short connections and a busy timeout.
 
 No manual SQL migration is required. Durable-memory import happens automatically when 0.2 first opens a repository. Because 0.2 never refreshes implicitly, each existing project needs one explicit `index.refresh`, followed through `task.get`, to publish the indexer-v8 backfill and `symbol-card-v1` vectors. Live `repo.search` with `mode=exact` works before that refresh; broad search and context continue to label the last published generation as stale until the task finishes.
 
@@ -170,7 +177,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The observatory regression suite covers dirty-worktree visibility, one-store work lookup/recommendation, review-gated promotion, the clean-break tool contract, and the dashboard's no-external-assets rule. The legacy suite continues covering index publication, Cargo and syntax relationships, ambiguity suppression, ranking, migrations, checkpoints, quality learning, and validation.
+The observatory regression suite covers dirty-worktree visibility, one-store work lookup/recommendation, repository-scoped primary/side-session prompt recovery, late legacy-memory synchronization, review-gated promotion, the clean-break tool contract, and the dashboard's no-external-assets rule. The legacy suite continues covering index publication, Cargo and syntax relationships, ambiguity suppression, ranking, migrations, checkpoints, quality learning, and validation.
 
 ## Known boundaries
 

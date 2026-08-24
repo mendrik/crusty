@@ -22,6 +22,8 @@ Repository-local state lives under the ignored `.rust-repo-intelligence/` direct
 
 Both databases use SQLite WAL mode. Index publication is transactional, while durable-memory operations use short connections and a busy timeout. Indexing never modifies repository source files.
 
+Codex's own session history remains owned by Codex and is not copied into either Crusty database. `memory.search` reads it on demand, uses session metadata to restrict results to the exact active repository, includes side-session records represented in the thread-history projection, excludes assistant/tool/injected-context content, and returns bounded matching user prompts with provenance. This is recovery evidence, not a new canonical roadmap.
+
 ## Hybrid retrieval
 
 `repo.context` and broad search combine FTS5/BM25, deterministic local symbol-card embeddings, and intent-directed typed graph expansion. Reciprocal-rank fusion combines ranks without treating lexical and cosine scores as interchangeable. Exact symbol identities always precede non-exact fused candidates, and ranking ties and graph seeds are deterministic.
@@ -46,7 +48,9 @@ Legacy approved quality constraints may still contribute validation evidence. Cr
 
 Every finding is categorized as technical, product, or design and begins as `proposed`. `finding.review` records a human decision. `finding.promote` can create project work only after acceptance and explicit human confirmation.
 
-`work.list`, `work.get`, `work.recommend`, `work.create`, and `work.update` all use `memory.sqlite3`. Recommendations include only human-owned, accepted or in-progress, unblocked work. Crusty's ledger records repository-local intent; it does not replace GitHub issues or a human product backlog.
+`work.list`, `work.get`, `work.recommend`, `work.create`, and `work.update` all use `memory.sqlite3`. Recommendations include only human-owned, accepted or active, unblocked work; the historical `in_progress` spelling remains readable. Crusty's ledger records repository-local intent; it does not replace GitHub issues or a human product backlog.
+
+`memory.search` is the read-only recovery boundary for human-authored Codex prompts and preserved legacy decisions, steerings, problems, and quality constraints. It does not promote, infer, summarize, or mutate work. An attached agent must present recovered intent faithfully and use explicit human-confirmed `work.create` before it enters the queue.
 
 ## Migration from 0.1
 
@@ -56,7 +60,7 @@ No manual SQL migration is required. On first 0.2 open:
 
 1. Crusty creates `memory.sqlite3`.
 2. Legacy work is copied into the 0.2 work store.
-3. Decisions, steerings, problems, and quality constraints are preserved as legacy records.
+3. Decisions, steerings, problems, and quality constraints are preserved as legacy records and synchronized again on later opens so post-migration guidance remains visible.
 4. The old index database is left in place and is not deleted by the import.
 
 Derived evidence is intentionally migrated separately. Because 0.2 does not refresh implicitly, each existing project needs one explicit `index.refresh(scope="workspace")`, polled with `task.get`, to publish indexer version 8 and the `symbol-card-v1` backfill. Projects may do this lazily. Live exact search remains available before the refresh; broad results identify the previous generation as stale.
