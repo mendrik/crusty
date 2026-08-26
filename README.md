@@ -123,7 +123,7 @@ Every finding needs evidence and a `technical`, `product`, or `design` category.
 
 - `work.list`, `work.get`, `work.recommend`, `work.create`, `work.update`
 
-All exact and recommendation queries use the same durable store. `work.recommend` only selects human-owned, accepted or active, unblocked items (and still recognizes the historical `in_progress` spelling). Crusty work memory is repository-local intent; it does not replace GitHub issues or a human product backlog.
+All exact and recommendation queries use the same durable store. `work.create` and `work.update` accept exact work-item IDs in `depends_on` and `blocked_by`; updates replace a supplied list and an explicit empty list clears it. Crusty rejects unknown, duplicate, self-referential, and cyclic relationships. `work.list` and `work.get` expose unresolved relationships and a derived `ready` flag. `work.recommend` only selects human-owned, accepted or active items whose dependencies and blockers have reached `completed` (the historical `complete` spelling is also recognized); it still recognizes `in_progress` as an active status. Crusty work memory is repository-local intent; it does not replace GitHub issues or a human product backlog.
 
 ### Recovered project memory
 

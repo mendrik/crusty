@@ -239,6 +239,12 @@ pub struct WorkCreateRequest {
     pub scope: Vec<String>,
     #[serde(default)]
     pub evidence: Vec<String>,
+    /// Exact work item IDs that must complete before this item is recommendable.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// Exact work item IDs that currently prevent this item from proceeding.
+    #[serde(default)]
+    pub blocked_by: Vec<String>,
     #[serde(default)]
     pub acceptance_criteria: Vec<String>,
     #[serde(default)]
@@ -252,6 +258,10 @@ pub struct WorkUpdateRequest {
     pub status: Option<String>,
     pub priority: Option<String>,
     pub title: Option<String>,
+    /// Replaces the dependency list when present; an empty list clears it.
+    pub depends_on: Option<Vec<String>>,
+    /// Replaces the blocker list when present; an empty list clears it.
+    pub blocked_by: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -965,9 +975,13 @@ impl Observatory {
         let db = self.db()?;
         let query = query.unwrap_or("").to_lowercase();
         let mut statement = db.prepare("SELECT id,title,status,priority,kind,scope_json,evidence_json,depends_json,blocked_json,acceptance_json,verification_json,discovered_from,provenance,confidence,last_validated_snapshot,source_finding_id,human_owned,updated_at FROM work_items WHERE ?1='' OR lower(id)=?1 OR lower(title) LIKE '%'||?1||'%' OR lower(scope_json) LIKE '%'||?1||'%' OR lower(evidence_json) LIKE '%'||?1||'%' ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, updated_at DESC LIMIT ?2")?;
-        let items = statement
+        let mut items = statement
             .query_map(params![query, limit.min(200) as i64], work_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for item in &mut items {
+            decorate_work_readiness(&db, item)?;
+        }
         Ok(
             json!({"query":query,"items":items,"authority":"human-owned project memory; this is not a GitHub issue tracker"}),
         )
@@ -975,8 +989,11 @@ impl Observatory {
 
     pub fn work_get(&self, id: &str) -> Result<Value> {
         let db = self.db()?;
-        db.query_row("SELECT id,title,status,priority,kind,scope_json,evidence_json,depends_json,blocked_json,acceptance_json,verification_json,discovered_from,provenance,confidence,last_validated_snapshot,source_finding_id,human_owned,updated_at FROM work_items WHERE id=?1", [id], work_row)
-            .map(|item| json!({"work":item})).with_context(|| format!("unknown work item {id}"))
+        let mut item = db
+            .query_row("SELECT id,title,status,priority,kind,scope_json,evidence_json,depends_json,blocked_json,acceptance_json,verification_json,discovered_from,provenance,confidence,last_validated_snapshot,source_finding_id,human_owned,updated_at FROM work_items WHERE id=?1", [id], work_row)
+            .with_context(|| format!("unknown work item {id}"))?;
+        decorate_work_readiness(&db, &mut item)?;
+        Ok(json!({"work":item}))
     }
 
     pub fn work_recommend(&self, query: Option<&str>) -> Result<Value> {
@@ -988,33 +1005,58 @@ impl Observatory {
                     item["human_owned"] == true
                         && ["accepted", "active", "in_progress"]
                             .contains(&item["status"].as_str().unwrap_or(""))
-                        && item["blocked_by"].as_array().is_none_or(Vec::is_empty)
+                        && item["ready"] == true
                 })
             })
             .cloned();
         Ok(
-            json!({"query":query,"recommendation":next,"selection_note":"Only human-owned, accepted or active, unblocked work is eligible."}),
+            json!({"query":query,"recommendation":next,"selection_note":"Only human-owned, accepted or active work with no unresolved dependencies or blockers is eligible."}),
         )
     }
 
     pub fn work_create(&self, request: WorkCreateRequest) -> Result<Value> {
         ensure!(request.confirm_human, "human confirmation is required");
         ensure!(!request.title.trim().is_empty(), "title cannot be empty");
+        let depends_on = normalize_work_links(request.depends_on, "depends_on")?;
+        let blocked_by = normalize_work_links(request.blocked_by, "blocked_by")?;
         let id = new_id("work");
         let now = Utc::now().to_rfc3339();
-        self.db()?.execute("INSERT INTO work_items(id,title,status,priority,kind,scope_json,evidence_json,depends_json,blocked_json,acceptance_json,verification_json,discovered_from,provenance,confidence,last_validated_snapshot,source_finding_id,human_owned,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'[]','[]',?8,?9,'explicit human creation','HumanDecision',1.0,'',NULL,1,?10,?10)", params![id,bounded(&request.title,500),request.status,request.priority,request.kind,serde_json::to_string(&request.scope)?,serde_json::to_string(&request.evidence)?,serde_json::to_string(&request.acceptance_criteria)?,serde_json::to_string(&request.verification)?,now])?;
+        let db = self.db()?;
+        validate_work_relationships(&db, Some(&id), &depends_on, &blocked_by)?;
+        db.execute("INSERT INTO work_items(id,title,status,priority,kind,scope_json,evidence_json,depends_json,blocked_json,acceptance_json,verification_json,discovered_from,provenance,confidence,last_validated_snapshot,source_finding_id,human_owned,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'explicit human creation','HumanDecision',1.0,'',NULL,1,?12,?12)", params![id,bounded(&request.title,500),request.status,request.priority,request.kind,serde_json::to_string(&request.scope)?,serde_json::to_string(&request.evidence)?,serde_json::to_string(&depends_on)?,serde_json::to_string(&blocked_by)?,serde_json::to_string(&request.acceptance_criteria)?,serde_json::to_string(&request.verification)?,now])?;
         Ok(json!({"work_id":id,"status":request.status,"owner":"human"}))
     }
 
     pub fn work_update(&self, request: WorkUpdateRequest) -> Result<Value> {
         ensure!(request.confirm_human, "human confirmation is required");
         let db = self.db()?;
-        let current: (String, String, String) = db.query_row(
-            "SELECT title,status,priority FROM work_items WHERE id=?1",
+        let current: (String, String, String, String, String) = db.query_row(
+            "SELECT title,status,priority,depends_json,blocked_json FROM work_items WHERE id=?1",
             [&request.work_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        db.execute("UPDATE work_items SET title=?1,status=?2,priority=?3,human_owned=1,provenance='HumanDecision',updated_at=?4 WHERE id=?5", params![request.title.unwrap_or(current.0),request.status.unwrap_or(current.1),request.priority.unwrap_or(current.2),Utc::now().to_rfc3339(),request.work_id])?;
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .with_context(|| format!("unknown work item {}", request.work_id))?;
+        let relationships_changed = request.depends_on.is_some() || request.blocked_by.is_some();
+        let depends_on = match request.depends_on {
+            Some(values) => normalize_work_links(values, "depends_on")?,
+            None => work_links_from_json(&current.3),
+        };
+        let blocked_by = match request.blocked_by {
+            Some(values) => normalize_work_links(values, "blocked_by")?,
+            None => work_links_from_json(&current.4),
+        };
+        if relationships_changed {
+            validate_work_relationships(&db, Some(&request.work_id), &depends_on, &blocked_by)?;
+        }
+        db.execute("UPDATE work_items SET title=?1,status=?2,priority=?3,depends_json=?4,blocked_json=?5,human_owned=1,provenance='HumanDecision',updated_at=?6 WHERE id=?7", params![request.title.unwrap_or(current.0),request.status.unwrap_or(current.1),request.priority.unwrap_or(current.2),serde_json::to_string(&depends_on)?,serde_json::to_string(&blocked_by)?,Utc::now().to_rfc3339(),request.work_id])?;
         self.work_get(&request.work_id)
     }
 
@@ -1785,6 +1827,136 @@ fn work_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     )
 }
 
+fn normalize_work_links(values: Vec<String>, field: &str) -> Result<Vec<String>> {
+    let mut normalized = Vec::with_capacity(values.len());
+    let mut seen = HashSet::new();
+    for value in values {
+        let work_id = value.trim();
+        ensure!(!work_id.is_empty(), "{field} cannot contain an empty id");
+        ensure!(
+            work_id.starts_with("work_"),
+            "{field} must contain exact work item ids"
+        );
+        ensure!(
+            seen.insert(work_id.to_owned()),
+            "{field} contains duplicate work item {work_id}"
+        );
+        normalized.push(work_id.to_owned());
+    }
+    Ok(normalized)
+}
+
+fn work_links_from_json(value: &str) -> Vec<String> {
+    serde_json::from_str(value).unwrap_or_default()
+}
+
+fn validate_work_relationships(
+    db: &Connection,
+    work_id: Option<&str>,
+    depends_on: &[String],
+    blocked_by: &[String],
+) -> Result<()> {
+    let mut relationships = HashSet::new();
+    for (field, work_ids) in [("depends_on", depends_on), ("blocked_by", blocked_by)] {
+        for related_id in work_ids {
+            ensure!(
+                work_id != Some(related_id.as_str()),
+                "work item cannot reference itself in {field}"
+            );
+            ensure!(
+                relationships.insert(related_id.as_str()),
+                "work item {related_id} cannot appear in both depends_on and blocked_by"
+            );
+            let exists = db
+                .query_row("SELECT 1 FROM work_items WHERE id=?1", [related_id], |_| {
+                    Ok(())
+                })
+                .optional()?
+                .is_some();
+            ensure!(exists, "unknown work item {related_id} in {field}");
+        }
+    }
+    if let Some(work_id) = work_id {
+        for related_id in relationships {
+            ensure!(
+                !work_reaches(db, related_id, work_id)?,
+                "relationship from {work_id} to {related_id} would create a cycle"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn work_reaches(db: &Connection, start: &str, target: &str) -> Result<bool> {
+    let mut pending = vec![start.to_owned()];
+    let mut visited = HashSet::new();
+    while let Some(work_id) = pending.pop() {
+        if work_id == target {
+            return Ok(true);
+        }
+        if !visited.insert(work_id.clone()) {
+            continue;
+        }
+        let links = db
+            .query_row(
+                "SELECT depends_json,blocked_json FROM work_items WHERE id=?1",
+                [&work_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((depends_on, blocked_by)) = links {
+            pending.extend(work_links_from_json(&depends_on));
+            pending.extend(work_links_from_json(&blocked_by));
+        }
+    }
+    Ok(false)
+}
+
+fn decorate_work_readiness(db: &Connection, item: &mut Value) -> Result<()> {
+    let unresolved_dependencies = unresolved_work_links(db, item, "depends_on")?;
+    let unresolved_blockers = unresolved_work_links(db, item, "blocked_by")?;
+    let ready = unresolved_dependencies.is_empty() && unresolved_blockers.is_empty();
+    let object = item
+        .as_object_mut()
+        .context("work item row must be a JSON object")?;
+    object.insert(
+        "unresolved_dependencies".into(),
+        json!(unresolved_dependencies),
+    );
+    object.insert("unresolved_blockers".into(), json!(unresolved_blockers));
+    object.insert("ready".into(), json!(ready));
+    Ok(())
+}
+
+fn unresolved_work_links(db: &Connection, item: &Value, field: &str) -> Result<Vec<String>> {
+    let mut unresolved = Vec::new();
+    for related_id in item[field]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        let status = db
+            .query_row(
+                "SELECT status FROM work_items WHERE id=?1",
+                [related_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if !status.as_deref().is_some_and(work_status_is_complete) {
+            unresolved.push(related_id.to_owned());
+        }
+    }
+    Ok(unresolved)
+}
+
+fn work_status_is_complete(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "complete" | "completed"
+    )
+}
+
 fn task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     let result: Option<String> = row.get(5)?;
     Ok(
@@ -1857,6 +2029,22 @@ mod tests {
         fs::write(directory.path().join("src/lib.rs"), "pub fn indexed() {}\n")?;
         let observatory = Observatory::open(directory.path())?;
         Ok((directory, observatory))
+    }
+
+    fn work_request(title: &str, status: &str) -> WorkCreateRequest {
+        WorkCreateRequest {
+            title: title.into(),
+            confirm_human: true,
+            status: status.into(),
+            priority: "normal".into(),
+            kind: "technical".into(),
+            scope: vec![],
+            evidence: vec![],
+            depends_on: vec![],
+            blocked_by: vec![],
+            acceptance_criteria: vec![],
+            verification: vec![],
+        }
     }
 
     #[test]
@@ -2023,17 +2211,10 @@ mod tests {
     #[test]
     fn exact_work_lookup_and_recommendation_share_one_store() -> Result<()> {
         let (_directory, observatory) = workspace()?;
-        let created = observatory.work_create(WorkCreateRequest {
-            title: "Unique queue repair".into(),
-            confirm_human: true,
-            status: "accepted".into(),
-            priority: "high".into(),
-            kind: "technical".into(),
-            scope: vec!["src/lib.rs".into()],
-            evidence: vec![],
-            acceptance_criteria: vec![],
-            verification: vec![],
-        })?;
+        let mut request = work_request("Unique queue repair", "accepted");
+        request.priority = "high".into();
+        request.scope = vec!["src/lib.rs".into()];
+        let created = observatory.work_create(request)?;
         let id = created["work_id"].as_str().unwrap();
         assert_eq!(
             observatory.work_list(Some(id), 10)?["items"]
@@ -2052,22 +2233,117 @@ mod tests {
     #[test]
     fn active_work_remains_recommendable() -> Result<()> {
         let (_directory, observatory) = workspace()?;
-        let created = observatory.work_create(WorkCreateRequest {
-            title: "Continue the active repair".into(),
-            confirm_human: true,
-            status: "active".into(),
-            priority: "critical".into(),
-            kind: "technical".into(),
-            scope: vec!["src/lib.rs".into()],
-            evidence: vec![],
-            acceptance_criteria: vec![],
-            verification: vec![],
-        })?;
+        let mut request = work_request("Continue the active repair", "active");
+        request.priority = "critical".into();
+        request.scope = vec!["src/lib.rs".into()];
+        let created = observatory.work_create(request)?;
         let id = created["work_id"].as_str().unwrap();
         assert_eq!(
             observatory.work_recommend(Some(id))?["recommendation"]["id"],
             id
         );
+        Ok(())
+    }
+
+    #[test]
+    fn work_dependencies_are_writable_and_gate_recommendations() -> Result<()> {
+        let (_directory, observatory) = workspace()?;
+        let prerequisite = observatory.work_create(work_request("Prerequisite", "accepted"))?;
+        let prerequisite_id = prerequisite["work_id"].as_str().unwrap().to_owned();
+
+        let mut candidate_request = work_request("Candidate", "accepted");
+        candidate_request.depends_on = vec![prerequisite_id.clone()];
+        let candidate = observatory.work_create(candidate_request)?;
+        let candidate_id = candidate["work_id"].as_str().unwrap().to_owned();
+        let pending = observatory.work_get(&candidate_id)?;
+        assert_eq!(
+            pending["work"]["depends_on"],
+            json!([prerequisite_id.clone()])
+        );
+        assert_eq!(
+            pending["work"]["unresolved_dependencies"],
+            pending["work"]["depends_on"]
+        );
+        assert_eq!(pending["work"]["ready"], false);
+        assert!(observatory.work_recommend(Some(&candidate_id))?["recommendation"].is_null());
+
+        observatory.work_update(WorkUpdateRequest {
+            work_id: prerequisite_id.clone(),
+            confirm_human: true,
+            status: Some("completed".into()),
+            priority: None,
+            title: None,
+            depends_on: None,
+            blocked_by: None,
+        })?;
+        assert_eq!(
+            observatory.work_recommend(Some(&candidate_id))?["recommendation"]["id"],
+            candidate_id
+        );
+
+        let blocker = observatory.work_create(work_request("Blocker", "active"))?;
+        let blocker_id = blocker["work_id"].as_str().unwrap().to_owned();
+        let blocked = observatory.work_update(WorkUpdateRequest {
+            work_id: candidate_id.clone(),
+            confirm_human: true,
+            status: None,
+            priority: None,
+            title: None,
+            depends_on: None,
+            blocked_by: Some(vec![blocker_id.clone()]),
+        })?;
+        assert_eq!(blocked["work"]["depends_on"], json!([prerequisite_id]));
+        assert_eq!(blocked["work"]["unresolved_blockers"], json!([blocker_id]));
+        assert_eq!(blocked["work"]["ready"], false);
+
+        let cleared = observatory.work_update(WorkUpdateRequest {
+            work_id: candidate_id,
+            confirm_human: true,
+            status: None,
+            priority: None,
+            title: None,
+            depends_on: None,
+            blocked_by: Some(vec![]),
+        })?;
+        assert_eq!(cleared["work"]["blocked_by"], json!([]));
+        assert_eq!(cleared["work"]["ready"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn work_relationships_reject_unknown_self_duplicate_and_cyclic_links() -> Result<()> {
+        let (_directory, observatory) = workspace()?;
+        let mut unknown = work_request("Unknown dependency", "accepted");
+        unknown.depends_on = vec!["work_missing".into()];
+        assert!(observatory.work_create(unknown).is_err());
+
+        let first = observatory.work_create(work_request("First", "accepted"))?;
+        let first_id = first["work_id"].as_str().unwrap().to_owned();
+        let mut second_request = work_request("Second", "accepted");
+        second_request.depends_on = vec![first_id.clone()];
+        let second = observatory.work_create(second_request)?;
+        let second_id = second["work_id"].as_str().unwrap().to_owned();
+
+        let update = |depends_on| WorkUpdateRequest {
+            work_id: first_id.clone(),
+            confirm_human: true,
+            status: None,
+            priority: None,
+            title: None,
+            depends_on: Some(depends_on),
+            blocked_by: Some(vec![]),
+        };
+        assert!(
+            observatory
+                .work_update(update(vec![first_id.clone()]))
+                .is_err()
+        );
+        assert!(
+            observatory
+                .work_update(update(vec![second_id.clone(), second_id.clone()]))
+                .is_err()
+        );
+        assert!(observatory.work_update(update(vec![second_id])).is_err());
         Ok(())
     }
 

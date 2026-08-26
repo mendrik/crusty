@@ -301,7 +301,7 @@ impl CrustyServer {
 
     #[tool(
         name = "work.recommend",
-        description = "Recommend only accepted or active, unblocked, human-owned work from the same store used by work.list."
+        description = "Recommend only accepted or active, human-owned work whose exact work-item dependencies and blockers are complete."
     )]
     async fn work_recommend(
         &self,
@@ -312,7 +312,7 @@ impl CrustyServer {
 
     #[tool(
         name = "work.create",
-        description = "Create human-owned project work with explicit confirmation. Crusty findings cannot call this autonomously."
+        description = "Create human-owned project work, optionally linked to exact dependency and blocker work IDs, with explicit confirmation. Crusty findings cannot call this autonomously."
     )]
     async fn work_create(
         &self,
@@ -323,7 +323,7 @@ impl CrustyServer {
 
     #[tool(
         name = "work.update",
-        description = "Update project work with explicit human confirmation."
+        description = "Update project work and replace or clear its exact dependency and blocker work IDs with explicit human confirmation."
     )]
     async fn work_update(
         &self,
