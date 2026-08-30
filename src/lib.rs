@@ -2221,14 +2221,9 @@ impl Service {
         let semantic_references = self.semantic_references(&target_nodes);
         let tests = self.test_nodes(&target_nodes)?;
         let use_cases = self.use_cases_for(&tests)?;
-        let decisions = self.decisions_for(&targets.join(" "))?;
-        let steerings = self.steering_list(Some(&targets.join(" ")), 12)?["steerings"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(steering_is_active)
-            .collect::<Vec<_>>();
+        let target_text = targets.join(" ");
+        let decisions = self.governing_decisions(&target_text, 12)?;
+        let steerings = self.governing_steerings(&target_text, 12)?;
         let lifecycle = self.lifecycle_for(&target_nodes)?;
         let uncertain_static_references = self.unresolved_for_targets(&target_nodes)?;
         let runtime_contracts = self.search_contract_artifacts(intent, 8)?;
@@ -2904,8 +2899,184 @@ impl Service {
 
     pub fn constraints(&self, change: &str) -> Result<Value> {
         Ok(
-            json!({"change":change,"snapshot":self.snapshot(),"decisions":self.decisions_for(change)?,"steerings":self.steering_list(Some(change),20)?["steerings"],"learned_quality_constraints":self.relevant_quality_constraints(change)?,"lifecycle_risks":self.obsolete_candidates(Some(change), 20)?,"runtime_contracts":self.search_contract_artifacts(change,12)?,"unresolved_edges":["Ambiguous syntax references are preserved as uncertainty rather than promoted to affected files.","Dynamic dispatch, macros, runtime registration, generated bindings, external API consumers, and deployment state need external verification."],"required_verification":["cargo check --all-targets","cargo test","Run the bounded feature-profile plan from repo.matrix.","Validate changed GTK markup with project GTK tooling.","Compare D-Bus XML changes with runtime introspection and external consumer expectations.","Run a deployment smoke test in the target environment when packaging or service configuration changes."]}),
+            json!({"change":change,"snapshot":self.snapshot(),"decisions":self.governing_decisions(change,20)?,"steerings":self.governing_steerings(change,20)?,"learned_quality_constraints":self.relevant_quality_constraints(change)?,"lifecycle_risks":self.obsolete_candidates(Some(change), 20)?,"runtime_contracts":self.search_contract_artifacts(change,12)?,"unresolved_edges":["Ambiguous syntax references are preserved as uncertainty rather than promoted to affected files.","Dynamic dispatch, macros, runtime registration, generated bindings, external API consumers, and deployment state need external verification."],"required_verification":["cargo check --all-targets","cargo test","Run the bounded feature-profile plan from repo.matrix.","Validate changed GTK markup with project GTK tooling.","Compare D-Bus XML changes with runtime introspection and external consumer expectations.","Run a deployment smoke test in the target environment when packaging or service configuration changes."]}),
         )
+    }
+
+    /// A bounded, read-only briefing that gives an attached agent repository
+    /// guidance before it plans, answers, or acts on any repository topic.
+    pub fn consult(&self, topic: &str, budget: usize) -> Result<Value> {
+        ensure!(!topic.trim().is_empty(), "topic is required");
+        let token_budget = budget.clamp(250, 20_000);
+        let max_bytes = token_budget.saturating_mul(4);
+        let mut used = 0usize;
+        let decisions = budget_values(self.governing_decisions(topic, 20)?, &mut used, max_bytes);
+        let steerings = budget_values(self.governing_steerings(topic, 20)?, &mut used, max_bytes);
+        let learned_quality_constraints = budget_values(
+            self.relevant_quality_constraints(topic)?,
+            &mut used,
+            max_bytes,
+        );
+        let governing_documents =
+            budget_values(self.governing_documents(topic, 12)?, &mut used, max_bytes);
+        let known_work = budget_values(
+            self.work_list(Some(topic), 12)?["items"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+            &mut used,
+            max_bytes,
+        );
+        let lifecycle_risks = budget_values(
+            self.obsolete_candidates(Some(topic), 12)?["candidates"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+            &mut used,
+            max_bytes,
+        );
+        let runtime_contracts = budget_values(
+            self.search_contract_artifacts(topic, 8)?,
+            &mut used,
+            max_bytes,
+        );
+        let mut relevant_sections = Vec::new();
+        for (name, values) in [
+            ("decisions", &decisions),
+            ("steerings", &steerings),
+            ("learned_quality_constraints", &learned_quality_constraints),
+            ("governing_documents", &governing_documents),
+            ("known_work", &known_work),
+            ("lifecycle_risks", &lifecycle_risks),
+            ("runtime_contracts", &runtime_contracts),
+        ] {
+            if !values.is_empty() {
+                relevant_sections.push(name);
+            }
+        }
+        Ok(json!({
+            "topic": topic,
+            "consulted": true,
+            "guidance_found": !relevant_sections.is_empty(),
+            "relevant_sections": relevant_sections,
+            "snapshot": self.snapshot(),
+            "decisions": decisions,
+            "steerings": steerings,
+            "learned_quality_constraints": learned_quality_constraints,
+            "governing_documents": governing_documents,
+            "known_work": known_work,
+            "lifecycle_risks": lifecycle_risks,
+            "runtime_contracts": runtime_contracts,
+            "next_steps": [
+                "Apply relevant human guidance before continuing.",
+                "If the request will modify repository files, call change.prepare before the first edit and change.validate after the edits.",
+                "Use repo.context when the consultation identifies a concept that needs deeper repository evidence."
+            ],
+            "authority": "Human decisions and steering govern. Indexed documents and relationships are freshness-labelled guidance; current source and runtime/compiler behavior remain authoritative.",
+            "context_budget": {"tokens": token_budget, "estimated_tokens": used.div_ceil(4)},
+        }))
+    }
+
+    fn governing_decisions(&self, topic: &str, limit: usize) -> Result<Vec<Value>> {
+        let mut decisions = self
+            .decisions_for(topic)?
+            .into_iter()
+            .filter(|decision| decision["status"] == "accepted")
+            .collect::<Vec<_>>();
+        let global_ids = self
+            .db
+            .prepare("SELECT id FROM decisions WHERE status='accepted' AND json_array_length(applies_to)=0 ORDER BY sequence DESC LIMIT ?1")?
+            .query_map([limit as i64], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for id in global_ids {
+            decisions.push(self.decision_resource(&id)?);
+        }
+        let mut seen = BTreeSet::new();
+        decisions.retain(|decision| {
+            decision["id"]
+                .as_str()
+                .is_some_and(|id| seen.insert(id.to_owned()))
+        });
+        decisions.truncate(limit);
+        Ok(decisions)
+    }
+
+    fn governing_steerings(&self, topic: &str, limit: usize) -> Result<Vec<Value>> {
+        let mut steerings = self.steering_list(Some(topic), limit)?["steerings"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let global = self
+            .db
+            .prepare("SELECT id,status,priority,title,instruction,scope,expires_at,revision,created_at FROM steerings WHERE status='active' AND json_array_length(scope)=0 ORDER BY sequence DESC LIMIT ?1")?
+            .query_map([limit as i64], |row| {
+                Ok(json!({
+                    "id": row.get::<_, String>(0)?,
+                    "status": row.get::<_, String>(1)?,
+                    "priority": row.get::<_, String>(2)?,
+                    "title": row.get::<_, String>(3)?,
+                    "instruction": row.get::<_, String>(4)?,
+                    "scope": serde_json::from_str::<Value>(&row.get::<_, String>(5)?)
+                        .unwrap_or_else(|_| json!([])),
+                    "expires_at": row.get::<_, Option<String>>(6)?,
+                    "revision": row.get::<_, String>(7)?,
+                    "created_at": row.get::<_, String>(8)?,
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        steerings.extend(global);
+        let mut seen = BTreeSet::new();
+        steerings.retain(|steering| {
+            steering_is_active(steering)
+                && steering["id"]
+                    .as_str()
+                    .is_some_and(|id| seen.insert(id.to_owned()))
+        });
+        steerings.truncate(limit);
+        Ok(steerings)
+    }
+
+    fn governing_documents(&self, topic: &str, limit: usize) -> Result<Vec<Value>> {
+        let mut documents = Vec::new();
+        let mut statement = self.db.prepare(
+            "SELECT kind,path,text FROM documents \
+             WHERE lower(path)='agents.md' OR lower(path) LIKE '%/agents.md' \
+                OR lower(path)='context.md' OR lower(path) LIKE '%/context.md' \
+                OR lower(path)='contributing.md' OR lower(path) LIKE '%/contributing.md' \
+                OR lower(path)='design.md' OR lower(path) LIKE '%/design.md' \
+                OR lower(path)='style.md' OR lower(path) LIKE '%/style.md' \
+                OR lower(path)='theme.md' OR lower(path) LIKE '%/theme.md' \
+                OR lower(path) LIKE 'workflow%' \
+                OR lower(path) LIKE '%/workflows/%' \
+                OR lower(path) LIKE '%/workflow%' \
+                OR lower(path) LIKE 'guideline%' \
+                OR lower(path) LIKE '%/guideline%' \
+                OR lower(path) LIKE 'policy%' \
+                OR lower(path) LIKE '%/policy%' \
+             ORDER BY path LIMIT ?1",
+        )?;
+        documents.extend(
+            statement
+                .query_map([limit as i64], |row| {
+                    Ok(json!({
+                        "kind": row.get::<_, String>(0)?,
+                        "path": row.get::<_, String>(1)?,
+                        "evidence": trim_text(&row.get::<_, String>(2)?, 700),
+                        "provenance": "PublishedDocument",
+                        "relevance": "repository_governance",
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
+        documents.extend(self.search_hits(&terms(topic), Some("document"), limit)?);
+        let mut seen = BTreeSet::new();
+        documents.retain(|document| {
+            document["path"]
+                .as_str()
+                .is_some_and(|path| seen.insert(path.to_owned()))
+        });
+        documents.truncate(limit);
+        Ok(documents)
     }
 
     pub fn obsolete_candidates(&self, scope: Option<&str>, limit: usize) -> Result<Value> {
@@ -5796,6 +5967,70 @@ mod tests {
             .prepare_change("change Store", &["Store".into()], 1, Some(500))
             .unwrap();
         assert_eq!(context["steerings"][0]["title"], "Keep storage injectable");
+    }
+
+    #[test]
+    fn consultation_includes_global_governance_and_policy_documents() {
+        let d = fixture();
+        fs::write(
+            d.path().join("AGENTS.md"),
+            "# Interface policy\nUse the ocean theme and run the accessibility workflow for UI designs.\n",
+        )
+        .unwrap();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        service
+            .record_decision(RecordDecision {
+                title: "Respect product accessibility".into(),
+                status: "accepted".into(),
+                reason: "All features must remain operable without a pointer".into(),
+                applies_to: vec![],
+                consequences: vec!["Include keyboard interaction in every design".into()],
+                supersedes: None,
+                materialize: false,
+            })
+            .unwrap();
+        service
+            .record_steering(RecordSteering {
+                title: "Use established visual language".into(),
+                instruction: "Reuse the repository theme and design tokens".into(),
+                scope: vec![],
+                priority: "high".into(),
+                status: "active".into(),
+                expires_at: None,
+            })
+            .unwrap();
+
+        let consultation = service.consult("Design a settings feature", 4_000).unwrap();
+        assert_eq!(consultation["consulted"], true);
+        assert_eq!(consultation["guidance_found"], true);
+        assert!(
+            consultation["decisions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|decision| decision["title"] == "Respect product accessibility")
+        );
+        assert!(
+            consultation["steerings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|steering| steering["title"] == "Use established visual language")
+        );
+        assert!(
+            consultation["governing_documents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|document| document["path"] == "AGENTS.md")
+        );
+        assert!(
+            consultation["context_budget"]["estimated_tokens"]
+                .as_u64()
+                .unwrap()
+                <= 4_000
+        );
     }
 
     #[test]

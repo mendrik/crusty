@@ -5,12 +5,12 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use rust_repo_intelligence::observatory::{
-    CheckpointCreateRequest, CheckpointDiffRequest, CheckpointRestoreRequest, ContextRequest,
-    FindingEvidenceRequest, MemorySearchRequest, Observatory, PrepareRequest, ProblemUpdateRequest,
-    PromoteFindingRequest, QualityMergeRequest, QualityReviewRequest, ResearchListRequest,
-    ResearchStartRequest, ResearchSubmitRequest, ReviewFindingRequest, ScopeRequest, SearchRequest,
-    SymbolRelationRequest, TargetRequest, TaskListRequest, ValidateRequest, WorkCreateRequest,
-    WorkUpdateRequest,
+    CheckpointCreateRequest, CheckpointDiffRequest, CheckpointRestoreRequest, ConsultRequest,
+    ContextRequest, FindingEvidenceRequest, MemorySearchRequest, Observatory, PrepareRequest,
+    ProblemUpdateRequest, PromoteFindingRequest, QualityMergeRequest, QualityReviewRequest,
+    ResearchListRequest, ResearchStartRequest, ResearchSubmitRequest, ReviewFindingRequest,
+    ScopeRequest, SearchRequest, SymbolRelationRequest, TargetRequest, TaskListRequest,
+    ValidateRequest, WorkCreateRequest, WorkUpdateRequest,
 };
 use rust_repo_intelligence::{RecordDecision, RecordSteering, ValidationOutcomeInput};
 use schemars::JsonSchema;
@@ -121,6 +121,18 @@ impl CrustyServer {
 
 #[tool_router(router = tool_router)]
 impl CrustyServer {
+    #[tool(
+        name = "repo.consult",
+        description = "Mandatory first-call preflight for every repository-scoped user request. Returns global and topical decisions, steering, design and quality constraints, restrictions, governing documentation, workflows, lifecycle risks, runtime contracts, and known work before planning, answering, or acting."
+    )]
+    async fn repo_consult(
+        &self,
+        Parameters(request): Parameters<ConsultRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.consult(&request.topic, request.budget)).await
+    }
+
     #[tool(
         name = "repo.search",
         description = "Search Rust source. exact reads the live worktree without refreshing; broad reads the published snapshot and labels freshness."
@@ -794,8 +806,8 @@ impl CrustyServer {
 
 #[tool_handler(
     name = "Crusty",
-    version = "0.2.2",
-    instructions = "Crusty is a Rust repository observatory. Use repo.search exact for live call-site work and symbol.relations for callers, references, implementations, and definitions; neither refreshes. Use change.prepare before edits and change.validate afterwards, polling both with task.get; task.list and change.get recover interrupted workflows. When a broad read is empty, check index.status: never_published distinguishes an unbuilt index from no matches. Change preparation, validation, refresh, and research are explicit durable tasks. Research uses local repository evidence plus primary-first web_search by the attached agent; no external connectors are available. Findings are proposals and only a human may review or promote them into work. Quality proposal never activates a constraint: activation, merging, finding promotion, and work writes require explicit human confirmation. Source, compiler/runtime behavior, and human ownership remain authoritative."
+    version = "0.2.3",
+    instructions = "Crusty is a Rust repository observatory. For every repository-scoped user prompt, call repo.consult first with the user's complete intent before planning, answering, or acting; do not skip consultation for design, review, questions, documentation, configuration, or non-code work. Apply relevant human decisions, steering, design and quality constraints, restrictions, governing documents, and workflows returned by the consultation. Consultation is read-only and does not replace change preparation: use change.prepare before edits and change.validate afterwards, polling both with task.get; task.list and change.get recover interrupted workflows. Use repo.search exact for live call-site work and symbol.relations for callers, references, implementations, and definitions; neither refreshes. When a broad read is empty, check index.status: never_published distinguishes an unbuilt index from no matches. Change preparation, validation, refresh, and research are explicit durable tasks. Research uses local repository evidence plus primary-first web_search by the attached agent; no external connectors are available. Findings are proposals and only a human may review or promote them into work. Quality proposal never activates a constraint: activation, merging, finding promotion, and work writes require explicit human confirmation. Source, compiler/runtime behavior, and human ownership remain authoritative."
 )]
 impl ServerHandler for CrustyServer {}
 
@@ -856,6 +868,7 @@ mod tests {
                 "repo.authority",
                 "repo.cleanup_candidates",
                 "repo.constraints",
+                "repo.consult",
                 "repo.context",
                 "repo.explain",
                 "repo.history",
@@ -945,6 +958,7 @@ mod tests {
             );
         }
         assert!(required("repo.search").contains(&"query".to_owned()));
+        assert!(required("repo.consult").contains(&"topic".to_owned()));
         assert!(required("symbol.relations").contains(&"symbol".to_owned()));
         assert!(required("change.validate").contains(&"context_id".to_owned()));
         assert!(required("work.update").contains(&"work_id".to_owned()));
@@ -960,6 +974,23 @@ mod tests {
             Some(&Value::Bool(false)),
             "a misnamed parameter must be an error, not a silent no-op"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn server_instructions_require_consultation_before_all_repository_work() -> Result<()> {
+        let directory = tempdir()?;
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname='fixture'\nversion='0.1.0'\nedition='2024'\n",
+        )?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "")?;
+        let server = CrustyServer::new(Observatory::open(directory.path())?);
+        let instructions = server.get_info().instructions.unwrap_or_default();
+        assert!(instructions.contains("every repository-scoped user prompt"));
+        assert!(instructions.contains("call repo.consult first"));
+        assert!(instructions.contains("does not replace change preparation"));
         Ok(())
     }
 }

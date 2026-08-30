@@ -42,6 +42,10 @@ _Avoid_: Semantic proof, vector search
 The model, card version, snapshot, ranking channel, and structural evidence that explain why a repository candidate was returned.
 _Avoid_: Confidence score, proof
 
+**Repository consultation**:
+A bounded, read-only briefing of global and topical repository guidance requested before an attached agent plans, answers, or acts.
+_Avoid_: Change preparation, repository search
+
 ### Research and decisions
 
 **Research run**:

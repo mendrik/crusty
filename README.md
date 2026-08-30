@@ -1,10 +1,35 @@
 # Crusty
 
+[![CI](https://github.com/mendrik/crusty/actions/workflows/ci.yml/badge.svg)](https://github.com/mendrik/crusty/actions/workflows/ci.yml)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
+
 Crusty is a local repository observatory for Rust. It gives an attached coding agent fast source navigation, snapshot-aware change intelligence, durable work memory, and budgeted technical/product/design research without turning an index or an autonomous suggestion into authority.
 
 The Cargo package and executable remain named `rust-repo-intelligence`.
 
-## What changed
+## Where Crusty helps
+
+Crusty is useful when an agent needs to work in a Rust repository without repeatedly rediscovering its structure or confusing stale indexed evidence with live code. It helps with:
+
+- orienting in an unfamiliar codebase and finding exact symbols, callers, references, implementations, tests, and related history;
+- preparing a change with a bounded impact surface, repository decisions, known risks, and a concrete verification plan;
+- preserving architectural decisions, steering, quality lessons, and human-owned work across coding sessions;
+- investigating improvement opportunities with local evidence and primary-source web research while keeping humans in control of acceptance and promotion;
+- recovering safely after long-running refresh, research, or validation work is interrupted.
+
+## Features
+
+| Capability | What it provides |
+| --- | --- |
+| Live navigation | Exact worktree search plus symbol relationships without waiting for an index refresh. |
+| Snapshot-aware intelligence | Broad hybrid retrieval over lexical, local similarity, Cargo, Git, syntax, and optional rust-analyzer evidence, always labelled with freshness and provenance. |
+| Change workflow | Durable preparation and validation tasks with likely change surfaces, policies, risks, and verification obligations. |
+| Repository memory | Human-owned decisions, steering, work, findings, problem records, learned quality constraints, and recoverable task state in local SQLite stores. |
+| Guarded research | Budgeted research packets, evidence qualification, human review, and explicit promotion from findings to work. |
+| Safe local dashboard | A loopback-only finding inbox protected by one-time bootstrap, session, CSRF, and CSP controls. |
+| Git-safe checkpoints | Recoverable refs and diffs that never move `HEAD` or rewrite repository history. |
+
+## How it works
 
 Crusty now separates three kinds of state that previously shared one synchronous request path:
 
@@ -29,6 +54,13 @@ attached agent ─ local scan + web_search ─► findings ─ human review ─�
 - The local dashboard puts the finding inbox first and requires a one-time bootstrap token, an HttpOnly SameSite session, CSRF validation, and a restrictive CSP.
 
 Crusty results are guidance and provenance—not proof. Current source, compiler/runtime behavior, and human decisions remain authoritative.
+
+## Requirements
+
+- a current stable Rust toolchain with Cargo;
+- Git and a local Rust repository to observe;
+- Codex or another MCP client that supports local stdio servers;
+- optionally, rust-analyzer for the highest-confidence relationship evidence.
 
 ## Install and connect to Codex
 
@@ -91,6 +123,7 @@ The 0.2 API is a clean break from the old `repo.*` surface.
 
 ### Navigation and change work
 
+- `repo.consult`: the mandatory first-call briefing for every repository-scoped prompt, combining global and topical decisions, steering, design and quality constraints, restrictions, governing documents, workflows, lifecycle risks, runtime contracts, and known work.
 - `repo.search`: `mode=exact` searches live Rust source; `mode=broad` searches the published snapshot.
 - `repo.context`: builds a bounded hybrid context without implicit refresh.
 - `repo.matrix`: returns a bounded Cargo feature/profile verification plan with freshness metadata.
@@ -103,6 +136,8 @@ The 0.2 API is a clean break from the old `repo.*` surface.
 - `change.get`: recovers a previously prepared change context by context ID.
 - `change.validate`: starts a task that checks a diff against prepared evidence and optionally executes validations; it never refreshes first.
 - `repo.authority`: states Crusty's evidence and ownership boundaries.
+
+The server instructions tell attached agents to call `repo.consult` with the user's complete intent before planning, answering, or acting, including design, review, documentation, configuration, and non-code work. Consultation is bounded and read-only. It does not replace `change.prepare` and `change.validate` when files will be edited. MCP instructions are an agent contract rather than a transport-level interception mechanism, so project policies such as `AGENTS.md` should repeat the first-call rule for clients that prioritize repository instructions.
 
 ### Index and tasks
 

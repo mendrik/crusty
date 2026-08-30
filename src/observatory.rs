@@ -173,6 +173,15 @@ pub struct ContextRequest {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ConsultRequest {
+    /// The user's complete repository-scoped intent or topic.
+    pub topic: String,
+    #[serde(default = "default_budget")]
+    pub budget: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PrepareRequest {
     pub intent: String,
     #[serde(default)]
@@ -824,6 +833,15 @@ impl Observatory {
         ensure!(!change.trim().is_empty(), "change is required");
         let freshness = self.freshness("published_snapshot")?;
         let result = Service::open(self.root.as_ref().clone())?.constraints(change)?;
+        Ok(json!({"freshness":freshness,"result":result}))
+    }
+
+    /// Universal read-only preflight for any repository-scoped user request.
+    pub fn consult(&self, topic: &str, budget: usize) -> Result<Value> {
+        ensure!(!topic.trim().is_empty(), "topic is required");
+        let freshness = self.freshness("published_snapshot")?;
+        let result =
+            Service::open(self.root.as_ref().clone())?.consult(topic, budget.clamp(250, 20_000))?;
         Ok(json!({"freshness":freshness,"result":result}))
     }
 

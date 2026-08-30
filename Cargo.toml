@@ -1,9 +1,13 @@
 [package]
 name = "rust-repo-intelligence"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 description = "A local MCP repository observatory for Rust projects"
 license = "GPL-3.0-or-later"
+repository = "https://github.com/mendrik/crusty"
+readme = "README.md"
+keywords = ["mcp", "rust", "code-analysis", "developer-tools"]
+categories = ["development-tools"]
 
 [dependencies]
 anyhow = "1.0"

@@ -71,7 +71,7 @@ If `config.toml` contains per-tool approval rules, rename or remove rules that t
 
 The 0.2 API keeps legacy decisions, steerings, and checkpoints out of the public mutation surface. It now exposes a bounded problem/quality lifecycle (`problem.*`, `quality.*`, and `validation.*`) so automatically captured problems can be inspected and learned constraints can be reviewed by a human. Existing quality memory can contribute evidence to prepared changes and validation, while new improvement discovery still flows through research, proposed findings, human review, and explicitly human-owned work.
 
-Project instructions such as `AGENTS.md` must also stop naming removed tools. The repository's own [`AGENTS.md`](../AGENTS.md) is a minimal 0.2 policy example.
+Project instructions such as `AGENTS.md` must also stop naming removed tools. They should require `repo.consult` as the first call for every repository-scoped prompt, while retaining the separate `change.prepare` and `change.validate` edit workflow. The repository's own [`AGENTS.md`](../AGENTS.md) is a minimal 0.2 policy example.
 
 ## Migrate a project
 
@@ -90,13 +90,14 @@ Projects can migrate lazily when next opened. Before the refresh, `repo.search(m
 
 ## Verify the installation
 
-A successful installation reports server name `Crusty`, version `0.2.2`, and the 55-tool clean-break surface. A useful smoke sequence is:
+A successful installation reports server name `Crusty`, version `0.2.3`, and the 56-tool clean-break surface. A useful smoke sequence is:
 
 1. `repo.authority`
-2. `index.status`
-3. `repo.search` with `mode=exact`, then `symbol.relations` with `relation=callers`
-4. `repo.context` after an explicit project refresh
-5. `memory.search` with a phrase from a prior project prompt; confirm unrelated repositories and assistant/tool output are absent
-6. `task.list` and `research.list`; confirm bounded summaries can recover interrupted workflows
+2. `repo.consult` with a repository design or implementation topic; confirm the response contains a freshness envelope and governing guidance sections
+3. `index.status`
+4. `repo.search` with `mode=exact`, then `symbol.relations` with `relation=callers`
+5. `repo.context` after an explicit project refresh
+6. `memory.search` with a phrase from a prior project prompt; confirm unrelated repositories and assistant/tool output are absent
+7. `task.list` and `research.list`; confirm bounded summaries can recover interrupted workflows
 
 Crusty research never opens arbitrary external connectors. `research.start` produces a bounded evidence packet; the attached agent performs primary-first `web_search` and returns qualified evidence through `research.submit`. Findings remain proposals until a human reviews them, and promotion to work requires explicit human confirmation.

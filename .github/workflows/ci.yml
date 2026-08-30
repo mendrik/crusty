@@ -2,8 +2,15 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,6 +19,7 @@ env:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,14 +35,17 @@ jobs:
       - name: Formatting
         run: cargo fmt --all -- --check
 
+      - name: Build all targets
+        run: cargo check --all-targets --locked
+
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Tests
-        run: cargo test --all-targets --locked
+        run: cargo test --locked
 
       - name: Latency budget
-        run: cargo run --example observatory_evaluate --locked
+        run: cargo run --release --example observatory_evaluate --locked -- "$GITHUB_WORKSPACE"
 
       - name: Retrieval evaluation
-        run: cargo run --example evaluate --locked
+        run: cargo run --release --example evaluate --locked -- "$GITHUB_WORKSPACE"
