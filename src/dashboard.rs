@@ -27,11 +27,35 @@ struct DashboardState {
     csp_nonce: String,
 }
 
-pub async fn start(observatory: Observatory) -> Result<String> {
-    let bootstrap_token = token();
+/// A running dashboard listener that can mint a fresh one-time URL on demand.
+///
+/// The bootstrap token is deliberately single-use, so caching the first URL
+/// meant every later `dashboard.open` handed the human a spent link that could
+/// only answer 401. The handle keeps one listener and re-issues the token
+/// instead.
+#[derive(Clone)]
+pub struct DashboardHandle {
+    address: String,
+    bootstrap_token: Arc<Mutex<Option<String>>>,
+}
+
+impl DashboardHandle {
+    /// Replaces any outstanding bootstrap token and returns a usable URL.
+    pub fn issue_url(&self) -> String {
+        let bootstrap_token = token();
+        *self
+            .bootstrap_token
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(bootstrap_token.clone());
+        format!("http://{}/?token={bootstrap_token}", self.address)
+    }
+}
+
+pub async fn start(observatory: Observatory) -> Result<DashboardHandle> {
+    let bootstrap_token = Arc::new(Mutex::new(None));
     let state = DashboardState {
         observatory,
-        bootstrap_token: Arc::new(Mutex::new(Some(bootstrap_token.clone()))),
+        bootstrap_token: bootstrap_token.clone(),
         session_token: token(),
         csrf_token: token(),
         csp_nonce: token(),
@@ -52,7 +76,10 @@ pub async fn start(observatory: Observatory) -> Result<String> {
             eprintln!("Crusty dashboard stopped: {error}");
         }
     });
-    Ok(format!("http://{address}/?token={bootstrap_token}"))
+    Ok(DashboardHandle {
+        address: address.to_string(),
+        bootstrap_token,
+    })
 }
 
 async fn index(
@@ -121,7 +148,9 @@ async fn api_findings(
 }
 
 async fn api_research(State(state): State<DashboardState>, headers: HeaderMap) -> Response {
-    read_api(&state, &headers, || state.observatory.research_list(100))
+    read_api(&state, &headers, || {
+        state.observatory.research_list(None, None, 100)
+    })
 }
 
 async fn api_work(
@@ -348,7 +377,8 @@ mod tests {
         )?;
         fs::create_dir(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "")?;
-        let url = start(Observatory::open(directory.path())?).await?;
+        let handle = start(Observatory::open(directory.path())?).await?;
+        let url = handle.issue_url();
         let without_scheme = url.strip_prefix("http://").expect("loopback URL");
         let (address, target) = without_scheme.split_once('/').expect("URL path");
 

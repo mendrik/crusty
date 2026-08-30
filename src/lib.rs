@@ -15,6 +15,7 @@ use fs2::FileExt;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, params};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -39,6 +40,16 @@ use walkdir::WalkDir;
 const INDEX_DIRECTORY: &str = ".rust-repo-intelligence";
 const MAX_SLICE_BYTES: usize = 12_000;
 const MAX_SEARCH_BODY_BYTES: usize = 48_000;
+/// Upper bound on a stored document body. `all_text_files` accepts `.json`,
+/// `.xml`, `.yaml`, and `.md`, so a checked-in fixture could otherwise be read
+/// whole into memory and inserted verbatim.
+const MAX_DOCUMENT_BYTES: usize = 256_000;
+/// Upper bound on the raw command output attached to a check result.
+const MAX_CHECK_OUTPUT_BYTES: usize = 8_000;
+/// Upper bound on structured diagnostics attached to a check result.
+const MAX_CHECK_DIAGNOSTICS: usize = 40;
+/// Superseded index generations retained for publishing history.
+const MAX_RETAINED_GENERATIONS: i64 = 20;
 const SCHEMA_VERSION: &str = "7";
 const INDEXER_VERSION: &str = "8";
 const RUST_ANALYZER_THREADS: u64 = 1;
@@ -199,7 +210,8 @@ type LifecycleRecord = (
     Option<String>,
 );
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RecordDecision {
     pub title: String,
     #[serde(default = "accepted")]
@@ -215,7 +227,8 @@ pub struct RecordDecision {
     pub materialize: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RecordSteering {
     pub title: String,
     pub instruction: String,
@@ -231,6 +244,7 @@ pub struct RecordSteering {
 /// Editable, evidence-backed repository work. Automatically discovered work is
 /// always `proposed`; callers must explicitly accept it before it becomes a plan.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkItemInput {
     pub title: String,
     #[serde(default = "proposed")]
@@ -536,6 +550,11 @@ impl Service {
         let index_dir = root.join(INDEX_DIRECTORY);
         fs::create_dir_all(&index_dir)?;
         let db = Connection::open(index_dir.join("index.sqlite3"))?;
+        // A refresh holds one write transaction for its whole duration. Without
+        // a busy timeout every concurrent reader failed outright with
+        // SQLITE_BUSY instead of waiting, contradicting the contract
+        // `index.status` advertises about reads during a refresh.
+        db.busy_timeout(std::time::Duration::from_secs(15))?;
         initialize_schema(&db)?;
         let (watcher, watch_events) = start_watcher(&root);
         let ra_program = rust_analyzer_program(
@@ -1045,6 +1064,15 @@ impl Service {
             params![revision.workspace_digest,semantic.id,Utc::now().to_rfc3339()],
         )?;
         let generation = self.db.last_insert_rowid();
+        // Superseded generations were never deleted, so the table grew by one
+        // row per refresh forever. A bounded tail is enough to explain recent
+        // publishing history.
+        self.db.execute(
+            "DELETE FROM index_generations WHERE status='superseded' AND id NOT IN (\
+                 SELECT id FROM index_generations WHERE status='superseded' ORDER BY id DESC LIMIT ?1\
+             )",
+            [MAX_RETAINED_GENERATIONS],
+        )?;
         self.db.execute(
             "INSERT OR REPLACE INTO metadata(key, value) VALUES ('revision', ?1)",
             [serde_json::to_string(revision)?],
@@ -1100,7 +1128,30 @@ impl Service {
         self.index_documents_and_use_cases(nodes, revision)
     }
 
+    /// Rebuilds the full-text index atomically.
+    ///
+    /// The body runs `DELETE` followed by one insert per node. Outside a
+    /// transaction, a failure part-way through — a busy writer, an I/O error,
+    /// a killed process — committed the delete and left the published search
+    /// index empty, so every search, locate, and decision lookup silently
+    /// returned nothing until the next full reindex.
     fn rebuild_search_index(&self) -> Result<()> {
+        self.db.execute_batch("SAVEPOINT rebuild_search_index")?;
+        match self.rebuild_search_index_inner() {
+            Ok(value) => {
+                self.db.execute_batch("RELEASE rebuild_search_index")?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = self.db.execute_batch(
+                    "ROLLBACK TO rebuild_search_index; RELEASE rebuild_search_index",
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn rebuild_search_index_inner(&self) -> Result<()> {
         self.db.execute("DELETE FROM search_index", [])?;
         for node in self.all_nodes()? {
             let body = self
@@ -1627,9 +1678,16 @@ impl Service {
         packages: &[(String, String, String)],
     ) -> Result<Vec<Node>> {
         let mut nodes = Vec::new();
+        let mut unreadable = Vec::new();
         for path in paths {
             let relative = relative(&self.root, path);
-            let text = fs::read_to_string(path).unwrap_or_default();
+            // An unreadable or non-UTF-8 file is recorded and skipped. Reading
+            // it as an empty string silently removed every one of its symbols
+            // while `index_inputs` still hashed it as healthy and current.
+            let Some(text) = read_source_text(path) else {
+                unreadable.push(relative);
+                continue;
+            };
             if let Some(ra) = &self.ra
                 && let Ok(mut ra) = ra.lock()
             {
@@ -1665,6 +1723,11 @@ impl Service {
                 });
             }
         }
+        // Surfaced by `status()` as a degraded area rather than being silent.
+        self.db.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES ('unreadable_inputs', ?1)",
+            [serde_json::to_string(&unreadable)?],
+        )?;
         Ok(nodes)
     }
 
@@ -1678,7 +1741,9 @@ impl Service {
         }
         self.db.execute("DELETE FROM unresolved_references", [])?;
         for file in rust_files(&self.root) {
-            let text = fs::read_to_string(&file).unwrap_or_default();
+            let Some(text) = read_source_text(&file) else {
+                continue;
+            };
             let rel = relative(&self.root, &file);
             let file_nodes: Vec<&Node> = nodes.iter().filter(|node| node.file == rel).collect();
             let mut edges = BTreeSet::new();
@@ -1725,7 +1790,19 @@ impl Service {
                 }
             }
             for (source, target, line, kind, confidence, resolution) in edges {
-                self.db.execute("INSERT INTO edges(src, dst, kind, context_json, confidence, provenance, revision, metadata) VALUES (?1, ?2, ?3, '{}', ?4, 'Syntax', ?5, ?6)", params![source, target, kind, f64::from_bits(confidence), revision, json!({"file":rel,"line":line,"resolution":resolution}).to_string()])?;
+                // One relationship per (src, dst, kind, provenance). The same
+                // call appearing on several lines used to insert a duplicate row
+                // each time, and the table had no uniqueness constraint to stop
+                // it. On a repeat, the strongest evidence wins; exact call sites
+                // remain the job of `repo.search mode=exact`.
+                self.db.execute(
+                    "INSERT INTO edges(src, dst, kind, context_json, confidence, provenance, revision, metadata) VALUES (?1, ?2, ?3, '{}', ?4, 'Syntax', ?5, ?6) \
+                     ON CONFLICT(src,dst,kind,provenance) DO UPDATE SET \
+                       confidence=MAX(confidence,excluded.confidence), \
+                       revision=excluded.revision, \
+                       metadata=CASE WHEN excluded.confidence>confidence THEN excluded.metadata ELSE metadata END",
+                    params![source, target, kind, f64::from_bits(confidence), revision, json!({"file":rel,"line":line,"resolution":resolution}).to_string()],
+                )?;
             }
         }
         Ok(())
@@ -1759,7 +1836,9 @@ impl Service {
         )?;
         let use_pattern = Regex::new(r"(?m)^\s*(?:pub\s+)?use\s+([^;]+);")?;
         for file in rust_files(&self.root) {
-            let text = fs::read_to_string(&file).unwrap_or_default();
+            let Some(text) = read_source_text(&file) else {
+                continue;
+            };
             let rel = relative(&self.root, &file);
             for capture in impl_pattern.captures_iter(&text) {
                 let trait_name = capture.get(1).map(|value| short_name(value.as_str()));
@@ -1879,9 +1958,21 @@ impl Service {
         let explicit = Regex::new(
             r"(?i)(?:deprecated|legacy|compat(?:ibility)?|fallback|superseded|replaced)\D{0,80}(?:use|with|by|replace(?:d)?\s+(?:with\s+)?)\s*`?([A-Za-z_][A-Za-z0-9_]*)`?",
         )?;
-        let lifecycle_name = Regex::new(r"(?i)(legacy|deprecated|compat|fallback|adapter|v1|old)")?;
+        // Anchored on word boundaries and matched against the symbol name only.
+        // The previous unanchored pattern also scanned a ±28-line excerpt, so
+        // any constant near the string "symbol-card-v1" and any function near
+        // the word "placeholders" was reported as suspected legacy — 59 of them
+        // in this repository alone. `v1` and `old` are dropped entirely: they
+        // carry almost no signal and produced most of the noise.
+        let lifecycle_name = Regex::new(
+            r"(?i)\b(legacy|deprecated|obsolete|superseded|compat|compatibility|fallback|shim)\b",
+        )?;
+        // An excerpt only contributes when it carries an explicit marker.
+        let explicit_marker = Regex::new(r"#\[deprecated|#\[allow\(deprecated\)\]")?;
         for node in nodes {
-            let text = fs::read_to_string(self.root.join(&node.file)).unwrap_or_default();
+            let Some(text) = read_source_text(&self.root.join(&node.file)) else {
+                continue;
+            };
             let start = node.start_line.saturating_sub(5);
             let excerpt = text
                 .lines()
@@ -1899,7 +1990,7 @@ impl Service {
                         .find(|other| short_name(&other.canonical_name) == name)
                 });
             let inferred_lifecycle = lifecycle_name.is_match(short_name(&node.canonical_name))
-                || lifecycle_name.is_match(&excerpt);
+                || explicit_marker.is_match(&excerpt);
             if replacement.is_none() && !inferred_lifecycle {
                 continue;
             }
@@ -1927,7 +2018,9 @@ impl Service {
         )?;
         for path in all_text_files(&self.root) {
             let relative_path = relative(&self.root, &path);
-            let text = fs::read_to_string(&path).unwrap_or_default();
+            let Some(text) = read_source_text(&path) else {
+                continue;
+            };
             for (offset, line) in text.lines().enumerate() {
                 let Some(actionable_text) = actionable_marker_text(&path, line) else {
                     continue;
@@ -2044,7 +2137,12 @@ impl Service {
                 "configuration" | "cargo" => "configuration",
                 _ => "source_doc",
             };
-            let text = fs::read_to_string(&path).unwrap_or_default();
+            let Some(text) = read_source_text(&path) else {
+                continue;
+            };
+            // Documents are stored whole; cap them so one checked-in dump
+            // cannot put an unbounded blob into the index.
+            let text = trim_text(&text, MAX_DOCUMENT_BYTES);
             self.db.execute(
                 "INSERT INTO documents(kind, path, text, revision) VALUES (?1, ?2, ?3, ?4)",
                 params![kind, relative(&self.root, &path), text, revision],
@@ -2093,8 +2191,7 @@ impl Service {
         depth: usize,
         budget: Option<usize>,
     ) -> Result<Value> {
-        let automatic_problem_capture =
-            self.automatic_problem_capture(intent, "repo.prepare_change")?;
+        let automatic_problem_capture = self.automatic_problem_capture(intent, "change.prepare")?;
         let context_id = format!(
             "ctx_{}",
             &blake3::hash(format!("{}:{:?}:{}", intent, targets, Utc::now()).as_bytes()).to_hex()
@@ -2215,6 +2312,106 @@ impl Service {
         Ok(
             json!({"context_id":id,"around":around,"relation":relation,"parent_context":serde_json::from_str::<Value>(&context)?,"source_slices":slices?,"revision":self.revision()}),
         )
+    }
+
+    /// Answers "who calls this", "who implements this", and "where is this
+    /// defined" without first preparing a change.
+    ///
+    /// `expand_context` already implemented these relations but required a
+    /// prepared change context, so the refactor and trait-implementor workflows
+    /// had no entry point at all and dropped straight to `grep`.
+    pub fn symbol_relations(&self, symbol: &str, relation: &str, limit: usize) -> Result<Value> {
+        let limit = limit.clamp(1, 100);
+        // Validate the relation before searching, so a misspelled relation is
+        // reported even when the symbol itself is unknown.
+        ensure!(
+            matches!(
+                relation,
+                "definition" | "callers" | "references" | "implementations"
+            ),
+            "unsupported relation `{relation}`; expected definition, callers, references, or implementations"
+        );
+        let nodes = self.search_nodes(&terms(symbol), limit.min(20))?;
+        if nodes.is_empty() {
+            return Ok(json!({
+                "symbol": symbol,
+                "relation": relation,
+                "definitions": [],
+                "results": [],
+                "freshness": self.snapshot(),
+                "note": "No indexed symbol matched. The published snapshot may be stale; use repo.search mode=exact for live text, or index.refresh to republish."
+            }));
+        }
+        let definitions = nodes
+            .iter()
+            .take(limit.min(8))
+            .map(node_location)
+            .collect::<Vec<_>>();
+        let (results, channel) = match relation {
+            "definition" => (definitions.clone(), "indexed definition"),
+            "implementations" => {
+                let semantic = self.semantic_locations(&nodes, "implementations");
+                if semantic.is_empty() {
+                    let ids = nodes.iter().map(|node| node.id).collect::<Vec<_>>();
+                    let neighbors = self.graph_neighbors(&ids, true, limit)?;
+                    (
+                        neighbors
+                            .iter()
+                            .filter(|(_, kind, _)| kind == "IMPLEMENTS")
+                            .map(|(node, kind, confidence)| {
+                                let mut located = node_location(node);
+                                located["edge"] = json!(kind);
+                                located["confidence"] = json!(confidence);
+                                located
+                            })
+                            .collect::<Vec<_>>(),
+                        "syntax-derived IMPLEMENTS edges",
+                    )
+                } else {
+                    (
+                        semantic
+                            .iter()
+                            .map(serde_json::to_value)
+                            .collect::<serde_json::Result<Vec<_>>>()?,
+                        "rust-analyzer",
+                    )
+                }
+            }
+            "callers" | "references" => {
+                let ids = nodes.iter().map(|node| node.id).collect::<Vec<_>>();
+                let wanted: &[&str] = if relation == "callers" {
+                    &["CALLS_DIRECT"]
+                } else {
+                    &["CALLS_DIRECT", "REFERENCES", "IMPORTS", "IMPLEMENTS"]
+                };
+                let neighbors = self.graph_neighbors(&ids, true, limit)?;
+                (
+                    neighbors
+                        .iter()
+                        .filter(|(_, kind, _)| wanted.contains(&kind.as_str()))
+                        .map(|(node, kind, confidence)| {
+                            let mut located = node_location(node);
+                            located["edge"] = json!(kind);
+                            located["confidence"] = json!(confidence);
+                            located
+                        })
+                        .collect::<Vec<_>>(),
+                    "indexed relationship graph",
+                )
+            }
+            other => bail!(
+                "unsupported relation `{other}`; expected definition, callers, references, or implementations"
+            ),
+        };
+        Ok(json!({
+            "symbol": symbol,
+            "relation": relation,
+            "definitions": definitions,
+            "results": results,
+            "channel": channel,
+            "freshness": self.snapshot(),
+            "authority": "Indexed relationships are guidance. Confirm call sites with repo.search mode=exact and the compiler before relying on them."
+        }))
     }
 
     pub fn history(&self, symbol: &str) -> Result<Value> {
@@ -2508,14 +2705,15 @@ impl Service {
             .optional()?
             .context("unknown change context")?;
         let context: Value = serde_json::from_str(&payload)?;
+        // `git diff --` reports only unstaged work. An agent that staged its
+        // edits before validating used to get an empty diff and a clean-looking
+        // report; `HEAD` covers staged and unstaged changes alike.
         let diff = diff
             .map(str::to_string)
+            .or_else(|| command_text(&self.root, &["diff", "HEAD", "--"]))
             .or_else(|| command_text(&self.root, &["diff", "--"]))
             .unwrap_or_default();
-        let changed_files: BTreeSet<String> = Regex::new(r"(?m)^\+\+\+ b/(.+)$")?
-            .captures_iter(&diff)
-            .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
-            .collect();
+        let changed_files = changed_files_in_diff(&diff);
         let mut validation_queue =
             self.activate_quality_constraints_for_diff(context_id, &diff, &changed_files)?;
         let expected: BTreeSet<String> = context
@@ -2575,8 +2773,44 @@ impl Service {
             })
             .filter(|symbol| diff.contains(symbol))
             .collect::<Vec<_>>();
+        let blocking = self.blocking_obligation_status(context_id, run_checks)?;
         Ok(
-            json!({"context_id":context_id,"revision_before":context.get("revision"),"revision_after":self.revision(),"snapshot":self.snapshot(),"changed_files":changed_files,"expected_affected_files":expected,"unmodified_expected_callers":unmodified,"new_references":"Re-run repo.prepare_change after signature changes to refresh static candidates.","architectural_violations":self.decision_conflicts(&diff)?,"legacy_paths_touched":legacy_left,"unresolved_edges":context.get("unresolved_edges"),"recommended_tests":context.get("tests"),"recommended_commands":["cargo fmt --check","cargo check --all-targets","cargo clippy --all-targets -- -D warnings","cargo test","gtk4-builder-tool validate <changed.ui>","blueprint-compiler compile <changed.blp>","xmllint --noout <changed.xml>"],"validation_queue":validation_queue,"checks":checks,"artifact_checks":artifact_checks,"learned_checks":learned_checks,"uncertainty":"Artifact validators can detect local syntax/schema issues, but not runtime registration, generated-code drift, external-consumer compatibility, or deployment behavior."}),
+            json!({"context_id":context_id,"revision_before":context.get("revision"),"revision_after":self.revision(),"snapshot":self.snapshot(),"changed_files":changed_files,"expected_affected_files":expected,"unmodified_expected_callers":unmodified,"new_references":"Re-run change.prepare after signature changes to refresh static candidates.","architectural_violations":self.decision_conflicts(&diff)?,"legacy_paths_touched":legacy_left,"unresolved_edges":context.get("unresolved_edges"),"recommended_tests":context.get("tests"),"recommended_commands":["cargo fmt --check","cargo check --all-targets","cargo clippy --all-targets -- -D warnings","cargo test","gtk4-builder-tool validate <changed.ui>","blueprint-compiler compile <changed.blp>","xmllint --noout <changed.xml>"],"validation_queue":validation_queue,"checks":checks,"artifact_checks":artifact_checks,"learned_checks":learned_checks,"blocking":blocking,"uncertainty":"Artifact validators can detect local syntax/schema issues, but not runtime registration, generated-code drift, external-consumer compatibility, or deployment behavior."}),
+        )
+    }
+
+    /// Reports whether any obligation a human marked `enforcement: "block"` is
+    /// unsatisfied for this context.
+    ///
+    /// `blocking` was previously written, ordered on, and serialised, but never
+    /// read, so `enforcement: "block"` gated nothing at all. Validation still
+    /// returns a result rather than an error — Crusty reports, the human and the
+    /// compiler decide — but the verdict is now explicit and machine-readable.
+    fn blocking_obligation_status(&self, context_id: &str, run_checks: bool) -> Result<Value> {
+        let mut statement = self.db.prepare(
+            "SELECT id,status,expected,selected_reason FROM validation_obligations WHERE context_id=?1 AND blocking=1 AND status!='cancelled' ORDER BY id",
+        )?;
+        let obligations = statement
+            .query_map([context_id], |row| {
+                Ok(json!({"obligation_id":row.get::<_,String>(0)?,"status":row.get::<_,String>(1)?,"expected":row.get::<_,String>(2)?,"selected_reason":row.get::<_,String>(3)?}))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let unsatisfied = obligations
+            .iter()
+            .filter(|item| item["status"] != "passed")
+            .cloned()
+            .collect::<Vec<_>>();
+        let note = if obligations.is_empty() {
+            "No blocking quality constraint matched this change."
+        } else if !run_checks {
+            "Blocking obligations were not executed because run_checks was false; their status is unresolved."
+        } else if unsatisfied.is_empty() {
+            "Every blocking obligation for this change passed."
+        } else {
+            "A human-approved blocking constraint is unsatisfied for this change; resolve it or record an explicit outcome before completing the change."
+        };
+        Ok(
+            json!({"blocked":!unsatisfied.is_empty(),"checked":run_checks,"unsatisfied":unsatisfied,"total":obligations.len(),"note":note}),
         )
     }
 
@@ -2843,8 +3077,29 @@ impl Service {
             |row| row.get(0),
         )?;
         let quality_memory = self.quality_counts()?;
+        // Files that could not be read are reported rather than silently
+        // indexed as empty, so a permissions or encoding problem is visible.
+        let unreadable: Vec<String> = self
+            .db
+            .query_row(
+                "SELECT value FROM metadata WHERE key='unreadable_inputs'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default();
+        let mut degraded = vec![Value::from(
+            "Runtime registration, generated code, external consumers, and profiles other than the indexed target/features require external verification; repo.matrix returns a bounded Cargo profile plan.",
+        )];
+        if !unreadable.is_empty() {
+            degraded.push(Value::from(format!(
+                "{} source file(s) could not be read or are not UTF-8 and were skipped; their symbols are absent from this snapshot.",
+                unreadable.len()
+            )));
+        }
         Ok(
-            json!({"snapshot":self.snapshot(),"current_revision":current_revision,"stale":stale,"index":self.index_status(),"counts":{"nodes":nodes,"edges":edges,"semantic_edges":semantic_edges,"unresolved_static_references":unresolved_static_references,"runtime_contract_artifacts":runtime_contracts,"embeddings":embeddings,"lifecycle_evidence":lifecycle,"work_items":work,"actionable_work_items":actionable_work,"package_targets":package_targets,"package_features":package_features},"quality_memory":quality_memory,"degraded_areas":["Runtime registration, generated code, external consumers, and profiles other than the indexed target/features require external verification; repo.matrix returns a bounded Cargo profile plan."],"cache":"rebuildable SQLite cache with atomic published generations; no repository files are changed by indexing."}),
+            json!({"snapshot":self.snapshot(),"current_revision":current_revision,"stale":stale,"index":self.index_status(),"counts":{"nodes":nodes,"edges":edges,"semantic_edges":semantic_edges,"unresolved_static_references":unresolved_static_references,"runtime_contract_artifacts":runtime_contracts,"embeddings":embeddings,"lifecycle_evidence":lifecycle,"work_items":work,"actionable_work_items":actionable_work,"package_targets":package_targets,"package_features":package_features},"quality_memory":quality_memory,"unreadable_inputs":unreadable,"degraded_areas":degraded,"cache":"rebuildable SQLite cache with atomic published generations; no repository files are changed by indexing."}),
         )
     }
 
@@ -3461,6 +3716,7 @@ CREATE INDEX IF NOT EXISTS nodes_file ON nodes(file);
 CREATE TABLE IF NOT EXISTS edges(id INTEGER PRIMARY KEY,src INTEGER REFERENCES nodes(id) ON DELETE CASCADE,dst INTEGER REFERENCES nodes(id) ON DELETE CASCADE,kind TEXT,context_json TEXT,confidence REAL,provenance TEXT,revision TEXT,metadata TEXT);
 CREATE INDEX IF NOT EXISTS edges_src ON edges(src);
 CREATE INDEX IF NOT EXISTS edges_dst ON edges(dst);
+CREATE UNIQUE INDEX IF NOT EXISTS edges_identity ON edges(src,dst,kind,provenance);
 CREATE INDEX IF NOT EXISTS edges_semantic ON edges(provenance,revision,kind);
 CREATE TABLE IF NOT EXISTS unresolved_references(id INTEGER PRIMARY KEY,source INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,file TEXT NOT NULL,line INTEGER NOT NULL,name TEXT NOT NULL,kind TEXT NOT NULL,candidate_count INTEGER NOT NULL,reason TEXT NOT NULL,revision TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS unresolved_references_source ON unresolved_references(source);
@@ -3506,25 +3762,49 @@ fn initialize_schema(db: &Connection) -> Result<()> {
                 |row| row.get(0),
             )
             .optional()?;
-        if version.as_deref() != Some(SCHEMA_VERSION)
-            && version.as_deref() != Some("6")
-            && version.as_deref() != Some("5")
-            && version.as_deref() != Some("4")
-        {
+        let stored = version.as_deref().unwrap_or("0");
+        let stored_number = stored.parse::<u32>().unwrap_or(0);
+        let current_number = SCHEMA_VERSION.parse::<u32>().unwrap_or(0);
+        // A database written by a newer Crusty is never rewritten. Downgrading
+        // used to fall through to the rebuild batch below and destroy every
+        // human-authored decision, problem record, and quality constraint.
+        ensure!(
+            stored_number <= current_number,
+            "index schema version {stored} was written by a newer Crusty than this build (schema {SCHEMA_VERSION}); \
+             upgrade Crusty or point --workspace at a different repository. No data was modified."
+        );
+        if stored != SCHEMA_VERSION && !matches!(stored, "6" | "5" | "4") {
+            // Derived data is rebuildable, so an incompatible older generation is
+            // discarded and reindexed. Human-authored tables are deliberately
+            // absent from this batch: decisions, steerings, work_items, the
+            // problem records, and the quality/validation lifecycle survive.
             db.execute_batch("PRAGMA foreign_keys=OFF;
-                DROP TABLE IF EXISTS quality_validation_history; DROP TABLE IF EXISTS validation_obligation_constraints; DROP TABLE IF EXISTS validation_obligations;
-                DROP TABLE IF EXISTS problem_quality_constraints; DROP TABLE IF EXISTS quality_constraints; DROP TABLE IF EXISTS problem_links; DROP TABLE IF EXISTS problem_occurrences; DROP TABLE IF EXISTS problem_records;
                 DROP TABLE IF EXISTS search_index;
                 DROP TABLE IF EXISTS symbol_embeddings; DROP TABLE IF EXISTS semantic_queries; DROP TABLE IF EXISTS index_generations; DROP TABLE IF EXISTS semantic_snapshots;
                 DROP TABLE IF EXISTS input_state; DROP TABLE IF EXISTS change_contexts;
                 DROP TABLE IF EXISTS co_changes; DROP TABLE IF EXISTS commit_files; DROP TABLE IF EXISTS commits;
                 DROP TABLE IF EXISTS use_case_nodes; DROP TABLE IF EXISTS use_cases; DROP TABLE IF EXISTS documents;
-                DROP TABLE IF EXISTS work_items; DROP TABLE IF EXISTS lifecycle_edges;
-                DROP TABLE IF EXISTS steerings; DROP TABLE IF EXISTS decision_targets; DROP TABLE IF EXISTS decisions; DROP TABLE IF EXISTS edges;
+                DROP TABLE IF EXISTS lifecycle_edges;
+                DROP TABLE IF EXISTS edges;
                 DROP TABLE IF EXISTS unresolved_references;
                 DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS package_features; DROP TABLE IF EXISTS package_targets; DROP TABLE IF EXISTS package_dependencies; DROP TABLE IF EXISTS packages;
-                DROP TABLE IF EXISTS metadata; PRAGMA foreign_keys=ON;")?;
+                PRAGMA foreign_keys=ON;")?;
         }
+    }
+    // `INSERT OR IGNORE INTO edges` could never ignore anything, because the
+    // table carried no uniqueness constraint. Existing databases therefore hold
+    // duplicate edges that must be collapsed before the index below can be
+    // created; the surviving row is the lowest id of each identity group.
+    let edges_exist: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='edges')",
+        [],
+        |row| row.get(0),
+    )?;
+    if edges_exist {
+        db.execute(
+            "DELETE FROM edges WHERE id NOT IN (SELECT MIN(id) FROM edges GROUP BY src,dst,kind,provenance)",
+            [],
+        )?;
     }
     db.execute_batch(SCHEMA)?;
     quality::initialize(db)?;
@@ -3533,6 +3813,95 @@ fn initialize_schema(db: &Connection) -> Result<()> {
         [SCHEMA_VERSION],
     )?;
     Ok(())
+}
+
+/// Collects every repository path a unified diff touches.
+///
+/// This replaces a single `^\+\+\+ b/(.+)$` regex that missed deletions
+/// (`+++ /dev/null`), pure renames (no `+++` line at all), and `--no-prefix`
+/// output, kept CRLF carriage returns and POSIX `\t<timestamp>` suffixes in the
+/// captured path, and matched `+++ b/...` text appearing inside added content.
+/// Every one of those failures was silent: the file simply never appeared in
+/// `changed_files`, and validation reported the change as clean.
+fn changed_files_in_diff(diff: &str) -> BTreeSet<String> {
+    let mut files = BTreeSet::new();
+    // Header directives are only meaningful outside a hunk body, where a line
+    // beginning `+++` is added content rather than a file header.
+    let mut in_hunk = false;
+    let mut previous_old_path: Option<String> = None;
+    for line in diff.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.starts_with("diff --git ") || line.starts_with("diff --cc ") {
+            in_hunk = false;
+            previous_old_path = None;
+            continue;
+        }
+        if line.starts_with("@@") {
+            in_hunk = true;
+            continue;
+        }
+        if in_hunk {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("rename from ") {
+            files.extend(diff_path(rest));
+        } else if let Some(rest) = line.strip_prefix("rename to ") {
+            files.extend(diff_path(rest));
+        } else if let Some(rest) = line.strip_prefix("--- ") {
+            previous_old_path = diff_path(rest);
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            match diff_path(rest) {
+                // `+++ /dev/null` marks a deletion; the path lives on the
+                // preceding `---` line.
+                None => files.extend(previous_old_path.take()),
+                Some(path) => {
+                    files.insert(path);
+                    previous_old_path = None;
+                }
+            }
+        }
+    }
+    files
+}
+
+/// Normalises one path out of a diff file header, or `None` for `/dev/null`.
+fn diff_path(raw: &str) -> Option<String> {
+    // POSIX diff appends a tab and a timestamp to the header path.
+    let path = raw.split('\t').next().unwrap_or(raw).trim_end();
+    // Git quotes paths containing unusual bytes; leave those to the caller's
+    // exact-match logic rather than mis-unescaping them.
+    let path = path.trim_matches('"');
+    if path.is_empty() || path == "/dev/null" {
+        return None;
+    }
+    // `a/` and `b/` are git's default prefixes; `--no-prefix` output has none.
+    let path = path
+        .strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path);
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_owned())
+    }
+}
+
+/// Renders a symbol as an actionable location.
+///
+/// `start_line`/`end_line` were indexed but dropped from every search and
+/// context response, so an agent got a filename and had to grep for the line.
+fn node_location(node: &Node) -> Value {
+    json!({
+        "id": node.id,
+        "symbol": node.canonical_name,
+        "kind": node.kind,
+        "file": node.file,
+        "line": node.start_line,
+        "end_line": node.end_line,
+        "location": format!("{}:{}", node.file, node.start_line),
+        "crate": node.crate_name,
+        "visibility": node.visibility,
+    })
 }
 
 fn node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
@@ -3867,7 +4236,11 @@ fn validate_checkpoint_ref(reference: &str) -> Result<()> {
         reference.starts_with(&format!("{CHECKPOINT_REF_PREFIX}/"))
             && reference
                 .chars()
-                .all(|character| character.is_ascii_alphanumeric() || "/-_.".contains(character)),
+                .all(|character| character.is_ascii_alphanumeric() || "/-_.".contains(character))
+            // `.` is legal in a ref name, but `..` walks out of the checkpoint
+            // namespace: `refs/codex/checkpoints/../../HEAD` otherwise passed
+            // validation and was handed straight to `git`.
+            && !reference.split('/').any(|segment| segment == ".." || segment == "."),
         "invalid checkpoint reference"
     );
     Ok(())
@@ -4045,7 +4418,7 @@ impl<'ast> Visit<'ast> for SyntaxReferenceVisitor {
 }
 
 fn syntax_references(text: &str) -> Option<Vec<SyntaxReference>> {
-    let file = syn::parse_file(text).ok()?;
+    let file = parse_rust_file(text)?;
     let mut visitor = SyntaxReferenceVisitor::default();
     visitor.visit_file(&file);
     Some(visitor.references.into_iter().collect())
@@ -4096,7 +4469,7 @@ fn resolve_syntax_reference<'a>(
 }
 
 fn parse_rust_symbols(text: &str) -> Option<Vec<ParsedSymbol>> {
-    let file = syn::parse_file(text).ok()?;
+    let file = parse_rust_file(text)?;
     let mut output = Vec::new();
     collect_syn_items(&file.items, &mut Vec::new(), &mut output);
     Some(output)
@@ -4336,8 +4709,51 @@ fn item_end(lines: &[&str], start: usize) -> usize {
 fn short_name(name: &str) -> &str {
     name.rsplit("::").next().unwrap_or(name)
 }
+/// Reads a source file, returning `None` when it cannot be read or is not UTF-8.
+///
+/// Callers previously used `fs::read_to_string(..).unwrap_or_default()`, which
+/// turned an unreadable or non-UTF-8 file into an *empty* one: zero symbols
+/// indexed, no error, no diagnostic, and downstream dead-code recommendations
+/// derived from the silence. `None` lets a caller skip the file instead of
+/// treating it as genuinely empty.
+/// Parses Rust source, refusing input nested deeply enough to overflow the stack.
+///
+/// `syn::parse_file` is recursive descent with no depth limit, so a generated
+/// file with a few thousand nested delimiters aborts the whole process — a
+/// stack overflow is not a catchable error. Callers already treat `None` as
+/// "fall back to the regex scanner", which is the right degradation here.
+fn parse_rust_file(text: &str) -> Option<syn::File> {
+    const MAX_NESTING: usize = 128;
+    let mut depth = 0usize;
+    let mut deepest = 0usize;
+    for byte in text.bytes() {
+        match byte {
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+                if deepest > MAX_NESTING {
+                    return None;
+                }
+            }
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    syn::parse_file(text).ok()
+}
+
+fn read_source_text(path: &Path) -> Option<String> {
+    match fs::read(path) {
+        Ok(bytes) => String::from_utf8(bytes).ok(),
+        Err(_) => None,
+    }
+}
+
 fn terms(input: &str) -> Vec<String> {
-    let re = Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").unwrap();
+    // The ASCII-only class silently produced zero terms for CJK, Cyrillic, and
+    // Greek input, which became an empty FTS MATCH and an empty result with no
+    // error. The Unicode classes are a strict superset of the old behaviour.
+    let re = Regex::new(r"[\p{Alphabetic}_][\p{Alphabetic}\p{Nd}_]*").unwrap();
     let values: Vec<_> = re
         .find_iter(input)
         .map(|m| m.as_str().to_string())
@@ -4372,21 +4788,21 @@ fn embedding_tokens(input: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     for character in input.chars() {
-        if character.is_ascii_alphanumeric() {
-            if character.is_ascii_uppercase()
-                && current.chars().last().is_some_and(char::is_lowercase)
-            {
-                words.push(current.to_ascii_lowercase());
+        // Mirrors `terms`: an ASCII-only test left non-Latin identifiers out of
+        // the feature vector entirely, so semantic search was blind to them.
+        if character.is_alphanumeric() || character == '_' {
+            if character.is_uppercase() && current.chars().last().is_some_and(char::is_lowercase) {
+                words.push(current.to_lowercase());
                 current.clear();
             }
             current.push(character);
         } else if !current.is_empty() {
-            words.push(current.to_ascii_lowercase());
+            words.push(current.to_lowercase());
             current.clear();
         }
     }
     if !current.is_empty() {
-        words.push(current.to_ascii_lowercase());
+        words.push(current.to_lowercase());
     }
     let mut tokens = Vec::new();
     for word in words.into_iter().filter(|word| word.len() > 1) {
@@ -4532,16 +4948,83 @@ fn decision_markdown(id: &str, d: &RecordDecision) -> String {
             .join("\n")
     )
 }
+/// Runs one cargo command and returns a bounded, structured result.
+///
+/// This previously returned the entire uncapped `stderr` as prose, so a failing
+/// `cargo test --all-targets` on a real workspace dumped its whole output into
+/// the MCP response and the compiler-error workflow got text where it needed
+/// file/line diagnostics.
 fn check(root: &Path, args: &[&str]) -> Value {
-    let out = Command::new("cargo").args(args).current_dir(root).output();
-    match out {
-        Ok(o) => {
-            json!({"command":format!("cargo {}",args.join(" ")),"success":o.status.success(),"output":String::from_utf8_lossy(&o.stderr)})
+    let command = format!("cargo {}", args.join(" "));
+    // `cargo fmt` does not understand `--message-format`, and the JSON stream is
+    // only useful for the compiler-driven commands.
+    let structured = matches!(args.first(), Some(&"check" | &"clippy" | &"test"));
+    let mut invocation = Command::new("cargo");
+    invocation.args(args).current_dir(root);
+    if structured {
+        invocation.arg("--message-format=json-diagnostic-rendered-ansi");
+    }
+    match invocation.output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let diagnostics = if structured {
+                cargo_diagnostics(&stdout)
+            } else {
+                Vec::new()
+            };
+            json!({
+                "command": command,
+                "success": output.status.success(),
+                "diagnostics": diagnostics,
+                "truncated_output": trim_text(&stderr, MAX_CHECK_OUTPUT_BYTES),
+                "output_truncated": stderr.len() > MAX_CHECK_OUTPUT_BYTES,
+            })
         }
-        Err(e) => {
-            json!({"command":format!("cargo {}",args.join(" ")),"success":false,"error":e.to_string()})
+        Err(error) => {
+            json!({"command":command,"success":false,"error":error.to_string()})
         }
     }
+}
+
+/// Extracts bounded `file:line` diagnostics from a cargo JSON message stream.
+fn cargo_diagnostics(stdout: &str) -> Vec<Value> {
+    let mut diagnostics = Vec::new();
+    for line in stdout.lines() {
+        if diagnostics.len() >= MAX_CHECK_DIAGNOSTICS {
+            break;
+        }
+        let Ok(message) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if message["reason"] != "compiler-message" {
+            continue;
+        }
+        let diagnostic = &message["message"];
+        let level = diagnostic["level"].as_str().unwrap_or("");
+        if !matches!(level, "error" | "warning") {
+            continue;
+        }
+        let span = diagnostic["spans"]
+            .as_array()
+            .and_then(|spans| spans.iter().find(|span| span["is_primary"] == true));
+        diagnostics.push(json!({
+            "level": level,
+            "code": diagnostic["code"]["code"].as_str(),
+            "message": trim_text(diagnostic["message"].as_str().unwrap_or(""), 1_000),
+            "file": span.and_then(|span| span["file_name"].as_str()),
+            "line": span.and_then(|span| span["line_start"].as_u64()),
+            "column": span.and_then(|span| span["column_start"].as_u64()),
+            "location": span.and_then(|span| {
+                Some(format!(
+                    "{}:{}",
+                    span["file_name"].as_str()?,
+                    span["line_start"].as_u64()?
+                ))
+            }),
+        }));
+    }
+    diagnostics
 }
 
 fn artifact_validator(path: &Path) -> Option<(&'static str, Vec<OsString>)> {
@@ -5497,5 +5980,430 @@ mod tests {
         assert_eq!(first.len(), EMBEDDING_DIMENSIONS);
         assert!(dot_product(&first, &first) > 0.99);
         assert!(dot_product(&first, &second) > 0.25);
+    }
+
+    /// Records the human-authored rows that must never be destroyed by a
+    /// schema-version transition, then reports them after reopening.
+    fn human_memory_counts(path: &std::path::Path) -> (i64, i64, i64) {
+        let db = Connection::open(path.join(".rust-repo-intelligence/index.sqlite3")).unwrap();
+        let count = |table: &str| {
+            db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+        (
+            count("decisions"),
+            count("problem_records"),
+            count("quality_constraints"),
+        )
+    }
+
+    fn seed_human_memory(directory: &std::path::Path) {
+        let mut service = Service::open(directory).unwrap();
+        service.refresh(None).unwrap();
+        service
+            .record_decision(RecordDecision {
+                title: "Keep the observatory read-only".into(),
+                status: "accepted".into(),
+                reason: "Crusty reports; humans decide".into(),
+                applies_to: vec!["src/lib.rs".into()],
+                consequences: vec![],
+                supersedes: None,
+                materialize: false,
+            })
+            .unwrap();
+        service
+            .problem_record(crate::quality::ProblemInput {
+                report: "The sidebar padding regressed after the last UI change".into(),
+                summary: None,
+                defect_family: None,
+                status: "reported".into(),
+                confidence: 0.8,
+                scope: crate::quality::QualityScope {
+                    files: vec!["src/lib.rs".into()],
+                    ..Default::default()
+                },
+                reproduction: None,
+                diagnostic_signature: Some("padding".into()),
+                root_cause: None,
+                fix_reference: None,
+                evidence: vec![],
+                related: vec![],
+                provenance: "HumanReport".into(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_database_from_a_newer_crusty_is_refused_without_touching_human_memory() {
+        let directory = fixture();
+        seed_human_memory(directory.path());
+        let before = human_memory_counts(directory.path());
+        assert!(before.0 > 0 && before.1 > 0 && before.2 > 0, "{before:?}");
+
+        let index = directory
+            .path()
+            .join(".rust-repo-intelligence/index.sqlite3");
+        let db = Connection::open(&index).unwrap();
+        db.execute(
+            "UPDATE metadata SET value='99' WHERE key='schema_version'",
+            [],
+        )
+        .unwrap();
+        drop(db);
+
+        let message = match Service::open(directory.path()) {
+            Ok(_) => panic!("a newer schema must not be silently rewritten"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            message.contains("newer Crusty") && message.contains("No data was modified"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(
+            human_memory_counts(directory.path()),
+            before,
+            "refusing to open must leave every human-authored row intact"
+        );
+    }
+
+    #[test]
+    fn an_incompatible_older_schema_rebuilds_derived_data_and_keeps_human_memory() {
+        let directory = fixture();
+        seed_human_memory(directory.path());
+        let before = human_memory_counts(directory.path());
+
+        let index = directory
+            .path()
+            .join(".rust-repo-intelligence/index.sqlite3");
+        let db = Connection::open(&index).unwrap();
+        db.execute(
+            "UPDATE metadata SET value='2' WHERE key='schema_version'",
+            [],
+        )
+        .unwrap();
+        let nodes_before: i64 = db
+            .query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))
+            .unwrap();
+        assert!(nodes_before > 0, "fixture should have indexed symbols");
+        drop(db);
+
+        let service = Service::open(directory.path())
+            .expect("an older schema is rebuildable, not a hard failure");
+        assert_eq!(
+            human_memory_counts(directory.path()),
+            before,
+            "decisions, problem records, and quality constraints are not derived data"
+        );
+        let nodes_after: i64 = service
+            .db
+            .query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            nodes_after, 0,
+            "derived symbol rows are discarded for reindex"
+        );
+    }
+
+    #[test]
+    fn changed_files_cover_deletions_renames_no_prefix_and_crlf_headers() {
+        let deletion = "diff --git a/src/gone.rs b/src/gone.rs\n\
+             deleted file mode 100644\n\
+             --- a/src/gone.rs\n\
+             +++ /dev/null\n\
+             @@ -1,2 +0,0 @@\n\
+             -pub fn gone() {}\n";
+        assert_eq!(
+            changed_files_in_diff(deletion),
+            BTreeSet::from(["src/gone.rs".to_owned()]),
+            "a deleted file is a changed file"
+        );
+
+        let addition = "diff --git a/src/new.rs b/src/new.rs\n\
+             new file mode 100644\n\
+             --- /dev/null\n\
+             +++ b/src/new.rs\n\
+             @@ -0,0 +1 @@\n\
+             +pub fn added() {}\n";
+        assert_eq!(
+            changed_files_in_diff(addition),
+            BTreeSet::from(["src/new.rs".to_owned()])
+        );
+
+        let rename = "diff --git a/src/old.rs b/src/new.rs\n\
+             similarity index 100%\n\
+             rename from src/old.rs\n\
+             rename to src/new.rs\n";
+        assert_eq!(
+            changed_files_in_diff(rename),
+            BTreeSet::from(["src/new.rs".to_owned(), "src/old.rs".to_owned()]),
+            "a pure rename has no +++ line but touches two paths"
+        );
+
+        let no_prefix = "diff --git src/plain.rs src/plain.rs\n\
+             --- src/plain.rs\n\
+             +++ src/plain.rs\n\
+             @@ -1 +1 @@\n\
+             +pub fn plain() {}\n";
+        assert_eq!(
+            changed_files_in_diff(no_prefix),
+            BTreeSet::from(["src/plain.rs".to_owned()]),
+            "--no-prefix output carries no a/ or b/ prefix"
+        );
+
+        let crlf = "diff --git a/src/lib.rs b/src/lib.rs\r\n\
+             --- a/src/lib.rs\r\n\
+             +++ b/src/lib.rs\r\n\
+             @@ -1 +1 @@\r\n";
+        assert_eq!(
+            changed_files_in_diff(crlf),
+            BTreeSet::from(["src/lib.rs".to_owned()]),
+            "a carriage return must not survive into the path"
+        );
+
+        let timestamped = "--- a/src/lib.rs\t2026-08-27 10:00:00.000000000 +0000\n\
+             +++ b/src/lib.rs\t2026-08-27 10:05:00.000000000 +0000\n\
+             @@ -1 +1 @@\n";
+        assert_eq!(
+            changed_files_in_diff(timestamped),
+            BTreeSet::from(["src/lib.rs".to_owned()]),
+            "POSIX diff appends a tab and a timestamp to the header path"
+        );
+    }
+
+    #[test]
+    fn diff_headers_inside_added_content_are_not_changed_files() {
+        // This repository's own tests embed diffs as string fixtures, so added
+        // content routinely contains text that looks exactly like a file header.
+        let diff = "diff --git a/src/tests.rs b/src/tests.rs\n\
+             --- a/src/tests.rs\n\
+             +++ b/src/tests.rs\n\
+             @@ -1,0 +1,3 @@\n\
+             +let fixture = \"\\\n\
+             +++ b/src/attacker_controlled.rs\n\
+             +\";\n";
+        assert_eq!(
+            changed_files_in_diff(diff),
+            BTreeSet::from(["src/tests.rs".to_owned()]),
+            "a header-shaped line inside a hunk body is content, not a file header"
+        );
+    }
+    #[test]
+    fn checkpoint_references_cannot_escape_the_checkpoint_namespace() {
+        validate_checkpoint_ref("refs/codex/checkpoints/cp_abc123").expect("a normal checkpoint");
+        validate_checkpoint_ref("refs/codex/checkpoints/feature.v2")
+            .expect("dots are legal in refs");
+        // `.` was in the allowed character set, so `..` walked straight out of
+        // the namespace and into `git branch`.
+        for escape in [
+            "refs/codex/checkpoints/../../HEAD",
+            "refs/codex/checkpoints/../refs/heads/main",
+            "refs/codex/checkpoints/./x",
+            "refs/heads/main",
+        ] {
+            assert!(
+                validate_checkpoint_ref(escape).is_err(),
+                "{escape} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn symbol_relations_answer_callers_and_implementations_with_locations() {
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname='relations'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        fs::create_dir(directory.path().join("src")).unwrap();
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub trait Store { fn put(&self); }\n\
+             pub struct Disk;\n\
+             impl Store for Disk { fn put(&self) {} }\n\
+             pub fn caller(disk: &Disk) { disk.put(); }\n",
+        )
+        .unwrap();
+        let mut service = Service::open(directory.path()).unwrap();
+        service.refresh(None).unwrap();
+
+        let definition = service
+            .symbol_relations("caller", "definition", 10)
+            .unwrap();
+        let first = &definition["definitions"][0];
+        assert!(
+            first["line"].as_i64().is_some_and(|line| line > 0),
+            "a definition must carry a line number, not just a filename: {first}"
+        );
+        assert!(
+            first["location"]
+                .as_str()
+                .is_some_and(|value| value.contains("src/lib.rs:")),
+            "{first}"
+        );
+
+        let implementations = service
+            .symbol_relations("Store", "implementations", 10)
+            .unwrap();
+        assert!(implementations["results"].is_array());
+        assert!(implementations["channel"].is_string());
+
+        // A misspelled relation must be an error even when the symbol is
+        // unknown, so the agent learns which parameter was wrong.
+        let error = service
+            .symbol_relations("no_such_symbol", "siblings", 10)
+            .expect_err("unknown relation");
+        assert!(format!("{error:#}").contains("unsupported relation"));
+
+        // An unknown symbol is not an error, but it must say why it is empty.
+        let empty = service
+            .symbol_relations("no_such_symbol", "callers", 10)
+            .unwrap();
+        assert_eq!(empty["results"].as_array().map(Vec::len), Some(0));
+        assert!(
+            empty["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("index.refresh")),
+            "an empty result must distinguish itself from a stale index"
+        );
+    }
+    #[test]
+    fn non_ascii_queries_find_their_documents() {
+        // The tokenizer regex was `[A-Za-z_][A-Za-z0-9_]*`, so CJK, Cyrillic,
+        // and Greek queries produced no terms, an empty FTS MATCH, and an empty
+        // result with no error at all.
+        assert!(!terms("日本語").is_empty(), "CJK must tokenize");
+        assert!(!terms("документация").is_empty(), "Cyrillic must tokenize");
+        assert!(
+            !terms("café résumé").is_empty(),
+            "accented Latin must tokenize"
+        );
+        // ASCII behaviour is unchanged.
+        assert_eq!(
+            terms("refresh_if_stale"),
+            vec!["refresh_if_stale".to_owned()]
+        );
+        assert_eq!(
+            terms("Service::open"),
+            vec!["Service".to_owned(), "open".to_owned()]
+        );
+        // Embeddings were blind to the same input.
+        assert!(!embedding_tokens("日本語ドキュメント").is_empty());
+        assert!(dot_product(&embed_text("документация"), &embed_text("документация")) > 0.99);
+    }
+
+    #[test]
+    fn an_unreadable_source_file_is_reported_rather_than_indexed_as_empty() {
+        let directory = fixture();
+        // Invalid UTF-8 in a .rs file. `unwrap_or_default` turned this into an
+        // empty file: zero symbols, no error, and `index_inputs` still hashed it
+        // as healthy and current.
+        fs::write(
+            directory.path().join("src/broken.rs"),
+            [0xFF, 0xFE, 0x00, 0x41],
+        )
+        .unwrap();
+        let mut service = Service::open(directory.path()).unwrap();
+        service.refresh(None).unwrap();
+
+        let status = service.status().unwrap();
+        let unreadable = status["unreadable_inputs"].as_array().unwrap();
+        assert!(
+            unreadable.iter().any(|path| path == "src/broken.rs"),
+            "the skipped file must be named: {unreadable:?}"
+        );
+        assert!(
+            status["degraded_areas"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|area| area.as_str().is_some_and(|area| area.contains("UTF-8"))),
+            "the degradation must be visible in status"
+        );
+    }
+
+    #[test]
+    fn repeated_relationships_collapse_to_one_edge() {
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname='edges'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        fs::create_dir(directory.path().join("src")).unwrap();
+        // `helper` is called three times from one function.
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub fn helper() -> u8 { 1 }\n\
+             pub fn caller() -> u8 { helper() + helper() + helper() }\n",
+        )
+        .unwrap();
+        let mut service = Service::open(directory.path()).unwrap();
+        service.refresh(None).unwrap();
+
+        // `INSERT OR IGNORE INTO edges` could never ignore anything: the table
+        // had no uniqueness constraint, so every repeat inserted another row and
+        // the graph grew on each refresh.
+        let duplicates: i64 = service
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM (SELECT src,dst,kind,provenance FROM edges GROUP BY src,dst,kind,provenance HAVING COUNT(*)>1)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(duplicates, 0, "an edge identity must appear once");
+
+        let before: i64 = service
+            .db
+            .query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))
+            .unwrap();
+        service.refresh(None).unwrap();
+        let after: i64 = service
+            .db
+            .query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, after, "a second refresh must not grow the graph");
+    }
+
+    #[test]
+    fn deeply_nested_input_degrades_instead_of_overflowing_the_stack() {
+        // `syn::parse_file` is recursive descent with no depth limit, and a
+        // stack overflow aborts the process rather than returning an error.
+        let pathological = format!("fn f() {{ {} {} }}", "(".repeat(5_000), ")".repeat(5_000));
+        assert!(
+            parse_rust_file(&pathological).is_none(),
+            "pathological nesting must be refused, not parsed"
+        );
+        // Ordinary nesting still parses.
+        assert!(
+            parse_rust_file(
+                "fn f() -> u8 { (((1)))
+}"
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn check_results_are_bounded_and_carry_structured_diagnostics() {
+        // `check` returned the entire uncapped stderr as prose, so a failing
+        // `cargo test --all-targets` dumped its whole output into the response
+        // and the compiler-error workflow got text instead of file:line.
+        let stream = r#"{"reason":"compiler-message","message":{"level":"error","code":{"code":"E0308"},"message":"mismatched types","spans":[{"is_primary":true,"file_name":"src/lib.rs","line_start":42,"column_start":9}]}}
+{"reason":"compiler-artifact","package_id":"x"}
+{"reason":"compiler-message","message":{"level":"note","message":"ignored","spans":[]}}"#;
+        let diagnostics = cargo_diagnostics(stream);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "only errors and warnings are reported"
+        );
+        assert_eq!(diagnostics[0]["level"], "error");
+        assert_eq!(diagnostics[0]["code"], "E0308");
+        assert_eq!(diagnostics[0]["location"], "src/lib.rs:42");
+        assert_eq!(diagnostics[0]["line"], 42);
     }
 }

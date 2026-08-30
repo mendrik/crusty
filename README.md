@@ -93,23 +93,33 @@ The 0.2 API is a clean break from the old `repo.*` surface.
 
 - `repo.search`: `mode=exact` searches live Rust source; `mode=broad` searches the published snapshot.
 - `repo.context`: builds a bounded hybrid context without implicit refresh.
+- `repo.matrix`: returns a bounded Cargo feature/profile verification plan with freshness metadata.
+- `symbol.relations`: resolves `callers`, `references`, `implementations`, or the `definition` of a symbol to `file:line` locations, labelled with the evidence channel that produced them.
+- `repo.history`: commit history and co-change neighbours for a symbol or path.
+- `repo.explain`: definitions, lifecycle, human decisions, related work, and bounded source slices for one target.
+- `repo.constraints`: the decisions, steerings, learned quality constraints, and lifecycle risks bearing on a proposed change.
+- `repo.cleanup_candidates`, `repo.obsolete_candidates`: private symbols with no indexed inbound references, and superseded symbols retained as lifecycle evidence.
 - `change.prepare`: starts a task that creates a freshness-labelled change briefing before edits.
+- `change.get`: recovers a previously prepared change context by context ID.
 - `change.validate`: starts a task that checks a diff against prepared evidence and optionally executes validations; it never refreshes first.
 - `repo.authority`: states Crusty's evidence and ownership boundaries.
 
 ### Index and tasks
 
 - `index.status`, `index.refresh`
-- `task.get`, `task.cancel`
+- `task.list`, `task.get`, `task.cancel`
+- `checkpoint.create`, `checkpoint.list`, `checkpoint.diff`, `checkpoint.restore`
 
-`change.prepare`, `change.validate`, and `index.refresh` return immediately with task IDs. The refresh worker acquires `.rust-repo-intelligence/index.lock`, refreshes in a blocking worker, and publishes atomically. Readers continue using the previous published generation.
+`index.status` reports node/edge/embedding counts, rust-analyzer and embedding backend health, and a `never_published` flag, so an empty `repo.context` can be told apart from an unbuilt index. Checkpoints are Git refs under `refs/codex/checkpoints`; `checkpoint.restore` only ever creates a new branch and never moves `HEAD`, discards work, or rewrites history.
+
+`change.prepare`, `change.validate`, and `index.refresh` return immediately with task IDs. Tasks carry a real progress figure, settle as `completed`, `failed`, or `cancelled`, and are bounded by a 30-minute budget. On startup Crusty reconciles anything a previous process left mid-flight, so an unclean shutdown cannot leave a task reporting `running` forever. Settled tasks are pruned to a bounded tail, and an oversized result is replaced by a summary rather than stored whole. `task.list` recovers task IDs after an interrupted client session without returning unbounded task results; use `task.get` for the full result. The refresh worker acquires `.rust-repo-intelligence/index.lock`, refreshes in a blocking worker, and publishes atomically. Readers continue using the previous published generation.
 
 ### Autonomous research and findings
 
-- `research.start`, `research.get`, `research.packet`, `research.submit`, `research.cancel`
-- `finding.list`, `finding.get`, `finding.review`, `finding.promote`
+- `research.start`, `research.list`, `research.get`, `research.packet`, `research.submit`, `research.cancel`
+- `finding.list`, `finding.get`, `finding.review`, `finding.evidence.add`, `finding.promote`
 
-A research run has explicit maximum web queries, local files, minutes, and findings. `research.start` performs bounded local discovery and prepares questions and web-search queries. The attached agent performs `web_search`, prefers standards, official documentation, maintainers, and original research, then calls `research.submit` with qualified evidence.
+A research run has explicit maximum web queries, local files, minutes, and findings. `research.start` performs bounded local discovery and prepares questions and web-search queries. `research.list` and the richer `research.get` recover run/task state and resulting findings. The attached agent performs `web_search`, prefers standards, official documentation, maintainers, and original research, then calls `research.submit` with qualified evidence.
 
 Allowed evidence is:
 
@@ -117,13 +127,28 @@ Allowed evidence is:
 - `web_primary`: HTTPS evidence explicitly marked primary;
 - `web_secondary`: HTTPS evidence with a written qualification explaining why it is being used.
 
-Every finding needs evidence and a `technical`, `product`, or `design` category. It starts as `proposed`. A human may review it as `accepted`, `dismissed`, or `needs_evidence`; only an accepted finding can be promoted, and promotion requires explicit human confirmation and reviewer identity.
+Every finding needs evidence and a `technical`, `product`, or `design` category. It starts as `proposed`. A human may review it as `accepted`, `dismissed`, or `needs_evidence`. `finding.evidence.add` appends qualified evidence only to a `needs_evidence` finding and reopens it as `proposed` without erasing review history. Only an accepted finding can be promoted, and promotion requires explicit human confirmation and reviewer identity. Promotion is terminal: it moves the finding to `promoted`, records the reviewer, and refuses both a second promotion and any later review that would contradict it.
 
 ### Human-owned work
 
 - `work.list`, `work.get`, `work.recommend`, `work.create`, `work.update`
 
-All exact and recommendation queries use the same durable store. `work.create` and `work.update` accept exact work-item IDs in `depends_on` and `blocked_by`; updates replace a supplied list and an explicit empty list clears it. Crusty rejects unknown, duplicate, self-referential, and cyclic relationships. `work.list` and `work.get` expose unresolved relationships and a derived `ready` flag. `work.recommend` only selects human-owned, accepted or active items whose dependencies and blockers have reached `completed` (the historical `complete` spelling is also recognized); it still recognizes `in_progress` as an active status. Crusty work memory is repository-local intent; it does not replace GitHub issues or a human product backlog.
+All exact and recommendation queries use the same durable store. `work.update` can change every human-editable create-time field: title, kind, status, scope, evidence, acceptance criteria, verification, dependencies, and blockers. Relationship updates replace a supplied list, an explicit empty list clears it, and omission preserves it. Crusty rejects unknown, duplicate, self-referential, and cyclic relationships. `work.list` and `work.get` expose unresolved relationships and a derived `ready` flag, and list results carry a `page` object with `total`, `next_offset`, and `has_more` so truncation is never silent. `work.recommend` considers every eligible item, not a first page, and selects only human-owned, accepted or active items whose dependencies and blockers have reached `completed` (the historical `complete` spelling is also recognized); it still recognizes `in_progress` as an active status. Crusty work memory is repository-local intent; it does not replace GitHub issues or a human product backlog.
+
+### Governance a change can cite
+
+- `decision.record`, `decision.list`
+- `steering.record`, `steering.list`
+
+Prepared changes and validation already cited human decisions and steerings; these tools let an agent contribute them rather than only read governance it can never write to.
+
+### Quality lifecycle
+
+- `problem.record`, `problem.list`, `problem.get`, `problem.update`
+- `quality.propose`, `quality.merge`, `quality.list`, `quality.get`, `quality.review`
+- `validation.queue`, `validation.record`
+
+These tools expose the minimum closed loop around automatically captured problems and learned constraints. Problem evidence may be corrected or completed; `problem.record` files a defect explicitly rather than waiting for automatic capture. `quality.propose` only ever proposes: a constraint becomes active solely through `quality.review` with an identified human reviewer and explicit confirmation, and `quality.merge` requires the same confirmation. Validation outcomes remain durable and inspectable, and `change.validate` reports a `blocking` verdict naming any unsatisfied `enforcement: "block"` obligation. Quality evidence may guide preparation and validation, but it cannot create work or expand scope by itself.
 
 ### Recovered project memory
 
@@ -141,8 +166,8 @@ The tool starts an Axum server on a random `127.0.0.1` port and returns a one-ti
 
 Crusty uses two SQLite files:
 
-- `.rust-repo-intelligence/index.sqlite3`: rebuildable source/Cargo/Git/document projections and prepared contexts;
-- `.rust-repo-intelligence/memory.sqlite3`: findings, evidence, research runs, tasks, work, and preserved legacy decision/quality records.
+- `.rust-repo-intelligence/index.sqlite3`: rebuildable source/Cargo/Git/document projections and prepared contexts, plus the retained problem/quality/validation engine;
+- `.rust-repo-intelligence/memory.sqlite3`: findings, evidence, research runs, tasks, work, and searchable summaries of retained decision/quality records.
 
 On first 0.2 startup, Crusty copies legacy work into the new work store and preserves decisions, steerings, problem records, and learned quality constraints as JSON legacy records. On later opens it refreshes those preserved read-only summaries so guidance added after the initial migration remains discoverable. The old database is never deleted. Both databases use WAL mode; durable memory writes use short connections and a busy timeout.
 
@@ -177,7 +202,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The observatory regression suite covers dirty-worktree visibility, one-store work lookup/recommendation, repository-scoped primary/side-session prompt recovery, late legacy-memory synchronization, review-gated promotion, the clean-break tool contract, and the dashboard's no-external-assets rule. The legacy suite continues covering index publication, Cargo and syntax relationships, ambiguity suppression, ranking, migrations, checkpoints, quality learning, and validation.
+The observatory regression suite covers dirty-worktree visibility, task and change recovery, one-store work lookup/recommendation and full-field updates, repository-scoped primary/side-session prompt recovery, late legacy-memory synchronization, evidence/review history, human-gated quality activation and finding promotion, the exact public tool contract, and the dashboard's no-external-assets rule. The legacy suite continues covering index publication, Cargo and syntax relationships, ambiguity suppression, ranking, migrations, checkpoints, quality learning, and validation.
 
 ## Known boundaries
 

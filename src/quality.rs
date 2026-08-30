@@ -3,6 +3,7 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, params};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -47,6 +48,12 @@ CREATE TABLE IF NOT EXISTS quality_constraints(
     revision TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS quality_constraint_state ON quality_constraints(status,maturity,category);
+CREATE TABLE IF NOT EXISTS quality_constraint_reviews(
+    id INTEGER PRIMARY KEY, constraint_id TEXT NOT NULL REFERENCES quality_constraints(id) ON DELETE CASCADE,
+    decision TEXT NOT NULL, reviewed_by TEXT NOT NULL, note TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS quality_review_constraint ON quality_constraint_reviews(constraint_id,created_at);
 CREATE TABLE IF NOT EXISTS problem_quality_constraints(
     problem_id TEXT NOT NULL REFERENCES problem_records(id) ON DELETE CASCADE,
     constraint_id TEXT NOT NULL REFERENCES quality_constraints(id) ON DELETE CASCADE,
@@ -112,7 +119,8 @@ const RECIPE_KINDS: &[&str] = &[
     "manual",
 ];
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct QualityScope {
     #[serde(default)]
     pub crates: Vec<String>,
@@ -191,7 +199,7 @@ impl QualityScope {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ValidationRecipe {
     pub kind: String,
     pub expected: String,
@@ -203,7 +211,8 @@ pub struct ValidationRecipe {
     pub environment: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProblemInput {
     pub report: String,
     #[serde(default)]
@@ -232,7 +241,8 @@ pub struct ProblemInput {
     pub provenance: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct QualityConstraintInput {
     pub rule: String,
     pub category: String,
@@ -258,7 +268,8 @@ pub struct QualityConstraintInput {
     pub invalidation_conditions: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ValidationOutcomeInput {
     pub obligation_id: String,
     pub status: String,
@@ -609,10 +620,20 @@ impl Service {
             .context("constraint status must be a string")?
             .to_owned();
         validate_choice("constraint status", &status, CONSTRAINT_STATUSES)?;
+        let previous_status = current
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("proposed");
+        validate_constraint_transition(previous_status, &status)?;
         let mut maturity = field("maturity")
             .as_str()
             .context("constraint maturity must be a string")?
             .to_owned();
+        // Activation implies approval. This is an internal Service API and is
+        // deliberately not on the MCP surface: `quality.review` is the only
+        // external activation path, and it records an identified reviewer.
+        // `validate_constraint_transition` above is what stops a rejected or
+        // retired constraint from being revived through either route.
         if status == "active" && maturity == "proposed" {
             maturity = "approved".into();
         }
@@ -651,6 +672,47 @@ impl Service {
         self.cancel_inactive_obligations()?;
         self.rebuild_search_index()?;
         Ok(json!({"constraint":self.quality_constraint_resource(id)?,"snapshot":self.snapshot()}))
+    }
+
+    pub fn quality_constraint_review(
+        &self,
+        id: &str,
+        decision: &str,
+        reviewed_by: &str,
+        note: &str,
+        enforcement: Option<&str>,
+    ) -> Result<Value> {
+        ensure!(!reviewed_by.trim().is_empty(), "reviewed_by is required");
+        let mut patch = match decision {
+            "activate" => json!({"status":"active","maturity":"approved"}),
+            "reject" => json!({"status":"rejected","maturity":"deprecated"}),
+            "disable" => json!({"status":"disabled"}),
+            "retire" => json!({"status":"retired","maturity":"deprecated"}),
+            other => bail!(
+                "unsupported quality review decision `{other}`; use activate, reject, disable, or retire"
+            ),
+        };
+        if let Some(enforcement) = enforcement {
+            patch["enforcement"] = json!(enforcement);
+        }
+        let transaction = self.db.unchecked_transaction()?;
+        self.quality_constraint_update(id, &patch)?;
+        transaction.execute(
+            "INSERT INTO quality_constraint_reviews(constraint_id,decision,reviewed_by,note,created_at) VALUES (?1,?2,?3,?4,?5)",
+            params![
+                id,
+                decision,
+                redact_text(reviewed_by.trim()),
+                redact_text(note.trim()),
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(json!({
+            "constraint": self.quality_constraint_resource(id)?,
+            "review": {"decision":decision,"reviewed_by":redact_text(reviewed_by.trim())},
+            "snapshot": self.snapshot()
+        }))
     }
 
     pub fn quality_constraint_merge(&self, source: &str, target: &str) -> Result<Value> {
@@ -725,16 +787,33 @@ impl Service {
             &input.status,
             &["passed", "failed", "skipped", "unavailable"],
         )?;
-        let exists: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM validation_obligations WHERE id=?1)",
-            [&input.obligation_id],
-            |row| row.get(0),
-        )?;
+        let current: Option<(String, bool)> = self
+            .db
+            .query_row(
+                "SELECT status,blocking FROM validation_obligations WHERE id=?1",
+                [&input.obligation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (current_status, blocking) = current
+            .with_context(|| format!("unknown validation obligation `{}`", input.obligation_id))?;
+        // Recording an outcome used to be unconditional, so a caller could
+        // resurrect a cancelled obligation as `passed`, or re-stamp a settled
+        // one. Only a queued obligation is awaiting an outcome.
         ensure!(
-            exists,
-            "unknown validation obligation `{}`",
+            current_status == "queued",
+            "validation obligation `{}` is {current_status}, not queued; re-prepare or re-validate the change to re-open it",
             input.obligation_id
         );
+        // A blocking obligation is the one thing an agent must not be able to
+        // wave through on its own word. `passed` with nothing to show for it
+        // would let the very check a human demanded be skipped as satisfied.
+        if blocking && input.status == "passed" {
+            ensure!(
+                input.evidence.iter().any(|item| !item.trim().is_empty()),
+                "a blocking obligation cannot be recorded as passed without evidence"
+            );
+        }
         let evidence = redact_strings(&input.evidence);
         let now = Utc::now().to_rfc3339();
         self.db.execute(
@@ -1065,8 +1144,12 @@ impl Service {
         let history = self.db.prepare(
             "SELECT obligation_id,status,evidence_json,provenance,revision,created_at FROM quality_validation_history WHERE constraint_id=?1 ORDER BY id DESC LIMIT 20",
         )?.query_map([id], |row| Ok(json!({"obligation_id":row.get::<_,String>(0)?,"status":row.get::<_,String>(1)?,"evidence":json_column(row,2),"provenance":row.get::<_,String>(3)?,"revision":row.get::<_,String>(4)?,"created_at":row.get::<_,String>(5)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let reviews = self.db.prepare(
+            "SELECT decision,reviewed_by,note,created_at FROM quality_constraint_reviews WHERE constraint_id=?1 ORDER BY id DESC LIMIT 20",
+        )?.query_map([id], |row| Ok(json!({"decision":row.get::<_,String>(0)?,"reviewed_by":row.get::<_,String>(1)?,"note":row.get::<_,String>(2)?,"created_at":row.get::<_,String>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         value["problem_ids"] = json!(problems);
         value["validation_history"] = json!(history);
+        value["reviews"] = json!(reviews);
         Ok(value)
     }
 
@@ -1230,7 +1313,7 @@ impl Service {
             );
             let now = Utc::now().to_rfc3339();
             self.db.execute(
-                "INSERT INTO validation_obligations(id,context_id,source,selected_reason,matched_surfaces_json,recipe_json,expected,enforcement,status,blocking,evidence_json,created_at,updated_at) VALUES (?1,?2,'learned_quality_constraint',?3,?4,?5,?6,?7,'queued',?8,'[]',?9,?9) ON CONFLICT(id) DO UPDATE SET selected_reason=excluded.selected_reason,matched_surfaces_json=excluded.matched_surfaces_json,enforcement=excluded.enforcement,blocking=excluded.blocking,updated_at=excluded.updated_at",
+                "INSERT INTO validation_obligations(id,context_id,source,selected_reason,matched_surfaces_json,recipe_json,expected,enforcement,status,blocking,evidence_json,created_at,updated_at) VALUES (?1,?2,'learned_quality_constraint',?3,?4,?5,?6,?7,'queued',?8,'[]',?9,?9) ON CONFLICT(id) DO UPDATE SET selected_reason=excluded.selected_reason,matched_surfaces_json=excluded.matched_surfaces_json,enforcement=excluded.enforcement,blocking=excluded.blocking,status='queued',evidence_json='[]',updated_at=excluded.updated_at",
                 params![obligation_id,context_id,selected_reason,serde_json::to_string(&surfaces)?,recipe.to_string(),expected,enforcement,blocking,now],
             )?;
             for constraint_id in constraint_ids {
@@ -1278,7 +1361,7 @@ impl Service {
             );
             let now = Utc::now().to_rfc3339();
             self.db.execute(
-                "INSERT INTO validation_obligations(id,context_id,source,selected_reason,matched_surfaces_json,recipe_json,expected,enforcement,status,blocking,evidence_json,created_at,updated_at) VALUES (?1,?2,'current_change',?3,?4,?5,?6,'validate','queued',0,'[]',?7,?7) ON CONFLICT(id) DO UPDATE SET selected_reason=excluded.selected_reason,matched_surfaces_json=excluded.matched_surfaces_json,recipe_json=excluded.recipe_json,expected=excluded.expected,updated_at=excluded.updated_at",
+                "INSERT INTO validation_obligations(id,context_id,source,selected_reason,matched_surfaces_json,recipe_json,expected,enforcement,status,blocking,evidence_json,created_at,updated_at) VALUES (?1,?2,'current_change',?3,?4,?5,?6,'validate','queued',0,'[]',?7,?7) ON CONFLICT(id) DO UPDATE SET selected_reason=excluded.selected_reason,matched_surfaces_json=excluded.matched_surfaces_json,recipe_json=excluded.recipe_json,expected=excluded.expected,status='queued',evidence_json='[]',updated_at=excluded.updated_at",
                 params![id,context_id,format!("Changed artifact `{file}` has a repository-supported native validator."),json!([{"kind":"file","selector":file,"matched":file}]).to_string(),serde_json::to_string(&recipe)?,recipe.expected,now],
             )?;
         }
@@ -1342,7 +1425,7 @@ impl Service {
 
     fn cancel_inactive_obligations(&self) -> Result<()> {
         self.db.execute(
-            "UPDATE validation_obligations SET status='cancelled',updated_at=?1 WHERE status='queued' AND NOT EXISTS (SELECT 1 FROM validation_obligation_constraints link JOIN quality_constraints qc ON qc.id=link.constraint_id WHERE link.obligation_id=validation_obligations.id AND qc.status='active' AND qc.maturity IN ('approved','established'))",
+            "UPDATE validation_obligations SET status='cancelled',updated_at=?1 WHERE status='queued' AND source='learned_quality_constraint' AND NOT EXISTS (SELECT 1 FROM validation_obligation_constraints link JOIN quality_constraints qc ON qc.id=link.constraint_id WHERE link.obligation_id=validation_obligations.id AND qc.status='active' AND qc.maturity IN ('approved','established'))",
             [Utc::now().to_rfc3339()],
         )?;
         Ok(())
@@ -1755,14 +1838,47 @@ fn scope_matches(scope: &QualityScope, surface: &QualityScope) -> (Vec<String>, 
 }
 
 fn selector_matches(field: &str, selector: &str, candidate: &str) -> bool {
+    if field == "file" {
+        return path_selector_matches(selector, candidate);
+    }
     let selector = normalize_selector(selector);
     let candidate = normalize_selector(candidate);
-    if field == "file" {
-        return wildcard_match(&selector, &candidate)
-            || candidate.starts_with(selector.trim_end_matches('/'));
-    }
     selector == candidate
         || (selector.len() > 3 && (candidate.contains(&selector) || selector.contains(&candidate)))
+}
+
+/// Matches a human-authored path selector against a repository path.
+///
+/// Path selectors are matched on the raw, separator-preserving text. Running
+/// them through `normalize_selector` first collapsed `*` and `/` into `-`,
+/// which made `wildcard_match`'s glob branch unreachable and left every
+/// glob-scoped constraint matching nothing at all.
+fn path_selector_matches(selector: &str, candidate: &str) -> bool {
+    let selector = normalize_path(selector);
+    let candidate = normalize_path(candidate);
+    if selector.is_empty() {
+        return false;
+    }
+    if selector.contains('*') {
+        return wildcard_match(&selector, &candidate);
+    }
+    // A directory selector matches everything beneath it, but only on a
+    // separator boundary: `src` must not match `srcfoo/evil.rs`.
+    let prefix = selector.trim_end_matches('/');
+    candidate == prefix
+        || candidate
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Lowercases and canonicalises separators so selectors and repository paths
+/// compare on the same footing, while preserving `/` and `*`.
+fn normalize_path(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches("./")
+        .replace('\\', "/")
+        .to_ascii_lowercase()
 }
 
 fn category_gate(category: &str, surface: &QualityScope, reasons: &[String]) -> bool {
@@ -1965,6 +2081,38 @@ fn validate_recipe(recipe: &ValidationRecipe, enforcement: &str) -> Result<()> {
     Ok(())
 }
 
+/// Enforces the learned-constraint lifecycle.
+///
+/// There was no transition table, only a flat membership check, so
+/// `rejected → active`, `retired → active`, and `merged → active` all
+/// succeeded. A human's rejection survived only as a historical review row that
+/// nothing consulted, and a reactivated merged constraint queued obligations
+/// alongside the target it had supposedly been folded into.
+fn validate_constraint_transition(from: &str, to: &str) -> Result<()> {
+    if from == to {
+        return Ok(());
+    }
+    let allowed: &[&str] = match from {
+        "proposed" => &["active", "rejected", "disabled", "retired", "merged"],
+        "active" => &["disabled", "retired", "merged"],
+        "disabled" => &["active", "retired", "merged"],
+        // Terminal. A rejected or retired constraint is re-proposed as a new
+        // record so its review history stays honest.
+        "rejected" | "retired" | "merged" => &[],
+        _ => &[],
+    };
+    ensure!(
+        allowed.contains(&to),
+        "cannot move a constraint from `{from}` to `{to}`{}",
+        if allowed.is_empty() {
+            format!("; `{from}` is terminal, so propose a new constraint instead")
+        } else {
+            format!("; `{from}` may become {}", allowed.join(", "))
+        }
+    );
+    Ok(())
+}
+
 fn validate_patch_keys(patch: &Value, allowed: &[&str]) -> Result<()> {
     let object = patch.as_object().context("patch must be an object")?;
     for key in object.keys() {
@@ -1976,30 +2124,71 @@ fn validate_patch_keys(patch: &Value, allowed: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// The redaction patterns, compiled once.
+///
+/// These were previously rebuilt on every call — inside the loop — so a
+/// 500-element evidence array cost 2,000 regex compilations per write.
+static REDACTIONS: std::sync::LazyLock<Vec<(Regex, &'static str)>> = std::sync::LazyLock::new(
+    || {
+        [
+            // PEM private key blocks, including the body.
+            (
+                r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+                "[REDACTED_PRIVATE_KEY]",
+            ),
+            // A URL with inline credentials. Runs before the email pattern,
+            // which would otherwise eat `user:pass@host` and destroy the host.
+            (
+                r"(?i)\b([a-z][a-z0-9+.-]*)://[^/\s:@]+:[^/\s@]+@",
+                "$1://[REDACTED_CREDENTIALS]@",
+            ),
+            // JWTs.
+            (
+                r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}",
+                "[REDACTED_JWT]",
+            ),
+            // Vendor-shaped tokens. `sk[-_]` covers both spellings, and the
+            // Slack, GitHub PAT, GitLab, Google, and AWS shapes are all
+            // recognisable on their own.
+            (
+                r"(?i)\b(?:gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{10,}|sk[-_](?:live|test)?[-_]?[A-Za-z0-9]{10,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[A-Z0-9]{16}|ASIA[A-Z0-9]{16}|AIza[A-Za-z0-9_-]{20,}|ya29\.[A-Za-z0-9_-]{10,}|npm_[A-Za-z0-9]{20,}|dop_v1_[a-f0-9]{40,})\b",
+                "[REDACTED_SECRET]",
+            ),
+            // Authorization headers of any scheme, not just Bearer.
+            (
+                r"(?i)\b(authorization\s*:\s*)(bearer|basic|token|digest)\s+\S+",
+                "$1$2 [REDACTED_SECRET]",
+            ),
+            (
+                r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}",
+                "Bearer [REDACTED_SECRET]",
+            ),
+            // Assigned secrets. The key half now allows surrounding word
+            // characters, so `AWS_SECRET_ACCESS_KEY` and `client_secret` match
+            // where a leading `\b` previously failed on the underscore. The
+            // value half accepts a quoted string so a passphrase containing
+            // spaces is not left half-exposed.
+            (
+                r#"(?i)([A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential)[A-Za-z0-9_.-]*)(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;]+)"#,
+                "$1$2[REDACTED_SECRET]",
+            ),
+            (
+                r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+                "[REDACTED_EMAIL]",
+            ),
+        ]
+        .into_iter()
+        .map(|(pattern, replacement)| {
+            (Regex::new(pattern).expect("redaction regex"), replacement)
+        })
+        .collect()
+    },
+);
+
 fn redact_text(value: &str) -> String {
     let mut output = value.to_owned();
-    for (pattern, replacement) in [
-        (
-            r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
-            "[REDACTED_EMAIL]",
-        ),
-        (
-            r"(?i)\b(?:gh[pousr]_[A-Za-z0-9_]{10,}|sk-[A-Za-z0-9_-]{10,}|AKIA[A-Z0-9]{16})\b",
-            "[REDACTED_SECRET]",
-        ),
-        (
-            r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+",
-            "Bearer [REDACTED_SECRET]",
-        ),
-        (
-            r"(?i)\b(password|passwd|token|api[_-]?key|secret)\s*[:=]\s*[^\s,;]+",
-            "$1=[REDACTED_SECRET]",
-        ),
-    ] {
-        output = Regex::new(pattern)
-            .expect("redaction regex")
-            .replace_all(&output, replacement)
-            .into_owned();
+    for (pattern, replacement) in REDACTIONS.iter() {
+        output = pattern.replace_all(&output, *replacement).into_owned();
     }
     output
 }
@@ -2518,5 +2707,303 @@ mod tests {
                 .iter()
                 .any(|value| value == &recorded["problem"]["id"])
         );
+    }
+    #[test]
+    fn file_selectors_match_the_paths_they_describe() {
+        // `normalize_selector` used to collapse `*` and `/` into `-` before
+        // matching, so every glob-scoped constraint silently matched nothing.
+        assert!(selector_matches("file", "*.rs", "src/lib.rs"));
+        assert!(selector_matches("file", "src/**/*.rs", "src/ui/window.rs"));
+        assert!(selector_matches("file", "data/*.ui", "data/window.ui"));
+        assert!(!selector_matches("file", "*.rs", "data/window.ui"));
+        assert!(!selector_matches("file", "*.toml", "src/lib.rs"));
+    }
+
+    #[test]
+    fn directory_selectors_match_only_on_a_separator_boundary() {
+        assert!(selector_matches("file", "src", "src/lib.rs"));
+        assert!(selector_matches("file", "src/", "src/ui/window.rs"));
+        assert!(selector_matches("file", "src/lib.rs", "src/lib.rs"));
+        // An unanchored `starts_with` used to let `src` claim `srcfoo/`.
+        assert!(!selector_matches("file", "src", "srcfoo/evil.rs"));
+        assert!(!selector_matches("file", "data", "database/schema.rs"));
+    }
+
+    #[test]
+    fn file_selectors_ignore_separator_and_case_differences() {
+        assert!(selector_matches("file", "./src/lib.rs", "src/lib.rs"));
+        assert!(selector_matches(
+            "file",
+            "src\\ui\\window.rs",
+            "src/ui/window.rs"
+        ));
+        assert!(selector_matches("file", "SRC/Lib.rs", "src/lib.rs"));
+        assert!(!selector_matches("file", "", "src/lib.rs"));
+    }
+
+    #[test]
+    fn a_satisfied_obligation_is_requeued_for_the_next_validation_pass() {
+        let directory = fixture();
+        let mut service = Service::open(directory.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        let recorded = gtk_problem(&service);
+        let constraint = recorded["constraint"]["id"].as_str().unwrap();
+        service
+            .quality_constraint_update(
+                constraint,
+                &json!({"status":"active","maturity":"approved","enforcement":"validate"}),
+            )
+            .unwrap();
+
+        let changed = BTreeSet::from(["data/window.ui".to_owned()]);
+        let first = service
+            .activate_quality_constraints_for_diff("ctx-requeue", "diff", &changed)
+            .unwrap();
+        let obligation = first["learned"][0]["id"].as_str().unwrap().to_owned();
+        assert_eq!(first["learned"][0]["status"], "queued");
+
+        service
+            .quality_validation_record(ValidationOutcomeInput {
+                obligation_id: obligation.clone(),
+                status: "passed".into(),
+                evidence: vec!["ran the UI".into()],
+            })
+            .unwrap();
+
+        // The same context is re-activated on every change.validate. A
+        // deterministic obligation id previously carried its `passed` status
+        // forward, so a blocking check became a one-time toll: the agent could
+        // satisfy it on a trivial diff and never run it against the real edit.
+        let second = service
+            .activate_quality_constraints_for_diff("ctx-requeue", "diff", &changed)
+            .unwrap();
+        let requeued = second["learned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == obligation.as_str())
+            .expect("the obligation still matches this change")
+            .clone();
+        assert_eq!(
+            requeued["status"], "queued",
+            "re-activating a change must re-open its obligations"
+        );
+        assert_eq!(
+            requeued["evidence"].as_array().map(Vec::len),
+            Some(0),
+            "stale evidence must not survive a re-validation"
+        );
+    }
+
+    #[test]
+    fn change_inferred_obligations_survive_unrelated_constraint_activity() {
+        let directory = fixture();
+        let mut service = Service::open(directory.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        let changed = BTreeSet::from(["data/window.ui".to_owned()]);
+        let queue = service
+            .activate_quality_constraints_for_diff("ctx-inferred", "diff", &changed)
+            .unwrap();
+        let inferred = queue["change_inferred"].as_array().cloned().unwrap();
+        assert!(
+            !inferred.is_empty(),
+            "a .ui change should infer a gtk4-builder-tool validator"
+        );
+        assert!(inferred.iter().all(|item| item["status"] == "queued"));
+
+        // `cancel_inactive_obligations` runs on every prepare, validate, and
+        // constraint update. Its NOT EXISTS predicate is vacuously true for
+        // change-inferred obligations, which carry no constraint link, so it
+        // used to cancel all of them as collateral damage.
+        let recorded = gtk_problem(&service);
+        let constraint = recorded["constraint"]["id"].as_str().unwrap();
+        service
+            .quality_constraint_update(constraint, &json!({"status":"disabled"}))
+            .unwrap();
+        let after = service
+            .quality_validation_queue_unchecked("ctx-inferred")
+            .unwrap();
+        let after = after["change_inferred"].as_array().cloned().unwrap();
+        assert!(
+            !after.is_empty() && after.iter().all(|item| item["status"] != "cancelled"),
+            "unrelated constraint activity must not cancel this change's checks: {after:?}"
+        );
+    }
+    #[test]
+    fn redaction_covers_the_secret_shapes_that_reach_repository_memory() {
+        // Evidence is stored verbatim in problem records and copied into the
+        // FTS index, where memory.search surfaces it to any later agent. Each
+        // of these previously passed through untouched.
+        let slack_token = ["xox", "b-123456789012-abcdefghijklmnopqr"].concat();
+        for (label, raw) in [
+            (
+                "aws secret",
+                "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY",
+            ),
+            (
+                "json access token",
+                r#"{"access_token": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcd"}"#,
+            ),
+            ("client secret", "client_secret=abc123supersecretvalue"),
+            (
+                "basic auth header",
+                "Authorization: Basic YWRtaW46aHVudGVyMg==",
+            ),
+            ("slack bot token", slack_token.as_str()),
+            ("github pat", "github_pat_11ABCDEFG0123456789abcdefghij"),
+            ("gcp api key", "AIzaSyD-1234567890abcdefghijklmnopqrstu"),
+            ("stripe live key", "sk_live_1234567890abcdefghij"),
+            (
+                "quoted passphrase",
+                r#"password: "correct horse battery staple""#,
+            ),
+            (
+                "private key",
+                "-----BEGIN RSA PRIVATE KEY-----\nMIIEpQIBAAKC\n-----END RSA PRIVATE KEY-----",
+            ),
+        ] {
+            let redacted = redact_text(raw);
+            assert!(
+                redacted.contains("[REDACTED"),
+                "{label} was not redacted: {redacted}"
+            );
+        }
+
+        // A secret's value must not survive anywhere in the output.
+        assert!(!redact_text("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENG").contains("wJalrXUt"));
+        assert!(!redact_text(r#"password: "correct horse battery staple""#).contains("battery"));
+
+        // The email pattern used to eat `user:pass@host` and destroy the host.
+        let dsn = redact_text("postgres://admin:Hunter2@db.internal:5432/prod");
+        assert!(!dsn.contains("Hunter2"), "credentials must go: {dsn}");
+        assert!(
+            dsn.contains("db.internal:5432/prod"),
+            "the host must survive redaction: {dsn}"
+        );
+
+        // Ordinary technical prose must pass through unharmed.
+        let prose = "The refresh task failed at src/lib.rs:2515 with SQLITE_BUSY.";
+        assert_eq!(redact_text(prose), prose);
+    }
+    #[test]
+    fn terminal_constraint_states_cannot_be_revived() {
+        // There was no transition table, only a flat membership check, so a
+        // human's rejection survived solely as a review row nothing consulted.
+        for terminal in ["rejected", "retired", "merged"] {
+            for target in ["active", "proposed", "disabled"] {
+                assert!(
+                    validate_constraint_transition(terminal, target).is_err(),
+                    "{terminal} -> {target} must be refused"
+                );
+            }
+        }
+        // The working lifecycle still moves.
+        for (from, to) in [
+            ("proposed", "active"),
+            ("proposed", "rejected"),
+            ("active", "disabled"),
+            ("active", "retired"),
+            ("disabled", "active"),
+            ("active", "active"),
+        ] {
+            validate_constraint_transition(from, to)
+                .unwrap_or_else(|error| panic!("{from} -> {to} must be allowed: {error}"));
+        }
+        assert!(
+            format!(
+                "{:#}",
+                validate_constraint_transition("rejected", "active").unwrap_err()
+            )
+            .contains("terminal"),
+            "the error should explain why"
+        );
+    }
+
+    #[test]
+    fn a_rejected_constraint_cannot_be_reactivated_through_review() {
+        let directory = fixture();
+        let service = Service::open(directory.path()).unwrap();
+        let recorded = gtk_problem(&service);
+        let id = recorded["constraint"]["id"].as_str().unwrap();
+        service
+            .quality_constraint_review(id, "reject", "human", "not a real invariant", None)
+            .unwrap();
+        let error = service
+            .quality_constraint_review(id, "activate", "human", "changed my mind", None)
+            .expect_err("a rejection must not be reversible in place");
+        assert!(format!("{error:#}").contains("cannot move a constraint from `rejected`"));
+    }
+
+    #[test]
+    fn validation_outcomes_cannot_be_self_certified() {
+        let directory = fixture();
+        let mut service = Service::open(directory.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        // A blocking constraint needs a deterministic command, so this uses the
+        // cargo-recipe family rather than the runtime GTK one.
+        let recorded = service
+            .problem_record(ProblemInput {
+                report: "rustc compiler warning in quality-demo".into(),
+                summary: None,
+                defect_family: None,
+                status: "reported".into(),
+                confidence: 0.9,
+                scope: QualityScope {
+                    crates: vec!["quality-demo".into()],
+                    ..Default::default()
+                },
+                reproduction: None,
+                diagnostic_signature: Some("unused variable warning".into()),
+                root_cause: None,
+                fix_reference: None,
+                evidence: vec![],
+                related: vec![],
+                provenance: "HumanReport".into(),
+            })
+            .unwrap();
+        let id = recorded["constraint"]["id"].as_str().unwrap();
+        service
+            .quality_constraint_update(
+                id,
+                &json!({"status":"active","maturity":"approved","enforcement":"block"}),
+            )
+            .unwrap();
+        let changed = BTreeSet::from(["src/lib.rs".to_owned()]);
+        let queue = service
+            .activate_quality_constraints_for_diff("ctx-selfcert", "diff", &changed)
+            .unwrap();
+        let obligation = queue["learned"][0]["id"].as_str().unwrap().to_owned();
+        assert_eq!(queue["learned"][0]["blocking"], true);
+
+        // The only check was that the obligation existed, so an agent could read
+        // the queue and mark every blocking obligation `passed` with an empty
+        // evidence array — and the real command then never ran.
+        let error = service
+            .quality_validation_record(ValidationOutcomeInput {
+                obligation_id: obligation.clone(),
+                status: "passed".into(),
+                evidence: vec![],
+            })
+            .expect_err("a blocking obligation needs evidence to pass");
+        assert!(format!("{error:#}").contains("without evidence"));
+
+        service
+            .quality_validation_record(ValidationOutcomeInput {
+                obligation_id: obligation.clone(),
+                status: "passed".into(),
+                evidence: vec!["cargo check --workspace --all-targets: clean".into()],
+            })
+            .unwrap();
+
+        // Recording twice used to re-stamp a settled obligation, and could even
+        // resurrect a cancelled one as passed.
+        let error = service
+            .quality_validation_record(ValidationOutcomeInput {
+                obligation_id: obligation,
+                status: "passed".into(),
+                evidence: vec!["again".into()],
+            })
+            .expect_err("a settled obligation is not awaiting an outcome");
+        assert!(format!("{error:#}").contains("not queued"));
     }
 }
