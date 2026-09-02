@@ -1,6 +1,6 @@
 # Install and upgrade Crusty in Codex
 
-Crusty 0.2 is a local stdio MCP server. The executable runs on the Codex host, uses the current project directory unless `--workspace` is supplied, and keeps repository intelligence under the repository's ignored `.rust-repo-intelligence/` directory. It does not require an API key or a hosted Crusty service.
+Crusty 0.3 is a local stdio MCP server. The executable runs on the Codex host, uses the current project directory unless `--workspace` is supplied, and keeps repository intelligence under the repository's ignored `.rust-repo-intelligence/` directory. It does not require an API key or a hosted Crusty service.
 
 Codex's desktop app, CLI, and IDE extension share MCP configuration on the same host. Global configuration lives in `~/.codex/config.toml`; trusted projects may use `.codex/config.toml`. These locations and the stdio server fields are defined by the [official Codex MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 
@@ -55,11 +55,11 @@ cargo install --path . --force --locked
 codex mcp get Crusty
 ```
 
-Keep the existing MCP entry when it already points to the installed executable. Restart the Codex client so it launches Crusty 0.2 instead of retaining the old process.
+Keep the existing MCP entry when it already points to the installed executable. Restart the Codex client so it launches Crusty 0.3 instead of retaining the old process.
 
 If `config.toml` contains per-tool approval rules, rename or remove rules that target the 0.1 API. A conservative read/workflow mapping is:
 
-| Crusty 0.1 | Crusty 0.2 |
+| Crusty 0.1 | Crusty 0.3 |
 | --- | --- |
 | `repo.locate` | `repo.search` with `mode=exact` or `mode=broad` |
 | `repo.orient`, `repo.context_pack` | `repo.context` |
@@ -69,17 +69,17 @@ If `config.toml` contains per-tool approval rules, rename or remove rules that t
 | `repo.work.list`, `repo.work.next` | `work.list`, `work.recommend` |
 | `repo.work.propose`, `repo.work.update` | `work.create`, `work.update` |
 
-The 0.2 API keeps legacy decisions, steerings, and checkpoints out of the public mutation surface. It now exposes a bounded problem/quality lifecycle (`problem.*`, `quality.*`, and `validation.*`) so automatically captured problems can be inspected and learned constraints can be reviewed by a human. Existing quality memory can contribute evidence to prepared changes and validation, while new improvement discovery still flows through research, proposed findings, human review, and explicitly human-owned work.
+The 0.3 API keeps legacy decisions, steerings, and checkpoints out of the public mutation surface. It exposes a bounded problem/quality lifecycle (`problem.*`, `quality.*`, and `validation.*`) plus live and durable architecture audits. Existing quality memory can contribute evidence to prepared changes and validation, while new improvement discovery still flows through proposed findings, human review, and explicitly human-owned work.
 
-Project instructions such as `AGENTS.md` must also stop naming removed tools. They should require `repo.consult` as the first call for every repository-scoped prompt, while retaining the separate `change.prepare` and `change.validate` edit workflow. The repository's own [`AGENTS.md`](../AGENTS.md) is a minimal 0.2 policy example.
+Project instructions such as `AGENTS.md` must also stop naming removed tools. They should require `repo.consult` as the first call for every repository-scoped prompt, while retaining the separate `change.prepare` and `change.validate` edit workflow. The repository's own [`AGENTS.md`](../AGENTS.md) is a minimal 0.3 policy example.
 
 ## Migrate a project
 
 There is no manual database conversion command and no need to edit application source.
 
-On the first 0.2 open of a repository, Crusty automatically creates `.rust-repo-intelligence/memory.sqlite3`, copies legacy work into the single 0.2 work store, and preserves legacy decisions, steerings, problem records, and learned quality constraints. The legacy index database is not deleted or rewritten by that import.
+On the first 0.2-or-newer open of a repository, Crusty automatically creates `.rust-repo-intelligence/memory.sqlite3`, copies legacy work into the current work store, and preserves legacy decisions, steerings, problem records, and learned quality constraints. The legacy index database is not deleted or rewritten by that import.
 
-Derived repository evidence is different: 0.2 does not perform implicit refreshes. In each existing project, explicitly start one refresh and poll it to completion:
+Derived repository evidence is different: Crusty does not perform implicit refreshes. In each existing project, explicitly start one refresh and poll it to completion:
 
 1. Call `index.status` to inspect the published generation and staleness.
 2. Call `index.refresh` with `scope="workspace"`.
@@ -90,14 +90,16 @@ Projects can migrate lazily when next opened. Before the refresh, `repo.search(m
 
 ## Verify the installation
 
-A successful installation reports server name `Crusty`, version `0.2.3`, and the 56-tool clean-break surface. A useful smoke sequence is:
+A successful installation reports server name `Crusty`, version `0.3.0`, and the 61-tool clean-break surface. A useful smoke sequence is:
 
 1. `repo.authority`
 2. `repo.consult` with a repository design or implementation topic; confirm the response contains a freshness envelope and governing guidance sections
 3. `index.status`
 4. `repo.search` with `mode=exact`, then `symbol.relations` with `relation=callers`
-5. `repo.context` after an explicit project refresh
-6. `memory.search` with a phrase from a prior project prompt; confirm unrelated repositories and assistant/tool output are absent
-7. `task.list` and `research.list`; confirm bounded summaries can recover interrupted workflows
+5. `repo.architecture`; confirm facts and findings remain separately labelled and evidence-bounded
+6. `audit.start`, followed by `task.get` and `audit.get`; confirm the report persists without entering human review automatically
+7. `repo.context` after an explicit project refresh
+8. `memory.search` with a phrase from a prior project prompt; confirm unrelated repositories and assistant/tool output are absent
+9. `task.list` and `research.list`; confirm bounded summaries can recover interrupted workflows
 
 Crusty research never opens arbitrary external connectors. `research.start` produces a bounded evidence packet; the attached agent performs primary-first `web_search` and returns qualified evidence through `research.submit`. Findings remain proposals until a human reviews them, and promotion to work requires explicit human confirmation.

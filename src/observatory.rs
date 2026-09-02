@@ -13,7 +13,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     env, fs,
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
@@ -211,6 +211,23 @@ pub struct ScopeRequest {
     pub scope: Option<String>,
     #[serde(default = "default_list_limit")]
     pub limit: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArchitectureRequest {
+    /// Optional path, symbol, rule, or architectural concept to narrow the
+    /// returned facts and findings. Omit for the whole workspace.
+    pub scope: Option<String>,
+    #[serde(default = "default_architecture_findings")]
+    pub max_findings: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArchitectureFindingRequest {
+    pub report_id: String,
+    pub finding_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -442,6 +459,9 @@ fn default_minutes() -> usize {
 }
 fn default_findings() -> usize {
     12
+}
+fn default_architecture_findings() -> usize {
+    100
 }
 fn default_limit() -> usize {
     20
@@ -920,6 +940,200 @@ impl Observatory {
         ensure!(!branch.trim().is_empty(), "branch is required");
         Service::open(self.root.as_ref().clone())?
             .checkpoint_restore_branch(reference, Some(branch))
+    }
+
+    pub fn architecture(&self, request: ArchitectureRequest) -> Result<Value> {
+        ensure!(
+            (1..=1_000).contains(&request.max_findings),
+            "max_findings must be between 1 and 1000"
+        );
+        let result = Service::open(self.root.as_ref().clone())?
+            .architecture(request.scope.as_deref(), request.max_findings)?;
+        Ok(json!({
+            "freshness":self.freshness("live_worktree")?,
+            "result":result
+        }))
+    }
+
+    pub fn start_architecture_audit(&self, request: ArchitectureRequest) -> Result<Value> {
+        ensure!(
+            (1..=1_000).contains(&request.max_findings),
+            "max_findings must be between 1 and 1000"
+        );
+        self.spawn_blocking_task(
+            "audit.start",
+            "queued for contextual architecture analysis",
+            move |observatory, task_id| {
+                observatory.update_task(
+                    &task_id,
+                    "running",
+                    10,
+                    "reading live manifests and Rust syntax",
+                )?;
+                let service = Service::open(observatory.root.as_ref().clone())?;
+                observatory.update_task(
+                    &task_id,
+                    "running",
+                    60,
+                    "qualifying architecture findings against counter-evidence",
+                )?;
+                let report =
+                    service.architecture_audit(request.scope.as_deref(), request.max_findings)?;
+                observatory.update_task(
+                    &task_id,
+                    "running",
+                    90,
+                    "persisting snapshot-scoped audit",
+                )?;
+                Ok(json!({
+                    "freshness":observatory.freshness("live_worktree")?,
+                    "report":report
+                }))
+            },
+        )
+    }
+
+    pub fn architecture_audit_get(&self, id: &str) -> Result<Value> {
+        ensure!(!id.trim().is_empty(), "audit id is required");
+        let report = Service::open(self.root.as_ref().clone())?.architecture_report(id)?;
+        Ok(json!({"report":report}))
+    }
+
+    pub fn architecture_audit_list(&self, limit: usize) -> Result<Value> {
+        Service::open(self.root.as_ref().clone())?.architecture_reports(limit)
+    }
+
+    /// Copy one audit result into the human-reviewed finding lifecycle.
+    ///
+    /// This is deliberately explicit: running an audit does not flood the
+    /// review inbox, and proposing a finding neither accepts nor activates it.
+    pub fn architecture_finding_propose(
+        &self,
+        request: ArchitectureFindingRequest,
+    ) -> Result<Value> {
+        ensure!(
+            !request.report_id.trim().is_empty(),
+            "report_id is required"
+        );
+        ensure!(
+            !request.finding_id.trim().is_empty(),
+            "finding_id is required"
+        );
+        let report =
+            Service::open(self.root.as_ref().clone())?.architecture_report(&request.report_id)?;
+        let finding = report["findings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|finding| finding["id"] == request.finding_id)
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "audit {} has no finding {}",
+                    request.report_id, request.finding_id
+                )
+            })?;
+        let id = format!(
+            "finding_{}",
+            &blake3::hash(format!("{}:{}", request.report_id, request.finding_id).as_bytes())
+                .to_hex()[..12]
+        );
+        let mut db = self.db()?;
+        let locations = finding["locations"].as_array().cloned().unwrap_or_default();
+        let scope = locations
+            .iter()
+            .filter_map(|location| location["file"].as_str())
+            .collect::<BTreeSet<_>>();
+        let severity = match finding["severity"].as_str().unwrap_or("low") {
+            "critical" => "critical",
+            "high" => "high",
+            "medium" => "normal",
+            _ => "low",
+        };
+        let summary = format!(
+            "{}\n\nRecommendation: {}",
+            finding["summary"].as_str().unwrap_or_default(),
+            finding["recommendation"].as_str().unwrap_or_default()
+        );
+        let now = Utc::now().to_rfc3339();
+        let transaction = db.transaction()?;
+        let inserted = transaction.execute(
+            "INSERT INTO findings(id,title,summary,category,severity,confidence,status,origin,research_run_id,scope_json,product_lens_json,created_at,updated_at,reviewed_by,review_note) VALUES (?1,?2,?3,'technical',?4,?5,'proposed','architecture_audit',NULL,?6,'[]',?7,?7,NULL,NULL) ON CONFLICT(id) DO NOTHING",
+            params![
+                id,
+                bounded(finding["title"].as_str().unwrap_or("Architecture finding"), 500),
+                bounded(&summary, 4_000),
+                severity,
+                finding["confidence"].as_f64().unwrap_or(0.7),
+                serde_json::to_string(&scope)?,
+                now
+            ],
+        )?;
+        if inserted == 0 {
+            let status: String =
+                transaction.query_row("SELECT status FROM findings WHERE id=?1", [&id], |row| {
+                    row.get(0)
+                })?;
+            transaction.commit()?;
+            return Ok(json!({
+                "finding_id":id,
+                "status":status,
+                "created":false,
+                "note":"This audit finding is already present in the review lifecycle."
+            }));
+        }
+        let evidence_id = new_id("evidence");
+        let uri = locations
+            .first()
+            .and_then(|location| location["file"].as_str())
+            .unwrap_or("Cargo.toml");
+        let evidence = finding["evidence"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("; ");
+        let qualification = format!(
+            "Proposed from audit {}. Counter-evidence: {} Limitations: {}",
+            request.report_id,
+            finding["counter_evidence"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("; "),
+            finding["limitations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        transaction.execute(
+            "INSERT INTO evidence_refs(id,owner_type,owner_id,source_kind,uri,title,excerpt,publisher,accessed_at,local_revision,confidence,is_primary,qualification) VALUES (?1,'finding',?2,'local_repository',?3,?4,?5,NULL,?6,?7,?8,1,?9)",
+            params![
+                evidence_id,
+                id,
+                uri,
+                format!("Architecture audit {}", request.report_id),
+                bounded(&evidence, 2_000),
+                now,
+                report.pointer("/revision/workspace_digest").and_then(Value::as_str),
+                finding["confidence"].as_f64().unwrap_or(0.7),
+                bounded(&qualification, 2_000)
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(json!({
+            "finding_id":id,
+            "status":"proposed",
+            "created":true,
+            "origin":"architecture_audit",
+            "next":"A human may review it with finding.review; only an accepted finding may be promoted into work."
+        }))
     }
 
     pub fn change_get(&self, context_id: &str) -> Result<Value> {
@@ -2087,9 +2301,14 @@ impl Observatory {
                 "truncated": true,
                 "bytes": serialized.len(),
                 "note": format!(
-                    "The result exceeded the {MAX_TASK_RESULT_BYTES}-byte task-result cap and was summarised. Narrow the request (a smaller budget or depth) and run it again."
+                    "The result exceeded the {MAX_TASK_RESULT_BYTES}-byte task-result cap and was summarised. Use the locator to retrieve persisted output, or narrow the request and run it again."
                 ),
                 "keys": result.as_object().map(|object| object.keys().cloned().collect::<Vec<_>>()),
+                "locator": {
+                    "context_id": result.pointer("/result/context_id"),
+                    "report_id": result.pointer("/report/id"),
+                    "run_id": result.get("run_id"),
+                }
             })
             .to_string()
         } else {
@@ -3789,6 +4008,57 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(generation_after, generation_before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn architecture_audits_are_durable_and_enter_review_only_explicitly() -> Result<()> {
+        let (directory, observatory) = workspace()?;
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub struct Job { active: bool, running: bool, failed: bool }\n",
+        )?;
+        let started = observatory.start_architecture_audit(ArchitectureRequest {
+            scope: None,
+            max_findings: 20,
+        })?;
+        let task_id = started["task_id"].as_str().expect("task id").to_owned();
+        let task = wait_for_task(&observatory, &task_id).await?;
+        assert_eq!(task["status"], "completed", "{task}");
+        let report = &task["result"]["report"];
+        let report_id = report["id"].as_str().expect("report id");
+        let finding_id = report["findings"][0]["id"]
+            .as_str()
+            .expect("architecture finding id");
+
+        assert_eq!(
+            observatory.architecture_audit_get(report_id)?["report"]["id"],
+            report_id
+        );
+        assert_eq!(
+            observatory.architecture_audit_list(10)?["reports"][0]["id"],
+            report_id
+        );
+        assert!(
+            observatory.finding_list(None, None, 10)?["findings"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+
+        let request = ArchitectureFindingRequest {
+            report_id: report_id.to_owned(),
+            finding_id: finding_id.to_owned(),
+        };
+        let proposed = observatory.architecture_finding_propose(request.clone())?;
+        assert_eq!(proposed["status"], "proposed");
+        assert_eq!(
+            observatory.finding_get(proposed["finding_id"].as_str().unwrap())?["finding"]["origin"],
+            "architecture_audit"
+        );
+        assert_eq!(
+            observatory.architecture_finding_propose(request)?["created"],
+            false
+        );
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "rust-repo-intelligence"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 description = "A local MCP repository observatory for Rust projects"
 license = "GPL-3.0-or-later"

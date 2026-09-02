@@ -1,4 +1,4 @@
-# Crusty 0.2 state, retrieval, and migration
+# Crusty 0.3 state, retrieval, and migration
 
 Crusty separates live navigation, rebuildable repository intelligence, and durable human/project memory. This separation is the core authority boundary: current source and runtime/compiler behavior remain authoritative, indexed relationships are freshness-labelled guidance, and autonomous findings remain proposals until a human acts on them.
 
@@ -8,7 +8,9 @@ Crusty separates live navigation, rebuildable repository intelligence, and durab
 
 `repo.search(mode=broad)` and `repo.context` read the last atomically published index generation. Their responses include a freshness envelope containing the live and indexed revisions, generation, staleness, confidence, and an explicit note that no implicit refresh was attempted.
 
-`index.status` reports that same boundary plus the latest refresh task and publisher lock. `index.refresh` is the only public refresh entry point. It returns a task ID immediately; `task.list` recovers bounded task summaries after an interrupted session and `task.get` exposes one task's queued, running, completed, or failed state and full result. Readers keep using the previous generation while a single writer builds and publishes the replacement.
+`repo.architecture` reads current manifests and Rust syntax directly from the live worktree. Its versioned facts and contextual findings are labelled separately from the published relationship graph. `audit.start` runs the same bounded analysis as a durable background task and persists its completed report.
+
+`index.status` reports the snapshot boundary plus the latest refresh task and publisher lock. `index.refresh` is the only public refresh entry point. It returns a task ID immediately; `task.list` recovers bounded task summaries after an interrupted session and `task.get` exposes one task's queued, running, completed, or failed state and full result. Readers keep using the previous generation while a single writer builds and publishes the replacement.
 
 Cargo/toolchain/profile inputs or an indexer-version change force a full rebuild. Ordinary source changes may use incremental invalidation. The semantic snapshot includes the source/Cargo digest, `Cargo.lock`, target triple, feature profile, build-environment fingerprint, and rust-analyzer version.
 
@@ -16,7 +18,7 @@ Cargo/toolchain/profile inputs or an indexer-version change force a full rebuild
 
 Repository-local state lives under the ignored `.rust-repo-intelligence/` directory:
 
-- `index.sqlite3` contains rebuildable source, Cargo, Git, document, graph, search, embedding, and prepared-change projections plus the retained problem/quality/validation engine.
+- `index.sqlite3` contains rebuildable source, Cargo, Git, document, graph, search, embedding, and prepared-change projections, the newest 20 snapshot-scoped architecture audits, plus the retained problem/quality/validation engine.
 - `memory.sqlite3` contains research runs, evidence, findings, task history, finding review decisions, the single human-owned work store, and searchable summaries of retained legacy guidance.
 - `index.lock` is the filesystem publisher lease used to reject concurrent writers.
 
@@ -36,9 +38,9 @@ GTK `.ui`, Blueprint, CSS, XML/D-Bus, desktop/service, Cargo, and common configu
 
 ## Change preparation and validation
 
-`change.prepare` captures a freshness-labelled impact briefing before edits. It returns a task ID; after polling `task.get`, the completed result contains the context ID, likely change surface, source slices, semantic/static provenance, governing evidence, ambiguity, and validation queue. `change.get` recovers that prepared evidence by context ID, and `repo.matrix` supplies the bounded Cargo feature/profile plan referenced by its verification guidance.
+`change.prepare` captures a freshness-labelled impact briefing before edits. It returns a task ID; after polling `task.get`, the completed result contains the context ID, likely change surface, source slices, semantic/static provenance, governing evidence, ambiguity, validation queue, and current architecture-finding baseline. `change.get` recovers that prepared evidence by context ID, and `repo.matrix` supplies the bounded Cargo feature/profile plan referenced by its verification guidance.
 
-`change.validate` compares a diff with that prepared context and optionally runs checks. It is also task-backed and never refreshes first. When checks are requested, locally available Rust and artifact validators report explicit pass, failure, or unavailable evidence. Runtime registration, deployment behavior, and external compatibility remain separate obligations.
+`change.validate` compares a diff with that prepared context and optionally runs checks. It is also task-backed and never refreshes first. Its architecture delta distinguishes new, worsened, resolved, and unchanged baseline findings and considers only files touched by the diff. Inferred architecture results remain advisory; only a separately human-approved quality constraint may block. When checks are requested, locally available Rust and artifact validators report explicit pass, failure, or unavailable evidence. Runtime registration, deployment behavior, and external compatibility remain separate obligations.
 
 The minimal public quality loop exposes `problem.list/get/update`, `quality.list/get/review`, and `validation.queue/record`. Problem evidence can be completed or corrected, but activating a learned constraint requires an identified human reviewer and explicit confirmation. Constraint review history and validation outcomes are durable and inspectable. Historical constraints never create human work or expand implementation scope by themselves.
 
@@ -46,7 +48,7 @@ The minimal public quality loop exposes `problem.list/get/update`, `quality.list
 
 `research.start` performs a bounded local scan and prepares primary-first web-search queries for the attached agent. `research.list` recovers run and task IDs, while `research.get` returns the run, task, budget consumption, packet, and resulting findings. Crusty itself has no GitHub, CI, analytics, telemetry, or arbitrary external connector. The attached agent performs `web_search` and submits qualified local, primary-web, or secondary-web evidence through `research.submit`.
 
-Every finding is categorized as technical, product, or design and begins as `proposed`. `finding.review` records an append-only human decision. When the result is `needs_evidence`, `finding.evidence.add` can append qualified evidence and reopen the proposal without discarding review history. `finding.promote` can create project work only after acceptance and explicit human confirmation.
+Every finding is categorized as technical, product, or design and begins as `proposed`. Architecture audit results remain in their report unless `audit.finding.propose` explicitly copies one into this lifecycle with local evidence, counter-evidence, and limitations. `finding.review` records an append-only human decision. When the result is `needs_evidence`, `finding.evidence.add` can append qualified evidence and reopen the proposal without discarding review history. `finding.promote` can create project work only after acceptance and explicit human confirmation.
 
 `work.list`, `work.get`, `work.recommend`, `work.create`, and `work.update` all use `memory.sqlite3`. `work.update` covers all human-editable create-time fields. `depends_on` records prerequisite work, while `blocked_by` records work that explicitly prevents progress; both contain exact work-item IDs. Create and update operations reject unknown, duplicate, self-referential, and cyclic relationships. Supplying a relationship list replaces it, an explicit empty list clears it, and omitting it during update preserves the stored value. Reads expose unresolved dependencies and blockers plus a derived `ready` flag. A relationship resolves when the referenced work reaches `completed` (or the historical `complete` spelling). Recommendations include only human-owned, accepted or active work with no unresolved relationships; the historical `in_progress` spelling remains readable. Crusty's ledger records repository-local intent; it does not replace GitHub issues or a human product backlog.
 
@@ -54,16 +56,16 @@ Every finding is categorized as technical, product, or design and begins as `pro
 
 ## Migration from 0.1
 
-Crusty 0.2 is a clean-break MCP API. Exact old tool names in `AGENTS.md`, Codex approval rules, or automation must be updated. See the [Codex installation and migration guide](codex-installation.md) for the mapping.
+Crusty 0.3 retains the clean-break MCP API introduced by 0.2. Exact old tool names in `AGENTS.md`, Codex approval rules, or automation must be updated. See the [Codex installation and migration guide](codex-installation.md) for the mapping.
 
-No manual SQL migration is required. On first 0.2 open:
+No manual SQL migration is required. On first 0.2-or-newer open:
 
 1. Crusty creates `memory.sqlite3`.
-2. Legacy work is copied into the 0.2 work store.
+2. Legacy work is copied into the current work store.
 3. Decisions, steerings, problems, and quality constraints are preserved as legacy records and synchronized again on later opens so post-migration guidance remains visible.
 4. The old index database is left in place and is not deleted by the import.
 
-Derived evidence is intentionally migrated separately. Because 0.2 does not refresh implicitly, each existing project needs one explicit `index.refresh(scope="workspace")`, polled with `task.get`, to publish indexer version 8 and the `symbol-card-v1` backfill. Projects may do this lazily. Live exact search remains available before the refresh; broad results identify the previous generation as stale.
+Derived evidence is intentionally migrated separately. Because Crusty does not refresh implicitly, each existing project needs one explicit `index.refresh(scope="workspace")`, polled with `task.get`, to publish indexer version 8 and the `symbol-card-v1` backfill. Projects may do this lazily. Live exact search remains available before the refresh; broad results identify the previous generation as stale.
 
 An incompatible or deliberately reset legacy schema may lose legacy memory, so deleting state is an explicit emergency action rather than a normal upgrade step.
 

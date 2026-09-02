@@ -5,12 +5,13 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use rust_repo_intelligence::observatory::{
-    CheckpointCreateRequest, CheckpointDiffRequest, CheckpointRestoreRequest, ConsultRequest,
-    ContextRequest, FindingEvidenceRequest, MemorySearchRequest, Observatory, PrepareRequest,
-    ProblemUpdateRequest, PromoteFindingRequest, QualityMergeRequest, QualityReviewRequest,
-    ResearchListRequest, ResearchStartRequest, ResearchSubmitRequest, ReviewFindingRequest,
-    ScopeRequest, SearchRequest, SymbolRelationRequest, TargetRequest, TaskListRequest,
-    ValidateRequest, WorkCreateRequest, WorkUpdateRequest,
+    ArchitectureFindingRequest, ArchitectureRequest, CheckpointCreateRequest,
+    CheckpointDiffRequest, CheckpointRestoreRequest, ConsultRequest, ContextRequest,
+    FindingEvidenceRequest, MemorySearchRequest, Observatory, PrepareRequest, ProblemUpdateRequest,
+    PromoteFindingRequest, QualityMergeRequest, QualityReviewRequest, ResearchListRequest,
+    ResearchStartRequest, ResearchSubmitRequest, ReviewFindingRequest, ScopeRequest, SearchRequest,
+    SymbolRelationRequest, TargetRequest, TaskListRequest, ValidateRequest, WorkCreateRequest,
+    WorkUpdateRequest,
 };
 use rust_repo_intelligence::{RecordDecision, RecordSteering, ValidationOutcomeInput};
 use schemars::JsonSchema;
@@ -62,6 +63,12 @@ struct ContextIdRequest {
 #[serde(deny_unknown_fields)]
 struct IndexRefreshRequest {
     scope: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AuditListRequest {
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -161,6 +168,66 @@ impl CrustyServer {
     )]
     async fn repo_matrix(&self) -> Result<Json<Value>, String> {
         Self::value(self.observatory.matrix())
+    }
+
+    #[tool(
+        name = "repo.architecture",
+        description = "Build a bounded live-worktree architecture map with versioned facts, qualified advisory findings, counter-evidence, confidence, and explicit limitations."
+    )]
+    async fn repo_architecture(
+        &self,
+        Parameters(request): Parameters<ArchitectureRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.architecture(request)).await
+    }
+
+    #[tool(
+        name = "audit.start",
+        description = "Start a durable contextual Rust architecture audit against the live worktree; returns immediately with a task id and persists the completed report."
+    )]
+    async fn audit_start(
+        &self,
+        Parameters(request): Parameters<ArchitectureRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.start_architecture_audit(request))
+    }
+
+    #[tool(
+        name = "audit.get",
+        description = "Retrieve one persisted snapshot-scoped architecture audit by its exact report id."
+    )]
+    async fn audit_get(
+        &self,
+        Parameters(request): Parameters<IdRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.architecture_audit_get(&request.id)).await
+    }
+
+    #[tool(
+        name = "audit.finding.propose",
+        description = "Explicitly copy one persisted audit finding into the human review inbox as a proposal; this never accepts, activates, or promotes it automatically."
+    )]
+    async fn audit_finding_propose(
+        &self,
+        Parameters(request): Parameters<ArchitectureFindingRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.architecture_finding_propose(request)).await
+    }
+
+    #[tool(
+        name = "audit.list",
+        description = "List bounded summaries of persisted architecture audits, newest first, for comparison and recovery."
+    )]
+    async fn audit_list(
+        &self,
+        Parameters(request): Parameters<AuditListRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.architecture_audit_list(request.limit.unwrap_or(20)))
+            .await
     }
 
     #[tool(
@@ -439,7 +506,7 @@ impl CrustyServer {
 
     #[tool(
         name = "task.list",
-        description = "List bounded summaries of durable change, refresh, and research tasks so interrupted sessions can recover IDs and result availability."
+        description = "List bounded summaries of durable change, refresh, architecture-audit, and research tasks so interrupted sessions can recover IDs and result availability."
     )]
     async fn task_list(
         &self,
@@ -454,7 +521,7 @@ impl CrustyServer {
 
     #[tool(
         name = "task.get",
-        description = "Poll a durable change, refresh, or research task for progress, result, or failure."
+        description = "Poll a durable change, refresh, architecture-audit, or research task for progress, result, or failure."
     )]
     async fn task_get(
         &self,
@@ -806,8 +873,8 @@ impl CrustyServer {
 
 #[tool_handler(
     name = "Crusty",
-    version = "0.2.3",
-    instructions = "Crusty is a Rust repository observatory. For every repository-scoped user prompt, call repo.consult first with the user's complete intent before planning, answering, or acting; do not skip consultation for design, review, questions, documentation, configuration, or non-code work. Apply relevant human decisions, steering, design and quality constraints, restrictions, governing documents, and workflows returned by the consultation. Consultation is read-only and does not replace change preparation: use change.prepare before edits and change.validate afterwards, polling both with task.get; task.list and change.get recover interrupted workflows. Use repo.search exact for live call-site work and symbol.relations for callers, references, implementations, and definitions; neither refreshes. When a broad read is empty, check index.status: never_published distinguishes an unbuilt index from no matches. Change preparation, validation, refresh, and research are explicit durable tasks. Research uses local repository evidence plus primary-first web_search by the attached agent; no external connectors are available. Findings are proposals and only a human may review or promote them into work. Quality proposal never activates a constraint: activation, merging, finding promotion, and work writes require explicit human confirmation. Source, compiler/runtime behavior, and human ownership remain authoritative."
+    version = "0.3.0",
+    instructions = "Crusty is a Rust repository observatory. For every repository-scoped user prompt, call repo.consult first with the user's complete intent before planning, answering, or acting; do not skip consultation for design, review, questions, documentation, configuration, or non-code work. Apply relevant human decisions, steering, design and quality constraints, restrictions, governing documents, and workflows returned by the consultation. Consultation is read-only and does not replace change preparation: use change.prepare before edits and change.validate afterwards, polling both with task.get; task.list and change.get recover interrupted workflows. Use repo.architecture for a bounded live architecture map and audit.start for a durable contextual audit. Change preparation captures an architecture baseline; validation reports advisory new, worsened, and resolved findings without blocking on inferred debt. Use repo.search exact for live call-site work and symbol.relations for callers, references, implementations, and definitions; neither refreshes. When a broad read is empty, check index.status: never_published distinguishes an unbuilt index from no matches. Change preparation, validation, refresh, audit, and research are explicit durable tasks. Research uses local repository evidence plus primary-first web_search by the attached agent; no external connectors are available. Findings are proposals and only a human may review or promote them into work. Quality proposal never activates a constraint: activation, merging, finding promotion, and work writes require explicit human confirmation. Source, compiler/runtime behavior, and human ownership remain authoritative."
 )]
 impl ServerHandler for CrustyServer {}
 
@@ -838,6 +905,10 @@ mod tests {
         assert_eq!(
             names,
             [
+                "audit.finding.propose",
+                "audit.get",
+                "audit.list",
+                "audit.start",
                 "change.get",
                 "change.prepare",
                 "change.validate",
@@ -865,6 +936,7 @@ mod tests {
                 "quality.merge",
                 "quality.propose",
                 "quality.review",
+                "repo.architecture",
                 "repo.authority",
                 "repo.cleanup_candidates",
                 "repo.constraints",
@@ -961,6 +1033,8 @@ mod tests {
         assert!(required("repo.consult").contains(&"topic".to_owned()));
         assert!(required("symbol.relations").contains(&"symbol".to_owned()));
         assert!(required("change.validate").contains(&"context_id".to_owned()));
+        assert!(required("audit.finding.propose").contains(&"report_id".to_owned()));
+        assert!(required("audit.finding.propose").contains(&"finding_id".to_owned()));
         assert!(required("work.update").contains(&"work_id".to_owned()));
 
         // Unknown fields must be refused rather than silently discarded.

@@ -911,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "rust-repo-intelligence"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",

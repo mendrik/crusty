@@ -24,6 +24,7 @@ Crusty is useful when an agent needs to work in a Rust repository without repeat
 | Live navigation | Exact worktree search plus symbol relationships without waiting for an index refresh. |
 | Snapshot-aware intelligence | Broad hybrid retrieval over lexical, local similarity, Cargo, Git, syntax, and optional rust-analyzer evidence, always labelled with freshness and provenance. |
 | Change workflow | Durable preparation and validation tasks with likely change surfaces, policies, risks, and verification obligations. |
+| Architecture guard | Versioned Cargo/syntax facts, contextual Rust architecture findings, persisted audits, and advisory before/after change deltas. |
 | Repository memory | Human-owned decisions, steering, work, findings, problem records, learned quality constraints, and recoverable task state in local SQLite stores. |
 | Guarded research | Budgeted research packets, evidence qualification, human review, and explicit promotion from findings to work. |
 | Safe local dashboard | A loopback-only finding inbox protected by one-time bootstrap, session, CSRF, and CSP controls. |
@@ -36,6 +37,8 @@ Crusty now separates three kinds of state that previously shared one synchronous
 ```text
 live Rust worktree ── exact search ───────────────► interactive answer
         │
+        ├─ contextual architecture scan ─► facts ─► qualified advisory findings
+        │                                      └─ baseline/change delta
         └─ explicit refresh task ─► derived index ─► broad context / change evidence
 
 attached agent ─ local scan + web_search ─► findings ─ human review ─► project work
@@ -119,7 +122,7 @@ Crusty uses the official Rust MCP SDK and negotiates the current protocol suppor
 
 ## Public MCP API
 
-The 0.2 API is a clean break from the old `repo.*` surface.
+The 0.3 API retains the clean break from the old `repo.*` surface.
 
 ### Navigation and change work
 
@@ -127,6 +130,7 @@ The 0.2 API is a clean break from the old `repo.*` surface.
 - `repo.search`: `mode=exact` searches live Rust source; `mode=broad` searches the published snapshot.
 - `repo.context`: builds a bounded hybrid context without implicit refresh.
 - `repo.matrix`: returns a bounded Cargo feature/profile verification plan with freshness metadata.
+- `repo.architecture`: builds a live, bounded architecture map from versioned manifest and syntax facts. Each finding carries evidence, counter-evidence, confidence, a recommendation, and limitations.
 - `symbol.relations`: resolves `callers`, `references`, `implementations`, or the `definition` of a symbol to `file:line` locations, labelled with the evidence channel that produced them.
 - `repo.history`: commit history and co-change neighbours for a symbol or path.
 - `repo.explain`: definitions, lifecycle, human decisions, related work, and bounded source slices for one target.
@@ -143,11 +147,14 @@ The server instructions tell attached agents to call `repo.consult` with the use
 
 - `index.status`, `index.refresh`
 - `task.list`, `task.get`, `task.cancel`
+- `audit.start`, `audit.list`, `audit.get`, `audit.finding.propose`
 - `checkpoint.create`, `checkpoint.list`, `checkpoint.diff`, `checkpoint.restore`
 
 `index.status` reports node/edge/embedding counts, rust-analyzer and embedding backend health, and a `never_published` flag, so an empty `repo.context` can be told apart from an unbuilt index. Checkpoints are Git refs under `refs/codex/checkpoints`; `checkpoint.restore` only ever creates a new branch and never moves `HEAD`, discards work, or rewrites history.
 
-`change.prepare`, `change.validate`, and `index.refresh` return immediately with task IDs. Tasks carry a real progress figure, settle as `completed`, `failed`, or `cancelled`, and are bounded by a 30-minute budget. On startup Crusty reconciles anything a previous process left mid-flight, so an unclean shutdown cannot leave a task reporting `running` forever. Settled tasks are pruned to a bounded tail, and an oversized result is replaced by a summary rather than stored whole. `task.list` recovers task IDs after an interrupted client session without returning unbounded task results; use `task.get` for the full result. The refresh worker acquires `.rust-repo-intelligence/index.lock`, refreshes in a blocking worker, and publishes atomically. Readers continue using the previous published generation.
+`change.prepare`, `change.validate`, `audit.start`, and `index.refresh` return immediately with task IDs. Tasks carry a real progress figure, settle as `completed`, `failed`, or `cancelled`, and are bounded by a 30-minute budget. On startup Crusty reconciles anything a previous process left mid-flight, so an unclean shutdown cannot leave a task reporting `running` forever. Settled tasks are pruned to a bounded tail, and an oversized result is replaced by a summary rather than stored whole. `task.list` recovers task IDs after an interrupted client session without returning unbounded task results; use `task.get` for the full result. The refresh worker acquires `.rust-repo-intelligence/index.lock`, refreshes in a blocking worker, and publishes atomically. Readers continue using the previous published generation.
+
+Architecture audits are snapshot/profile-labelled and retain the newest 20 reports. Syntax observations are facts rather than findings. Deterministic detectors add architectural context and counter-evidence for unsafe contracts, structured-concurrency gaps, blocking async work, discarded errors, implicit boolean state machines, opaque library errors, primitive domain identifiers, boundary representation leakage, configuration scatter, cross-boundary serialization, and unsafe dependency declarations. `change.prepare` stores the current finding baseline; `change.validate` reports only new, worsened, and resolved findings touching the diff. Inferred findings are always advisory. `audit.finding.propose` explicitly copies one result into the normal review inbox; it still requires human acceptance before promotion into work.
 
 ### Autonomous research and findings
 
@@ -201,12 +208,12 @@ The tool starts an Axum server on a random `127.0.0.1` port and returns a one-ti
 
 Crusty uses two SQLite files:
 
-- `.rust-repo-intelligence/index.sqlite3`: rebuildable source/Cargo/Git/document projections and prepared contexts, plus the retained problem/quality/validation engine;
+- `.rust-repo-intelligence/index.sqlite3`: rebuildable source/Cargo/Git/document projections, prepared contexts, and the newest 20 snapshot-scoped architecture audits, plus the retained problem/quality/validation engine;
 - `.rust-repo-intelligence/memory.sqlite3`: findings, evidence, research runs, tasks, work, and searchable summaries of retained decision/quality records.
 
-On first 0.2 startup, Crusty copies legacy work into the new work store and preserves decisions, steerings, problem records, and learned quality constraints as JSON legacy records. On later opens it refreshes those preserved read-only summaries so guidance added after the initial migration remains discoverable. The old database is never deleted. Both databases use WAL mode; durable memory writes use short connections and a busy timeout.
+On first 0.2-or-newer startup, Crusty copies legacy work into the current work store and preserves decisions, steerings, problem records, and learned quality constraints as JSON legacy records. On later opens it refreshes those preserved read-only summaries so guidance added after the initial migration remains discoverable. The old database is never deleted. Both databases use WAL mode; durable memory writes use short connections and a busy timeout.
 
-No manual SQL migration is required. Durable-memory import happens automatically when 0.2 first opens a repository. Because 0.2 never refreshes implicitly, each existing project needs one explicit `index.refresh`, followed through `task.get`, to publish the indexer-v8 backfill and `symbol-card-v1` vectors. Live `repo.search` with `mode=exact` works before that refresh; broad search and context continue to label the last published generation as stale until the task finishes.
+No manual SQL migration is required. Durable-memory import happens automatically when a compatible release first opens a repository. Because Crusty never refreshes implicitly, each existing project needs one explicit `index.refresh`, followed through `task.get`, to publish the indexer-v8 backfill and `symbol-card-v1` vectors. Live `repo.search` with `mode=exact` works before that refresh; broad search and context continue to label the last published generation as stale until the task finishes.
 
 The existing syntax/Cargo/Git/rust-analyzer engine remains the broad-intelligence implementation. Compiler-backed evidence is highest-confidence, while ambiguity-suppressed static evidence remains visible but never enters a likely change surface merely because a short name matched.
 

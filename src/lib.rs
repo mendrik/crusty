@@ -1,6 +1,7 @@
 //! Repository indexing and change-impact services used by the MCP binary.
 //! Semantic facts returned by a static scan are explicitly marked as such.
 
+pub mod analysis;
 pub mod dashboard;
 pub mod observatory;
 mod quality;
@@ -50,7 +51,7 @@ const MAX_CHECK_OUTPUT_BYTES: usize = 8_000;
 const MAX_CHECK_DIAGNOSTICS: usize = 40;
 /// Superseded index generations retained for publishing history.
 const MAX_RETAINED_GENERATIONS: i64 = 20;
-const SCHEMA_VERSION: &str = "7";
+const SCHEMA_VERSION: &str = "8";
 const INDEXER_VERSION: &str = "8";
 const RUST_ANALYZER_THREADS: u64 = 1;
 const RUST_ANALYZER_ENV: &str = "RUST_REPO_INTELLIGENCE_ENABLE_RUST_ANALYZER";
@@ -2184,6 +2185,94 @@ impl Service {
         )
     }
 
+    /// Build a bounded, live-worktree architecture map and advisory report.
+    ///
+    /// Unlike the published relationship index, these facts are collected
+    /// directly from current manifests and Rust syntax. The returned profile
+    /// and limitations make that evidence envelope explicit.
+    pub fn architecture(&self, scope: Option<&str>, max_findings: usize) -> Result<Value> {
+        Ok(serde_json::to_value(
+            self.analyze_architecture(scope, max_findings)?,
+        )?)
+    }
+
+    fn analyze_architecture(
+        &self,
+        scope: Option<&str>,
+        max_findings: usize,
+    ) -> Result<analysis::ArchitectureReport> {
+        let revision = self.revision();
+        let report = analysis::analyze(
+            &self.root,
+            serde_json::to_value(&revision)?,
+            scope,
+            max_findings,
+        )?;
+        ensure!(
+            revision == self.revision(),
+            "the live worktree changed during architecture analysis; retry so facts are not labelled with a mixed revision"
+        );
+        Ok(report)
+    }
+
+    /// Run and persist a snapshot-scoped architecture audit.
+    pub fn architecture_audit(&self, scope: Option<&str>, max_findings: usize) -> Result<Value> {
+        let report = self.analyze_architecture(scope, max_findings)?;
+        let payload = serde_json::to_string(&report)?;
+        self.db.execute(
+            "INSERT OR REPLACE INTO architecture_reports(id,revision,profile,scope,analyzer_version,payload,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                report.id,
+                report.revision.to_string(),
+                report.profile,
+                report.scope,
+                report.analyzer_version,
+                payload,
+                report.generated_at
+            ],
+        )?;
+        self.db.execute(
+            "DELETE FROM architecture_reports WHERE id NOT IN (SELECT id FROM architecture_reports ORDER BY created_at DESC LIMIT 20)",
+            [],
+        )?;
+        Ok(serde_json::to_value(report)?)
+    }
+
+    pub fn architecture_report(&self, id: &str) -> Result<Value> {
+        let payload: String = self
+            .db
+            .query_row(
+                "SELECT payload FROM architecture_reports WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .with_context(|| format!("unknown architecture audit `{id}`"))?;
+        Ok(serde_json::from_str(&payload)?)
+    }
+
+    pub fn architecture_reports(&self, limit: usize) -> Result<Value> {
+        let mut statement = self.db.prepare(
+            "SELECT payload FROM architecture_reports ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let reports = statement
+            .query_map([limit.clamp(1, 100) as i64], |row| row.get::<_, String>(0))?
+            .filter_map(Result::ok)
+            .filter_map(|payload| serde_json::from_str::<Value>(&payload).ok())
+            .map(|report| {
+                json!({
+                    "id":report.get("id"),
+                    "revision":report.get("revision"),
+                    "profile":report.get("profile"),
+                    "scope":report.get("scope"),
+                    "generated_at":report.get("generated_at"),
+                    "summary":report.get("summary")
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({"reports":reports,"count":reports.len()}))
+    }
+
     pub fn prepare_change(
         &self,
         intent: &str,
@@ -2237,6 +2326,16 @@ impl Service {
             &target_nodes,
             &references,
         )?;
+        let architecture_baseline = self.analyze_architecture(None, 1_000)?;
+        let architecture_guard = json!({
+            "baseline_id": architecture_baseline.id,
+            "analyzer_version": architecture_baseline.analyzer_version,
+            "profile": architecture_baseline.profile,
+            "summary": architecture_baseline.summary,
+            "baseline_findings": analysis::baseline(&architecture_baseline.findings),
+            "policy": "advisory_only",
+            "note": "Validation reports only new, worsened, and resolved findings. Existing inferred debt is never promoted or made blocking automatically."
+        });
         let token_budget = budget.unwrap_or(3_000).clamp(250, 10_000);
         let max = token_budget.saturating_mul(4);
         let mut slices = Vec::new();
@@ -2262,7 +2361,7 @@ impl Service {
             used += slice.source.len();
             slices.push(slice);
         }
-        let payload = json!({"context_id":context_id,"intent":intent,"revision":self.revision(),"snapshot":self.snapshot(),"automatic_problem_capture":automatic_problem_capture,"primary_symbols":target_nodes,"references":references,"reference_provenance":{"semantic":"RustAnalyzer (confidence 1.0), cached by semantic snapshot","fallback":"Syntax-derived, ambiguity-suppressed relationships (confidence labelled)"},"semantic_references":semantic_references,"uncertain_static_references":uncertain_static_references,"runtime_contracts":runtime_contracts,"tests":tests,"use_cases":use_cases,"decisions":decisions,"steerings":steerings,"lifecycle":lifecycle,"obsolete_candidates":obsolete.get("candidates"),"work_items":work.get("items"),"likely_change_surface":likely_surface,"source_slices":slices,"context_budget":{"tokens":token_budget,"estimated_tokens":used.div_ceil(4)},"generation":self.active_generation(),"semantic_snapshot":self.semantic_snapshot_resource(),"risk":risk(&target_nodes, &references),"validation_queue":validation_queue,"unresolved_edges":["Ambiguous static references are reported separately and excluded from likely_change_surface.","Runtime registration, generated code, inactive feature/target profiles, external consumers, and deployment state require profile-specific or runtime verification."],"verification_plan":["cargo check --all-targets","cargo test","Use repo.matrix for no-default, individual-feature, and all-feature checks.","Validate changed GTK UI/Blueprint files with the project GTK tooling.","Compare changed D-Bus XML with runtime introspection and external consumer expectations."],"semantic_note":"rust-analyzer facts are resolved on demand and persisted for the active semantic snapshot. Syntax relationships are AST-derived; unresolved ambiguous names are retained as uncertainty, not impact edges."});
+        let payload = json!({"context_id":context_id,"intent":intent,"revision":self.revision(),"snapshot":self.snapshot(),"automatic_problem_capture":automatic_problem_capture,"primary_symbols":target_nodes,"references":references,"reference_provenance":{"semantic":"RustAnalyzer (confidence 1.0), cached by semantic snapshot","fallback":"Syntax-derived, ambiguity-suppressed relationships (confidence labelled)"},"semantic_references":semantic_references,"uncertain_static_references":uncertain_static_references,"runtime_contracts":runtime_contracts,"tests":tests,"use_cases":use_cases,"decisions":decisions,"steerings":steerings,"lifecycle":lifecycle,"obsolete_candidates":obsolete.get("candidates"),"work_items":work.get("items"),"likely_change_surface":likely_surface,"source_slices":slices,"context_budget":{"tokens":token_budget,"estimated_tokens":used.div_ceil(4)},"generation":self.active_generation(),"semantic_snapshot":self.semantic_snapshot_resource(),"risk":risk(&target_nodes, &references),"validation_queue":validation_queue,"architecture_guard":architecture_guard,"unresolved_edges":["Ambiguous static references are reported separately and excluded from likely_change_surface.","Runtime registration, generated code, inactive feature/target profiles, external consumers, and deployment state require profile-specific or runtime verification."],"verification_plan":["cargo check --all-targets","cargo test","Use repo.matrix for no-default, individual-feature, and all-feature checks.","Validate changed GTK UI/Blueprint files with the project GTK tooling.","Compare changed D-Bus XML with runtime introspection and external consumer expectations."],"semantic_note":"rust-analyzer facts are resolved on demand and persisted for the active semantic snapshot. Syntax relationships are AST-derived; unresolved ambiguous names are retained as uncertainty, not impact edges."});
         self.db.execute("INSERT INTO change_contexts(id, intent, payload, revision, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![context_id, intent, payload.to_string(), self.revision().workspace_digest, Utc::now().to_rfc3339()])?;
         Ok(payload)
     }
@@ -2709,6 +2808,48 @@ impl Service {
             .or_else(|| command_text(&self.root, &["diff", "--"]))
             .unwrap_or_default();
         let changed_files = changed_files_in_diff(&diff);
+        let architecture_baseline_truncated = context
+            .pointer("/architecture_guard/summary/findings_truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let architecture_delta = if architecture_baseline_truncated {
+            json!({
+                "policy":"advisory_only",
+                "available":false,
+                "reason":"The prepared architecture baseline was truncated, so Crusty will not guess whether a finding is new. Narrow the audit scope for review."
+            })
+        } else if let Some(baseline) = context
+            .pointer("/architecture_guard/baseline_findings")
+            .and_then(Value::as_array)
+        {
+            let baseline = baseline
+                .iter()
+                .cloned()
+                .map(serde_json::from_value)
+                .collect::<serde_json::Result<Vec<analysis::ArchitectureFindingBaseline>>>(
+            )?;
+            let current = self.analyze_architecture(None, 1_000)?;
+            if current
+                .summary
+                .get("findings_truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+            {
+                json!({
+                    "policy":"advisory_only",
+                    "available":false,
+                    "reason":"The current architecture scan was truncated, so Crusty will not guess whether a finding is new. Narrow the audit scope for review."
+                })
+            } else {
+                analysis::delta(&baseline, &current.findings, &changed_files)
+            }
+        } else {
+            json!({
+                "policy":"advisory_only",
+                "available":false,
+                "reason":"This context predates architecture baselines; run change.prepare again to enable a before/after architecture delta."
+            })
+        };
         let mut validation_queue =
             self.activate_quality_constraints_for_diff(context_id, &diff, &changed_files)?;
         let expected: BTreeSet<String> = context
@@ -2770,7 +2911,7 @@ impl Service {
             .collect::<Vec<_>>();
         let blocking = self.blocking_obligation_status(context_id, run_checks)?;
         Ok(
-            json!({"context_id":context_id,"revision_before":context.get("revision"),"revision_after":self.revision(),"snapshot":self.snapshot(),"changed_files":changed_files,"expected_affected_files":expected,"unmodified_expected_callers":unmodified,"new_references":"Re-run change.prepare after signature changes to refresh static candidates.","architectural_violations":self.decision_conflicts(&diff)?,"legacy_paths_touched":legacy_left,"unresolved_edges":context.get("unresolved_edges"),"recommended_tests":context.get("tests"),"recommended_commands":["cargo fmt --check","cargo check --all-targets","cargo clippy --all-targets -- -D warnings","cargo test","gtk4-builder-tool validate <changed.ui>","blueprint-compiler compile <changed.blp>","xmllint --noout <changed.xml>"],"validation_queue":validation_queue,"checks":checks,"artifact_checks":artifact_checks,"learned_checks":learned_checks,"blocking":blocking,"uncertainty":"Artifact validators can detect local syntax/schema issues, but not runtime registration, generated-code drift, external-consumer compatibility, or deployment behavior."}),
+            json!({"context_id":context_id,"revision_before":context.get("revision"),"revision_after":self.revision(),"snapshot":self.snapshot(),"changed_files":changed_files,"expected_affected_files":expected,"unmodified_expected_callers":unmodified,"new_references":"Re-run change.prepare after signature changes to refresh static candidates.","architectural_violations":self.decision_conflicts(&diff)?,"architecture_delta":architecture_delta,"legacy_paths_touched":legacy_left,"unresolved_edges":context.get("unresolved_edges"),"recommended_tests":context.get("tests"),"recommended_commands":["cargo fmt --check","cargo check --all-targets","cargo clippy --all-targets -- -D warnings","cargo test","gtk4-builder-tool validate <changed.ui>","blueprint-compiler compile <changed.blp>","xmllint --noout <changed.xml>"],"validation_queue":validation_queue,"checks":checks,"artifact_checks":artifact_checks,"learned_checks":learned_checks,"blocking":blocking,"uncertainty":"Artifact validators and architecture detectors can identify current static evidence, but not runtime registration, generated-code drift, external-consumer compatibility, or deployment behavior."}),
         )
     }
 
@@ -3248,6 +3389,11 @@ impl Service {
             |row| row.get(0),
         )?;
         let quality_memory = self.quality_counts()?;
+        let architecture_reports: i64 =
+            self.db
+                .query_row("SELECT COUNT(*) FROM architecture_reports", [], |row| {
+                    row.get(0)
+                })?;
         // Files that could not be read are reported rather than silently
         // indexed as empty, so a permissions or encoding problem is visible.
         let unreadable: Vec<String> = self
@@ -3270,7 +3416,7 @@ impl Service {
             )));
         }
         Ok(
-            json!({"snapshot":self.snapshot(),"current_revision":current_revision,"stale":stale,"index":self.index_status(),"counts":{"nodes":nodes,"edges":edges,"semantic_edges":semantic_edges,"unresolved_static_references":unresolved_static_references,"runtime_contract_artifacts":runtime_contracts,"embeddings":embeddings,"lifecycle_evidence":lifecycle,"work_items":work,"actionable_work_items":actionable_work,"package_targets":package_targets,"package_features":package_features},"quality_memory":quality_memory,"unreadable_inputs":unreadable,"degraded_areas":degraded,"cache":"rebuildable SQLite cache with atomic published generations; no repository files are changed by indexing."}),
+            json!({"snapshot":self.snapshot(),"current_revision":current_revision,"stale":stale,"index":self.index_status(),"counts":{"nodes":nodes,"edges":edges,"semantic_edges":semantic_edges,"unresolved_static_references":unresolved_static_references,"runtime_contract_artifacts":runtime_contracts,"embeddings":embeddings,"lifecycle_evidence":lifecycle,"work_items":work,"actionable_work_items":actionable_work,"package_targets":package_targets,"package_features":package_features,"architecture_reports":architecture_reports},"quality_memory":quality_memory,"unreadable_inputs":unreadable,"degraded_areas":degraded,"cache":"rebuildable SQLite cache with atomic published generations; architecture audits retain the newest 20 snapshot-scoped reports."}),
         )
     }
 
@@ -3915,6 +4061,8 @@ CREATE INDEX IF NOT EXISTS lifecycle_canonical ON lifecycle_edges(canonical_node
 CREATE TABLE IF NOT EXISTS work_items(id TEXT PRIMARY KEY,title TEXT NOT NULL,status TEXT NOT NULL,priority TEXT NOT NULL,kind TEXT NOT NULL,scope_json TEXT NOT NULL,evidence_json TEXT NOT NULL,depends_json TEXT NOT NULL,blocked_json TEXT NOT NULL,acceptance_json TEXT NOT NULL,verification_json TEXT NOT NULL,discovered_from TEXT NOT NULL,provenance TEXT NOT NULL,confidence REAL NOT NULL,last_validated_snapshot TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS work_status_priority ON work_items(status,priority);
 CREATE TABLE IF NOT EXISTS change_contexts(id TEXT PRIMARY KEY,intent TEXT,payload TEXT,revision TEXT,created_at TEXT);
+CREATE TABLE IF NOT EXISTS architecture_reports(id TEXT PRIMARY KEY,revision TEXT NOT NULL,profile TEXT NOT NULL,scope TEXT,analyzer_version TEXT NOT NULL,payload TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS architecture_reports_created ON architecture_reports(created_at);
 CREATE TABLE IF NOT EXISTS input_state(path TEXT PRIMARY KEY,kind TEXT NOT NULL,content_hash TEXT NOT NULL,revision TEXT NOT NULL);
 ";
 
@@ -3944,7 +4092,7 @@ fn initialize_schema(db: &Connection) -> Result<()> {
             "index schema version {stored} was written by a newer Crusty than this build (schema {SCHEMA_VERSION}); \
              upgrade Crusty or point --workspace at a different repository. No data was modified."
         );
-        if stored != SCHEMA_VERSION && !matches!(stored, "6" | "5" | "4") {
+        if stored != SCHEMA_VERSION && !matches!(stored, "7" | "6" | "5" | "4") {
             // Derived data is rebuildable, so an incompatible older generation is
             // discarded and reindexed. Human-authored tables are deliberately
             // absent from this batch: decisions, steerings, work_items, the
@@ -3952,7 +4100,7 @@ fn initialize_schema(db: &Connection) -> Result<()> {
             db.execute_batch("PRAGMA foreign_keys=OFF;
                 DROP TABLE IF EXISTS search_index;
                 DROP TABLE IF EXISTS symbol_embeddings; DROP TABLE IF EXISTS semantic_queries; DROP TABLE IF EXISTS index_generations; DROP TABLE IF EXISTS semantic_snapshots;
-                DROP TABLE IF EXISTS input_state; DROP TABLE IF EXISTS change_contexts;
+                DROP TABLE IF EXISTS input_state; DROP TABLE IF EXISTS change_contexts; DROP TABLE IF EXISTS architecture_reports;
                 DROP TABLE IF EXISTS co_changes; DROP TABLE IF EXISTS commit_files; DROP TABLE IF EXISTS commits;
                 DROP TABLE IF EXISTS use_case_nodes; DROP TABLE IF EXISTS use_cases; DROP TABLE IF EXISTS documents;
                 DROP TABLE IF EXISTS lifecycle_edges;
@@ -5364,6 +5512,37 @@ mod tests {
     }
 
     #[test]
+    fn change_validation_reports_new_architecture_debt_without_blocking() {
+        let d = fixture();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        let prepared = service
+            .prepare_change("extend job state", &["src/lib.rs".into()], 1, None)
+            .unwrap();
+        assert_eq!(prepared["architecture_guard"]["policy"], "advisory_only");
+        fs::write(
+            d.path().join("src/lib.rs"),
+            "pub trait Store { fn load(&self); }\n\
+             fn uses(s: &dyn Store) { s.load(); }\n\
+             pub struct Job { active: bool, running: bool, failed: bool }\n",
+        )
+        .unwrap();
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -2,0 +3 @@\n+pub struct Job { active: bool, running: bool, failed: bool }\n";
+        let validated = service
+            .validate_change(prepared["context_id"].as_str().unwrap(), Some(diff), false)
+            .unwrap();
+        assert_eq!(validated["architecture_delta"]["attention_required"], true);
+        assert!(
+            validated["architecture_delta"]["new"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| finding["rule_id"] == "boolean-state-cluster")
+        );
+        assert_eq!(validated["blocking"]["blocked"], false);
+    }
+
+    #[test]
     fn decisions_and_change_contexts_are_persistent_resources() {
         let d = fixture();
         let mut service = Service::open(d.path()).unwrap();
@@ -5484,6 +5663,7 @@ mod tests {
             "use_cases",
             "use_case_nodes",
             "change_contexts",
+            "architecture_reports",
         ] {
             assert!(tables.contains(table), "missing table: {table}");
         }
