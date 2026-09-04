@@ -4,8 +4,8 @@ This is a correctness-oriented evaluation, not a claim of universal repository u
 
 | Measurement | Baseline | Current slice |
 | --- | ---: | ---: |
-| Unit regression tests | 4 | 107 |
-| Public MCP tools | 7 | 61 clean-break tools |
+| Unit regression tests | 4 | 116 |
+| Public MCP tools | 7 | 62 clean-break tools |
 | Persistent lifecycle evidence | no | yes |
 | Persistent editable work items | no | yes |
 | Referenced-but-superseded regression | no | yes |

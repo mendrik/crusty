@@ -44,6 +44,16 @@ GTK `.ui`, Blueprint, CSS, XML/D-Bus, desktop/service, Cargo, and common configu
 
 The minimal public quality loop exposes `problem.list/get/update`, `quality.list/get/review`, and `validation.queue/record`. Problem evidence can be completed or corrected, but activating a learned constraint requires an identified human reviewer and explicit confirmation. Constraint review history and validation outcomes are durable and inspectable. Historical constraints never create human work or expand implementation scope by themselves.
 
+## Decisions and steering
+
+Decisions and steerings live in `index.sqlite3` beside the derived tables but are never rebuilt; they are human records, and Crusty does not infer, merge, or expire them on its own. A decision is `accepted`, `superseded`, or `retired`, and unknown status values are rejected at write time because an unrecognised status used to make a decision permanently invisible to consultation with no diagnostic.
+
+Only accepted decisions govern. `repo.consult`, `repo.constraints`, `repo.context`, `repo.explain`, `repo.authority`, and `change.prepare` all read the accepted set; superseded and retired decisions stay in the ledger as history. `decision.record` may list one or more accepted decisions in `supersedes`: each becomes `superseded`, the new record keeps the forward links, and `recorded_by` is required because another human's record changes. `decision.retire` moves an accepted decision to `retired` without a replacement and requires `retired_by`. Both transitions are terminal, reject unknown or already-closed targets, append a row to the decision's `history` with the action, actor, note, and time, and rewrite the `Status:` line of any markdown the decision materialized under `docs/decisions/`. Every decision exposes `supersedes`, `superseded_by`, and `history`, and `decision.list` enumerates the whole ledger newest first when no scope is given, applies its `limit`, and accepts a `status` filter.
+
+`repo.consult` fills its sections in authority order until the token budget is spent. Its `context_budget` now reports `truncated` and per-section `omitted` counts so a starved section is visible; raise `budget` or call `repo.constraints` for the unbudgeted set. Steering keeps its lazy `expires_at` check, but the timestamp and the `active`/`retired` status are validated on write so a typo can no longer make a steering permanent.
+
+Databases written before multi-target supersession stored one bare decision ID in `supersedes`; Crusty rewrites those rows into the list form on open, and the legacy memory mirror carries the same list.
+
 ## Research, findings, and work
 
 `research.start` performs a bounded local scan and prepares primary-first web-search queries for the attached agent. `research.list` recovers run and task IDs, while `research.get` returns the run, task, budget consumption, packet, and resulting findings. Crusty itself has no GitHub, CI, analytics, telemetry, or arbitrary external connector. The attached agent performs `web_search` and submits qualified local, primary-web, or secondary-web evidence through `research.submit`.

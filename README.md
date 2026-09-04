@@ -179,10 +179,12 @@ All exact and recommendation queries use the same durable store. `work.update` c
 
 ### Governance a change can cite
 
-- `decision.record`, `decision.list`
+- `decision.record`, `decision.list`, `decision.retire`
 - `steering.record`, `steering.list`
 
 Prepared changes and validation already cited human decisions and steerings; these tools let an agent contribute them rather than only read governance it can never write to.
+
+Decisions have a small, human-driven lifecycle rather than an automatic sweep. A decision is `accepted`, `superseded`, or `retired`; only accepted decisions reach `repo.consult`, `repo.constraints`, `repo.context`, `repo.explain`, `repo.authority`, and prepared changes. `decision.record` may name one or several accepted decisions in `supersedes`, which consolidates them into the new record, marks each one `superseded`, and requires `recorded_by`. `decision.retire` closes an accepted decision without a replacement and requires `retired_by`. Both transitions are terminal, append a review-history row with the actor and note, and rewrite the status line of any markdown the decision materialized under `docs/decisions/`. Nothing is deleted: `decision.list` without a scope enumerates the whole ledger newest first, honours `limit`, and takes an optional `status` filter, and every decision carries `supersedes`, `superseded_by`, and `history`. Crusty never infers that one decision overturns another; a human records the replacement. Steering status and `expires_at` are validated on write for the same reason: an unrecognised value used to make a record silently invisible or permanent.
 
 ### Quality lifecycle
 

@@ -2026,7 +2026,7 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
     pattern.ends_with('*') || rest.is_empty()
 }
 
-fn validate_choice(label: &str, value: &str, allowed: &[&str]) -> Result<()> {
+pub(crate) fn validate_choice(label: &str, value: &str, allowed: &[&str]) -> Result<()> {
     if !allowed.contains(&value) {
         bail!(
             "unsupported {label} `{value}`; expected one of {}",

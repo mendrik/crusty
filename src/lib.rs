@@ -51,6 +51,9 @@ const MAX_CHECK_OUTPUT_BYTES: usize = 8_000;
 const MAX_CHECK_DIAGNOSTICS: usize = 40;
 /// Superseded index generations retained for publishing history.
 const MAX_RETAINED_GENERATIONS: i64 = 20;
+/// Upper bound on full-text decision hits examined before status filtering;
+/// matches the largest list limit a caller can request.
+const MAX_DECISION_HITS: usize = 200;
 const SCHEMA_VERSION: &str = "8";
 const INDEXER_VERSION: &str = "8";
 const RUST_ANALYZER_THREADS: u64 = 1;
@@ -211,10 +214,20 @@ type LifecycleRecord = (
     Option<String>,
 );
 
+/// Lifecycle states of a human architectural decision.
+///
+/// Only `accepted` decisions govern consultation, prepared changes, and
+/// validation. `superseded` and `retired` are terminal: the record stays in the
+/// ledger with its review trail, and only a new decision can take its place.
+pub const DECISION_STATUSES: &[&str] = &["accepted", "superseded", "retired"];
+/// Lifecycle states of a human steering instruction.
+pub const STEERING_STATUSES: &[&str] = &["active", "retired"];
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecordDecision {
     pub title: String,
+    /// `accepted`, `superseded`, or `retired`.
     #[serde(default = "accepted")]
     pub status: String,
     #[serde(default)]
@@ -223,9 +236,44 @@ pub struct RecordDecision {
     pub applies_to: Vec<String>,
     #[serde(default)]
     pub consequences: Vec<String>,
-    pub supersedes: Option<String>,
+    /// Accepted decision IDs this decision replaces; each becomes `superseded`.
+    /// A single ID is accepted as well as a list.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub supersedes: Vec<String>,
+    /// Who records the decision. Required when `supersedes` is non-empty,
+    /// because replacing a decision changes another human's record.
+    #[serde(default)]
+    pub recorded_by: String,
     #[serde(default)]
     pub materialize: bool,
+}
+
+/// Retires one accepted decision without replacing it.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RetireDecision {
+    pub id: String,
+    pub retired_by: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// Accepts `null`, one string, or a list of strings, so callers written against
+/// the earlier single-ID `supersedes` field keep working.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match Option::<OneOrMany>::deserialize(deserializer)? {
+        None => Vec::new(),
+        Some(OneOrMany::One(one)) => vec![one],
+        Some(OneOrMany::Many(many)) => many,
+    })
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2690,13 +2738,26 @@ impl Service {
     }
 
     pub fn record_decision(&self, input: RecordDecision) -> Result<Value> {
-        if let Some(superseded) = input.supersedes.as_deref() {
-            let exists: bool = self.db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM decisions WHERE id=?1)",
-                [superseded],
-                |row| row.get(0),
-            )?;
-            ensure!(exists, "cannot supersede unknown decision `{superseded}`");
+        quality::validate_choice("decision status", &input.status, DECISION_STATUSES)?;
+        let mut supersedes: Vec<String> = Vec::new();
+        for id in input.supersedes.iter().map(|id| id.trim()) {
+            if !id.is_empty() && !supersedes.iter().any(|seen| seen == id) {
+                supersedes.push(id.to_owned());
+            }
+        }
+        if !supersedes.is_empty() {
+            ensure!(
+                input.status == "accepted",
+                "only an accepted decision can supersede others; status was `{}`",
+                input.status
+            );
+            ensure!(
+                !input.recorded_by.trim().is_empty(),
+                "recorded_by is required when superseding decisions"
+            );
+            for superseded in &supersedes {
+                self.ensure_decision_accepted(superseded, "supersede")?;
+            }
         }
         let next: i64 = self.db.query_row(
             "SELECT COALESCE(MAX(sequence), 0) + 1 FROM decisions",
@@ -2704,11 +2765,16 @@ impl Service {
             |r| r.get(0),
         )?;
         let id = format!("DEC-{:04}", next);
-        self.db.execute("INSERT INTO decisions(id, sequence, status, title, rationale, applies_to, consequences, supersedes, revision, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)", params![id, next, input.status, input.title, input.reason, serde_json::to_string(&input.applies_to)?, serde_json::to_string(&input.consequences)?, input.supersedes, self.revision().workspace_digest, Utc::now().to_rfc3339()])?;
-        if let Some(superseded) = input.supersedes.as_deref() {
-            self.db.execute(
-                "UPDATE decisions SET status='superseded' WHERE id=?1",
-                [superseded],
+        let now = Utc::now().to_rfc3339();
+        self.db.execute("INSERT INTO decisions(id, sequence, status, title, rationale, applies_to, consequences, supersedes, revision, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)", params![id, next, input.status, input.title, input.reason, serde_json::to_string(&input.applies_to)?, serde_json::to_string(&input.consequences)?, serde_json::to_string(&supersedes)?, self.revision().workspace_digest, now])?;
+        for superseded in &supersedes {
+            self.close_decision(
+                superseded,
+                "superseded",
+                input.recorded_by.trim(),
+                &format!("superseded by {id}"),
+                &format!("superseded by {id}"),
+                &now,
             )?;
         }
         for target in &input.applies_to {
@@ -2730,18 +2796,143 @@ impl Service {
             let dir = self.root.join("docs/decisions");
             fs::create_dir_all(&dir)?;
             let path = dir.join(format!("{:04}-{}.md", next, slug(&input.title)));
-            fs::write(&path, decision_markdown(&id, &input))?;
+            fs::write(&path, decision_markdown(&id, &input, &supersedes))?;
             Some(relative(&self.root, &path))
         } else {
             None
         };
         self.rebuild_search_index()?;
         Ok(
-            json!({"id":id,"status":input.status,"resource_uri":format!("rustrepo://decision/{id}"),"materialized_path":path,"revision":self.revision()}),
+            json!({"id":id,"status":input.status,"supersedes":supersedes,"resource_uri":format!("rustrepo://decision/{id}"),"materialized_path":path,"revision":self.revision()}),
         )
     }
 
+    /// Retires an accepted decision without replacing it. The record stays in
+    /// the ledger as history; only a new decision can take its place.
+    pub fn retire_decision(&self, input: RetireDecision) -> Result<Value> {
+        let id = input.id.trim();
+        ensure!(!id.is_empty(), "id is required");
+        let retired_by = input.retired_by.trim();
+        ensure!(!retired_by.is_empty(), "retired_by is required");
+        self.ensure_decision_accepted(id, "retire")?;
+        let note = input.note.trim();
+        let status_line = if note.is_empty() {
+            "retired".to_owned()
+        } else {
+            format!("retired: {note}")
+        };
+        let path = self.close_decision(
+            id,
+            "retired",
+            retired_by,
+            note,
+            &status_line,
+            &Utc::now().to_rfc3339(),
+        )?;
+        let mut decision = self.decision_resource(id)?;
+        decision["materialized_path"] = json!(path);
+        Ok(decision)
+    }
+
+    /// Fails unless `id` names an accepted decision. Superseded and retired
+    /// decisions are terminal history and cannot be closed a second time.
+    fn ensure_decision_accepted(&self, id: &str, action: &str) -> Result<()> {
+        let status: Option<String> = self
+            .db
+            .query_row("SELECT status FROM decisions WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        match status.as_deref() {
+            None => bail!("cannot {action} unknown decision `{id}`"),
+            Some("accepted") => Ok(()),
+            Some(status) => bail!(
+                "cannot {action} decision `{id}` with status `{status}`; only accepted decisions can be {action}d"
+            ),
+        }
+    }
+
+    /// Moves an accepted decision to a terminal status, appends its review
+    /// history row, and rewrites the status line of its materialized markdown
+    /// when one exists. Returns the updated markdown path.
+    fn close_decision(
+        &self,
+        id: &str,
+        status: &str,
+        actor: &str,
+        note: &str,
+        status_line: &str,
+        now: &str,
+    ) -> Result<Option<String>> {
+        self.db.execute(
+            "UPDATE decisions SET status=?1 WHERE id=?2",
+            params![status, id],
+        )?;
+        self.db.execute(
+            "INSERT INTO decision_reviews(decision_id,action,actor,note,created_at) VALUES (?1,?2,?3,?4,?5)",
+            params![id, status, actor, note, now],
+        )?;
+        let sequence: i64 =
+            self.db
+                .query_row("SELECT sequence FROM decisions WHERE id=?1", [id], |row| {
+                    row.get(0)
+                })?;
+        self.update_materialized_decision(sequence, status_line)
+    }
+
+    /// Rewrites the `Status:` line of a decision materialized under
+    /// `docs/decisions`. The file name starts with the decision sequence, so the
+    /// path never needs to be stored; a decision that was never materialized
+    /// yields `None`.
+    fn update_materialized_decision(
+        &self,
+        sequence: i64,
+        status_line: &str,
+    ) -> Result<Option<String>> {
+        let prefix = format!("{sequence:04}-");
+        let Ok(entries) = fs::read_dir(self.root.join("docs/decisions")) else {
+            return Ok(None);
+        };
+        let Some(path) = entries
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".md"))
+            })
+        else {
+            return Ok(None);
+        };
+        let text = fs::read_to_string(&path)?;
+        let mut replaced = false;
+        let lines = text
+            .lines()
+            .map(|line| {
+                if !replaced && line.starts_with("Status: ") {
+                    replaced = true;
+                    format!("Status: {status_line}")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>();
+        if !replaced {
+            return Ok(None);
+        }
+        fs::write(&path, format!("{}\n", lines.join("\n")))?;
+        Ok(Some(relative(&self.root, &path)))
+    }
+
     pub fn record_steering(&self, input: RecordSteering) -> Result<Value> {
+        quality::validate_choice("steering status", &input.status, STEERING_STATUSES)?;
+        if let Some(expires_at) = input.expires_at.as_deref() {
+            // An unparsable expiry used to be stored and then read as "never
+            // expires", so a typo silently made a steering permanent.
+            chrono::DateTime::parse_from_rfc3339(expires_at).with_context(|| {
+                format!("expires_at `{expires_at}` is not an RFC 3339 timestamp")
+            })?;
+        }
         let next: i64 = self.db.query_row(
             "SELECT COALESCE(MAX(sequence),0)+1 FROM steerings",
             [],
@@ -3051,16 +3242,18 @@ impl Service {
         let token_budget = budget.clamp(250, 20_000);
         let max_bytes = token_budget.saturating_mul(4);
         let mut used = 0usize;
-        let decisions = budget_values(self.governing_decisions(topic, 20)?, &mut used, max_bytes);
-        let steerings = budget_values(self.governing_steerings(topic, 20)?, &mut used, max_bytes);
-        let learned_quality_constraints = budget_values(
+        let (decisions, omitted_decisions) =
+            budget_section(self.governing_decisions(topic, 20)?, &mut used, max_bytes);
+        let (steerings, omitted_steerings) =
+            budget_section(self.governing_steerings(topic, 20)?, &mut used, max_bytes);
+        let (learned_quality_constraints, omitted_constraints) = budget_section(
             self.relevant_quality_constraints(topic)?,
             &mut used,
             max_bytes,
         );
-        let governing_documents =
-            budget_values(self.governing_documents(topic, 12)?, &mut used, max_bytes);
-        let known_work = budget_values(
+        let (governing_documents, omitted_documents) =
+            budget_section(self.governing_documents(topic, 12)?, &mut used, max_bytes);
+        let (known_work, omitted_work) = budget_section(
             self.work_list(Some(topic), 12)?["items"]
                 .as_array()
                 .cloned()
@@ -3068,7 +3261,7 @@ impl Service {
             &mut used,
             max_bytes,
         );
-        let lifecycle_risks = budget_values(
+        let (lifecycle_risks, omitted_risks) = budget_section(
             self.obsolete_candidates(Some(topic), 12)?["candidates"]
                 .as_array()
                 .cloned()
@@ -3076,11 +3269,28 @@ impl Service {
             &mut used,
             max_bytes,
         );
-        let runtime_contracts = budget_values(
+        let (runtime_contracts, omitted_contracts) = budget_section(
             self.search_contract_artifacts(topic, 8)?,
             &mut used,
             max_bytes,
         );
+        let omitted = json!({
+            "decisions": omitted_decisions,
+            "steerings": omitted_steerings,
+            "learned_quality_constraints": omitted_constraints,
+            "governing_documents": omitted_documents,
+            "known_work": omitted_work,
+            "lifecycle_risks": omitted_risks,
+            "runtime_contracts": omitted_contracts,
+        });
+        let truncated = omitted_decisions
+            + omitted_steerings
+            + omitted_constraints
+            + omitted_documents
+            + omitted_work
+            + omitted_risks
+            + omitted_contracts
+            > 0;
         let mut relevant_sections = Vec::new();
         for (name, values) in [
             ("decisions", &decisions),
@@ -3114,16 +3324,18 @@ impl Service {
                 "Use repo.context when the consultation identifies a concept that needs deeper repository evidence."
             ],
             "authority": "Human decisions and steering govern. Indexed documents and relationships are freshness-labelled guidance; current source and runtime/compiler behavior remain authoritative.",
-            "context_budget": {"tokens": token_budget, "estimated_tokens": used.div_ceil(4)},
+            "context_budget": {
+                "tokens": token_budget,
+                "estimated_tokens": used.div_ceil(4),
+                "truncated": truncated,
+                "omitted": omitted,
+                "note": "Sections are filled in authority order until the budget is spent. Omitted counts name matching guidance that did not fit; raise budget or call repo.constraints to read the unbudgeted set.",
+            },
         }))
     }
 
     fn governing_decisions(&self, topic: &str, limit: usize) -> Result<Vec<Value>> {
-        let mut decisions = self
-            .decisions_for(topic)?
-            .into_iter()
-            .filter(|decision| decision["status"] == "accepted")
-            .collect::<Vec<_>>();
+        let mut decisions = self.decisions_for(topic)?;
         let global_ids = self
             .db
             .prepare("SELECT id FROM decisions WHERE status='accepted' AND json_array_length(applies_to)=0 ORDER BY sequence DESC LIMIT ?1")?
@@ -3958,15 +4170,71 @@ impl Service {
             source,
         })
     }
+    /// Accepted decisions relevant to `text`. Superseded and retired decisions
+    /// are history, so every consumer that cites governing guidance uses this.
     fn decisions_for(&self, text: &str) -> Result<Vec<Value>> {
-        let hits = self.search_hits(&terms(text), Some("decision"), 20)?;
-        hits.into_iter()
-            .filter_map(|hit| hit["entity_id"].as_str().map(str::to_owned))
-            .map(|id| self.decision_resource(&id))
-            .collect()
+        self.decision_list(text, Some("accepted"), 20)
     }
+
+    /// Decisions relevant to `text`, or the newest decisions in the ledger when
+    /// `text` is blank, optionally narrowed to one status.
+    ///
+    /// A blank query used to fall through to the full-text search, which
+    /// short-circuits on empty terms, so the ledger could not be enumerated.
+    pub fn decision_list(
+        &self,
+        text: &str,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Value>> {
+        let ids: Vec<String> = if text.trim().is_empty() {
+            self.db
+                .prepare("SELECT id FROM decisions WHERE (?1 IS NULL OR status=?1) ORDER BY sequence DESC LIMIT ?2")?
+                .query_map(params![status, limit as i64], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        } else {
+            // Status is not part of the search index, so over-fetch and filter
+            // below; the ledger is small enough that this stays cheap.
+            self.search_hits(&terms(text), Some("decision"), MAX_DECISION_HITS)?
+                .into_iter()
+                .filter_map(|hit| hit["entity_id"].as_str().map(str::to_owned))
+                .collect()
+        };
+        let mut decisions = Vec::new();
+        for id in ids {
+            if decisions.len() >= limit {
+                break;
+            }
+            let decision = self.decision_resource(&id)?;
+            if status.is_none_or(|status| decision["status"] == status) {
+                decisions.push(decision);
+            }
+        }
+        Ok(decisions)
+    }
+
     fn decision_resource(&self, id: &str) -> Result<Value> {
-        Ok(self.db.query_row("SELECT id,status,title,rationale,applies_to,consequences,supersedes,revision,created_at FROM decisions WHERE id=?1",[id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"title":r.get::<_,String>(2)?,"rationale":r.get::<_,String>(3)?,"applies_to":serde_json::from_str::<Value>(&r.get::<_,String>(4)?).unwrap_or(Value::Null),"consequences":serde_json::from_str::<Value>(&r.get::<_,String>(5)?).unwrap_or(Value::Null),"supersedes":r.get::<_,Option<String>>(6)?,"revision":r.get::<_,String>(7)?,"created_at":r.get::<_,String>(8)?})))?)
+        let mut decision = self.db.query_row("SELECT id,status,title,rationale,applies_to,consequences,supersedes,revision,created_at FROM decisions WHERE id=?1",[id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"title":r.get::<_,String>(2)?,"rationale":r.get::<_,String>(3)?,"applies_to":serde_json::from_str::<Value>(&r.get::<_,String>(4)?).unwrap_or(Value::Null),"consequences":serde_json::from_str::<Value>(&r.get::<_,String>(5)?).unwrap_or(Value::Null),"supersedes":supersedes_list(r.get::<_,Option<String>>(6)?),"revision":r.get::<_,String>(7)?,"created_at":r.get::<_,String>(8)?})))?;
+        let superseded_by = self
+            .db
+            .prepare("SELECT d.id FROM decisions d, json_each(d.supersedes) j WHERE d.supersedes IS NOT NULL AND j.value=?1 ORDER BY d.sequence")?
+            .query_map([id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let history = self
+            .db
+            .prepare("SELECT action,actor,note,created_at FROM decision_reviews WHERE decision_id=?1 ORDER BY id")?
+            .query_map([id], |row| {
+                Ok(json!({
+                    "action": row.get::<_, String>(0)?,
+                    "actor": row.get::<_, String>(1)?,
+                    "note": row.get::<_, String>(2)?,
+                    "created_at": row.get::<_, String>(3)?,
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        decision["superseded_by"] = json!(superseded_by);
+        decision["history"] = json!(history);
+        Ok(decision)
     }
     fn decision_conflicts(&self, diff: &str) -> Result<Vec<Value>> {
         let mut s = self.db.prepare(
@@ -4045,6 +4313,8 @@ CREATE TABLE IF NOT EXISTS symbol_embeddings(node_id INTEGER PRIMARY KEY REFEREN
 CREATE INDEX IF NOT EXISTS symbol_embeddings_snapshot ON symbol_embeddings(model,semantic_snapshot);
 CREATE TABLE IF NOT EXISTS decisions(id TEXT PRIMARY KEY,sequence INTEGER,status TEXT,title TEXT,rationale TEXT,applies_to TEXT,consequences TEXT,supersedes TEXT,revision TEXT,created_at TEXT);
 CREATE TABLE IF NOT EXISTS decision_targets(decision_id TEXT NOT NULL REFERENCES decisions(id) ON DELETE CASCADE,node_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL,target_ref TEXT NOT NULL,PRIMARY KEY(decision_id,target_ref));
+CREATE TABLE IF NOT EXISTS decision_reviews(id INTEGER PRIMARY KEY,decision_id TEXT NOT NULL REFERENCES decisions(id) ON DELETE CASCADE,action TEXT NOT NULL,actor TEXT NOT NULL,note TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS decision_review_history ON decision_reviews(decision_id,created_at);
 CREATE TABLE IF NOT EXISTS steerings(id TEXT PRIMARY KEY,sequence INTEGER NOT NULL,status TEXT NOT NULL,priority TEXT NOT NULL,title TEXT NOT NULL,instruction TEXT NOT NULL,scope TEXT NOT NULL,expires_at TEXT,revision TEXT NOT NULL,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS documents(id INTEGER PRIMARY KEY,kind TEXT,path TEXT,text TEXT,revision TEXT);
 CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(entity_type UNINDEXED,entity_id UNINDEXED,title,path,body,tokenize='unicode61 remove_diacritics 2 tokenchars ''_''');
@@ -4095,8 +4365,9 @@ fn initialize_schema(db: &Connection) -> Result<()> {
         if stored != SCHEMA_VERSION && !matches!(stored, "7" | "6" | "5" | "4") {
             // Derived data is rebuildable, so an incompatible older generation is
             // discarded and reindexed. Human-authored tables are deliberately
-            // absent from this batch: decisions, steerings, work_items, the
-            // problem records, and the quality/validation lifecycle survive.
+            // absent from this batch: decisions and their review history,
+            // steerings, work_items, the problem records, and the
+            // quality/validation lifecycle survive.
             db.execute_batch("PRAGMA foreign_keys=OFF;
                 DROP TABLE IF EXISTS search_index;
                 DROP TABLE IF EXISTS symbol_embeddings; DROP TABLE IF EXISTS semantic_queries; DROP TABLE IF EXISTS index_generations; DROP TABLE IF EXISTS semantic_snapshots;
@@ -4126,11 +4397,31 @@ fn initialize_schema(db: &Connection) -> Result<()> {
         )?;
     }
     db.execute_batch(SCHEMA)?;
+    normalize_supersedes(db)?;
     quality::initialize(db)?;
     db.execute(
         "INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?1)",
         [SCHEMA_VERSION],
     )?;
+    Ok(())
+}
+
+/// Rewrites `decisions.supersedes` values written before multi-target
+/// supersession, when the column held one bare decision ID, into the JSON array
+/// form so `json_each` can compute `superseded_by` without tripping on them.
+fn normalize_supersedes(db: &Connection) -> Result<()> {
+    let rows: Vec<(String, String)> = db
+        .prepare("SELECT id,supersedes FROM decisions WHERE supersedes IS NOT NULL")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, stored) in rows {
+        if serde_json::from_str::<Vec<String>>(&stored).is_err() {
+            db.execute(
+                "UPDATE decisions SET supersedes=?1 WHERE id=?2",
+                params![serde_json::to_string(&[stored.trim()])?, id],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -5190,6 +5481,31 @@ fn add_rrf_hit(
     hit.channels.insert(channel.to_owned());
 }
 
+/// Keeps the prefix of `values` that fits the remaining byte budget and reports
+/// how many were dropped, so a consultation can say what it left out instead
+/// of truncating silently.
+fn budget_section(values: Vec<Value>, used: &mut usize, max_bytes: usize) -> (Vec<Value>, usize) {
+    let total = values.len();
+    let kept = budget_values(values, used, max_bytes);
+    let omitted = total - kept.len();
+    (kept, omitted)
+}
+
+/// Reads the `supersedes` column, a JSON array of decision IDs. Databases
+/// written before multi-target supersession stored one bare ID;
+/// `initialize_schema` rewrites those, and this tolerates one that slipped
+/// through.
+fn supersedes_list(stored: Option<String>) -> Vec<String> {
+    let Some(text) = stored else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<String>>(&text)
+        .unwrap_or_else(|_| vec![text])
+        .into_iter()
+        .filter(|id| !id.trim().is_empty())
+        .collect()
+}
+
 fn budget_values(values: Vec<Value>, used: &mut usize, max_bytes: usize) -> Vec<Value> {
     let mut output = Vec::new();
     for value in values {
@@ -5250,9 +5566,14 @@ fn slug(value: &str) -> String {
         .collect::<Vec<_>>()
         .join("-")
 }
-fn decision_markdown(id: &str, d: &RecordDecision) -> String {
+fn decision_markdown(id: &str, d: &RecordDecision, supersedes: &[String]) -> String {
+    let supersedes = if supersedes.is_empty() {
+        String::new()
+    } else {
+        format!("\nSupersedes: {}\n", supersedes.join(", "))
+    };
     format!(
-        "# {id}: {}\n\nStatus: {}\n\n## Rationale\n\n{}\n\n## Applies to\n\n{}\n\n## Consequences\n\n{}\n",
+        "# {id}: {}\n\nStatus: {}\n{supersedes}\n## Rationale\n\n{}\n\n## Applies to\n\n{}\n\n## Consequences\n\n{}\n",
         d.title,
         d.status,
         d.reason,
@@ -5554,7 +5875,8 @@ mod tests {
                 reason: "Permits isolated testing".into(),
                 applies_to: vec!["Store".into()],
                 consequences: vec!["Do not construct stores in handlers".into()],
-                supersedes: None,
+                supersedes: vec![],
+                recorded_by: String::new(),
                 materialize: false,
             })
             .unwrap();
@@ -5588,7 +5910,8 @@ mod tests {
                 reason: "Permits isolated testing".into(),
                 applies_to: vec!["Store".into()],
                 consequences: vec![],
-                supersedes: None,
+                supersedes: vec![],
+                recorded_by: String::new(),
                 materialize: false,
             })
             .unwrap();
@@ -5681,7 +6004,8 @@ mod tests {
                     reason: "Additive cache upgrades are not conceptual resets".into(),
                     applies_to: vec![],
                     consequences: vec![],
-                    supersedes: None,
+                    supersedes: vec![],
+                    recorded_by: String::new(),
                     materialize: false,
                 })
                 .unwrap();
@@ -6167,7 +6491,8 @@ mod tests {
                 reason: "All features must remain operable without a pointer".into(),
                 applies_to: vec![],
                 consequences: vec!["Include keyboard interaction in every design".into()],
-                supersedes: None,
+                supersedes: vec![],
+                recorded_by: String::new(),
                 materialize: false,
             })
             .unwrap();
@@ -6425,7 +6750,8 @@ mod tests {
                 reason: "Crusty reports; humans decide".into(),
                 applies_to: vec!["src/lib.rs".into()],
                 consequences: vec![],
-                supersedes: None,
+                supersedes: vec![],
+                recorded_by: String::new(),
                 materialize: false,
             })
             .unwrap();
@@ -6821,5 +7147,405 @@ mod tests {
         assert_eq!(diagnostics[0]["code"], "E0308");
         assert_eq!(diagnostics[0]["location"], "src/lib.rs:42");
         assert_eq!(diagnostics[0]["line"], 42);
+    }
+
+    fn decision(title: &str, applies_to: &[&str]) -> RecordDecision {
+        RecordDecision {
+            title: title.into(),
+            status: "accepted".into(),
+            reason: format!("{title} rationale"),
+            applies_to: applies_to
+                .iter()
+                .map(|target| (*target).to_owned())
+                .collect(),
+            consequences: vec![],
+            supersedes: vec![],
+            recorded_by: String::new(),
+            materialize: false,
+        }
+    }
+
+    fn decision_ids(values: &Value) -> Vec<String> {
+        values
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|decision| decision["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn supersedes_accepts_a_single_id_or_a_list() {
+        let single: RecordDecision =
+            serde_json::from_value(json!({"title": "t", "supersedes": "DEC-0001"})).unwrap();
+        assert_eq!(single.supersedes, ["DEC-0001"]);
+        let many: RecordDecision =
+            serde_json::from_value(json!({"title": "t", "supersedes": ["DEC-0001", "DEC-0002"]}))
+                .unwrap();
+        assert_eq!(many.supersedes, ["DEC-0001", "DEC-0002"]);
+        let none: RecordDecision =
+            serde_json::from_value(json!({"title": "t", "supersedes": null})).unwrap();
+        assert!(none.supersedes.is_empty());
+        let absent: RecordDecision = serde_json::from_value(json!({"title": "t"})).unwrap();
+        assert!(absent.supersedes.is_empty());
+        assert_eq!(absent.status, "accepted");
+    }
+
+    #[test]
+    fn unscoped_decision_list_enumerates_the_ledger_newest_first() {
+        let d = fixture();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        for title in ["First", "Second", "Third"] {
+            service
+                .record_decision(decision(title, &["Store"]))
+                .unwrap();
+        }
+        let all = service.decision_list("", None, 200).unwrap();
+        assert_eq!(
+            decision_ids(&json!(all)),
+            ["DEC-0003", "DEC-0002", "DEC-0001"]
+        );
+        assert_eq!(service.decision_list("", None, 2).unwrap().len(), 2);
+        assert!(
+            service
+                .decision_list("", Some("superseded"), 200)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(service.decision_list("Store", None, 1).unwrap().len(), 1);
+        assert_eq!(service.decision_list("Store", None, 200).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn superseding_closes_targets_and_exposes_back_links_and_history() {
+        let d = fixture();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        service
+            .record_decision(decision("Inject the store", &["Store"]))
+            .unwrap();
+        service
+            .record_decision(decision("Load lazily", &["Store"]))
+            .unwrap();
+
+        let mut missing_actor = decision("Inject a lazily loading store", &["Store"]);
+        missing_actor.supersedes = vec!["DEC-0001".into()];
+        let error = service
+            .record_decision(missing_actor)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("recorded_by is required"), "{error}");
+
+        let mut unknown = decision("Unknown target", &[]);
+        unknown.supersedes = vec!["DEC-9999".into()];
+        unknown.recorded_by = "andreas".into();
+        let error = service.record_decision(unknown).unwrap_err().to_string();
+        assert!(error.contains("unknown decision `DEC-9999`"), "{error}");
+
+        let mut not_accepted = decision("Historical note", &[]);
+        not_accepted.status = "retired".into();
+        not_accepted.supersedes = vec!["DEC-0001".into()];
+        not_accepted.recorded_by = "andreas".into();
+        let error = service
+            .record_decision(not_accepted)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("only an accepted decision can supersede"),
+            "{error}"
+        );
+
+        let mut consolidated = decision("Inject a lazily loading store", &["Store"]);
+        consolidated.supersedes = vec!["DEC-0001".into(), " DEC-0002 ".into(), "DEC-0001".into()];
+        consolidated.recorded_by = "andreas".into();
+        let recorded = service.record_decision(consolidated).unwrap();
+        assert_eq!(recorded["id"], "DEC-0003");
+        assert_eq!(recorded["supersedes"], json!(["DEC-0001", "DEC-0002"]));
+
+        let first = service.decision_resource("DEC-0001").unwrap();
+        assert_eq!(first["status"], "superseded");
+        assert_eq!(first["superseded_by"], json!(["DEC-0003"]));
+        assert_eq!(first["history"][0]["action"], "superseded");
+        assert_eq!(first["history"][0]["actor"], "andreas");
+        assert_eq!(first["history"][0]["note"], "superseded by DEC-0003");
+        let third = service.decision_resource("DEC-0003").unwrap();
+        assert_eq!(third["status"], "accepted");
+        assert_eq!(third["supersedes"], json!(["DEC-0001", "DEC-0002"]));
+        assert_eq!(third["superseded_by"], json!([]));
+        assert_eq!(third["history"], json!([]));
+
+        let mut again = decision("Try again", &[]);
+        again.supersedes = vec!["DEC-0001".into()];
+        again.recorded_by = "andreas".into();
+        let error = service.record_decision(again).unwrap_err().to_string();
+        assert!(error.contains("status `superseded`"), "{error}");
+        assert_eq!(service.decision_list("", None, 200).unwrap().len(), 3);
+        assert_eq!(
+            decision_ids(&json!(
+                service.decision_list("", Some("superseded"), 200).unwrap()
+            )),
+            ["DEC-0002", "DEC-0001"]
+        );
+    }
+
+    #[test]
+    fn retiring_requires_an_actor_and_is_terminal() {
+        let d = fixture();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        service
+            .record_decision(decision("Inject the store", &["Store"]))
+            .unwrap();
+        let retire = |id: &str, retired_by: &str, note: &str| RetireDecision {
+            id: id.into(),
+            retired_by: retired_by.into(),
+            note: note.into(),
+        };
+        let error = service
+            .retire_decision(retire("DEC-0001", "  ", ""))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("retired_by is required"), "{error}");
+        let error = service
+            .retire_decision(retire("DEC-0042", "andreas", ""))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown decision `DEC-0042`"), "{error}");
+
+        let retired = service
+            .retire_decision(retire("DEC-0001", "andreas", "No longer applies"))
+            .unwrap();
+        assert_eq!(retired["status"], "retired");
+        assert_eq!(retired["history"][0]["action"], "retired");
+        assert_eq!(retired["history"][0]["actor"], "andreas");
+        assert_eq!(retired["history"][0]["note"], "No longer applies");
+        assert_eq!(retired["materialized_path"], Value::Null);
+
+        let error = service
+            .retire_decision(retire("DEC-0001", "andreas", ""))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("status `retired`"), "{error}");
+        let mut replacement = decision("Replacement", &[]);
+        replacement.supersedes = vec!["DEC-0001".into()];
+        replacement.recorded_by = "andreas".into();
+        let error = service
+            .record_decision(replacement)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("status `retired`"), "{error}");
+        assert!(service.decisions_for("Store").unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_decision_and_steering_statuses_are_rejected() {
+        let d = fixture();
+        let service = Service::open(d.path()).unwrap();
+        let mut invalid = decision("Typo", &[]);
+        invalid.status = "acepted".into();
+        let error = service.record_decision(invalid).unwrap_err().to_string();
+        assert!(
+            error.contains("unsupported decision status `acepted`"),
+            "{error}"
+        );
+        let steering = |status: &str, expires_at: Option<&str>| RecordSteering {
+            title: "Theme".into(),
+            instruction: "Reuse the theme".into(),
+            scope: vec![],
+            priority: "normal".into(),
+            status: status.into(),
+            expires_at: expires_at.map(str::to_owned),
+        };
+        let error = service
+            .record_steering(steering("enabled", None))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unsupported steering status `enabled`"),
+            "{error}"
+        );
+        let error = service
+            .record_steering(steering("active", Some("tomorrow")))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not an RFC 3339 timestamp"), "{error}");
+        service
+            .record_steering(steering("active", Some("2030-01-01T00:00:00Z")))
+            .unwrap();
+        assert!(service.decision_list("", None, 200).unwrap().is_empty());
+        assert_eq!(
+            service.steering_list(None, 200).unwrap()["steerings"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn governing_consumers_only_cite_accepted_decisions() {
+        let d = fixture();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        service
+            .record_decision(decision("Inject the store", &["Store"]))
+            .unwrap();
+        let mut replacement = decision("Inject the store through a builder", &["Store"]);
+        replacement.supersedes = vec!["DEC-0001".into()];
+        replacement.recorded_by = "andreas".into();
+        service.record_decision(replacement).unwrap();
+
+        assert_eq!(
+            decision_ids(&service.explain("Store", 10).unwrap()["decisions"]),
+            ["DEC-0002"]
+        );
+        assert_eq!(
+            decision_ids(&service.why("Store").unwrap()["decisions"]),
+            ["DEC-0002"]
+        );
+        assert_eq!(
+            decision_ids(&service.context_pack("Store", 4_000, 10).unwrap()["decisions"]),
+            ["DEC-0002"]
+        );
+        assert_eq!(
+            decision_ids(&service.consult("change Store", 4_000).unwrap()["decisions"]),
+            ["DEC-0002"]
+        );
+        assert_eq!(
+            decision_ids(&service.constraints("Store").unwrap()["decisions"]),
+            ["DEC-0002"]
+        );
+        assert_eq!(
+            decision_ids(&json!(
+                service
+                    .decision_list("Store", Some("superseded"), 20)
+                    .unwrap()
+            )),
+            ["DEC-0001"]
+        );
+    }
+
+    #[test]
+    fn consultation_reports_what_the_budget_left_out() {
+        let d = fixture();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        for index in 0..6 {
+            let mut global = decision(&format!("Global rule {index}"), &[]);
+            global.reason = "x".repeat(600);
+            service.record_decision(global).unwrap();
+        }
+        let tight = service.consult("anything at all", 250).unwrap();
+        assert_eq!(tight["context_budget"]["truncated"], true);
+        assert!(
+            tight["context_budget"]["omitted"]["decisions"]
+                .as_u64()
+                .unwrap()
+                >= 1
+        );
+        assert!(tight["decisions"].as_array().unwrap().len() < 6);
+        let generous = service.consult("anything at all", 20_000).unwrap();
+        assert_eq!(generous["context_budget"]["truncated"], false);
+        assert_eq!(generous["context_budget"]["omitted"]["decisions"], 0);
+        assert_eq!(generous["decisions"].as_array().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn bare_legacy_supersedes_values_are_normalized_on_open() {
+        let d = fixture();
+        {
+            let service = Service::open(d.path()).unwrap();
+            service.record_decision(decision("Old", &[])).unwrap();
+            service.record_decision(decision("New", &[])).unwrap();
+            // Databases written before multi-target supersession stored one
+            // bare ID and only flipped the old status.
+            service
+                .db
+                .execute(
+                    "UPDATE decisions SET supersedes='DEC-0001' WHERE id='DEC-0002'",
+                    [],
+                )
+                .unwrap();
+            service
+                .db
+                .execute(
+                    "UPDATE decisions SET status='superseded' WHERE id='DEC-0001'",
+                    [],
+                )
+                .unwrap();
+        }
+        let service = Service::open(d.path()).unwrap();
+        assert_eq!(
+            service.decision_resource("DEC-0002").unwrap()["supersedes"],
+            json!(["DEC-0001"])
+        );
+        assert_eq!(
+            service.decision_resource("DEC-0001").unwrap()["superseded_by"],
+            json!(["DEC-0002"])
+        );
+        let stored: String = service
+            .db
+            .query_row(
+                "SELECT supersedes FROM decisions WHERE id='DEC-0002'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "[\"DEC-0001\"]");
+    }
+
+    #[test]
+    fn materialized_markdown_tracks_supersession_and_retirement() {
+        let d = fixture();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        let mut first = decision("Inject the store", &["Store"]);
+        first.materialize = true;
+        let first_path = service.record_decision(first).unwrap()["materialized_path"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(first_path, "docs/decisions/0001-inject-the-store.md");
+        let mut second = decision("Cache the store", &["Store"]);
+        second.materialize = true;
+        service.record_decision(second).unwrap();
+
+        let mut replacement = decision("Inject a cached store", &["Store"]);
+        replacement.supersedes = vec!["DEC-0001".into()];
+        replacement.recorded_by = "andreas".into();
+        replacement.materialize = true;
+        let recorded = service.record_decision(replacement).unwrap();
+        let replacement_text = fs::read_to_string(
+            d.path()
+                .join(recorded["materialized_path"].as_str().unwrap()),
+        )
+        .unwrap();
+        assert!(
+            replacement_text.contains("Status: accepted\n\nSupersedes: DEC-0001\n\n## Rationale"),
+            "{replacement_text}"
+        );
+        let first_text = fs::read_to_string(d.path().join(&first_path)).unwrap();
+        assert!(
+            first_text.contains("Status: superseded by DEC-0003\n\n## Rationale"),
+            "{first_text}"
+        );
+
+        let retired = service
+            .retire_decision(RetireDecision {
+                id: "DEC-0002".into(),
+                retired_by: "andreas".into(),
+                note: "Caching moved to the client".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            retired["materialized_path"],
+            "docs/decisions/0002-cache-the-store.md"
+        );
+        let second_text =
+            fs::read_to_string(d.path().join("docs/decisions/0002-cache-the-store.md")).unwrap();
+        assert!(
+            second_text.contains("Status: retired: Caching moved to the client\n\n## Rationale"),
+            "{second_text}"
+        );
     }
 }

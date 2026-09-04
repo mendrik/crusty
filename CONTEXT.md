@@ -46,6 +46,24 @@ _Avoid_: Confidence score, proof
 A bounded, read-only briefing of global and topical repository guidance requested before an attached agent plans, answers, or acts.
 _Avoid_: Change preparation, repository search
 
+### Human governance
+
+**Decision**:
+A human architectural decision recorded in the ledger; only an `accepted` decision governs consultation, prepared changes, and validation.
+_Avoid_: Inference, finding, suggestion
+
+**Supersession**:
+The human act of recording a new decision that replaces one or more accepted decisions, closing each with its actor and history.
+_Avoid_: Compaction, automatic sweep, contradiction detection
+
+**Retirement**:
+The human act of closing an accepted decision without a replacement; the record stays in the ledger as history.
+_Avoid_: Deletion, archive, cleanup
+
+**Steering**:
+A durable human instruction with a scope, priority, and optional expiry that shapes later changes.
+_Avoid_: Prompt, hint, decision
+
 ### Research and decisions
 
 **Research run**:

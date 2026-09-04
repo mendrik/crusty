@@ -4,7 +4,10 @@
 //! operations are explicit durable tasks, while findings and human-owned work
 //! live in a database that is independent from the rebuildable index.
 
-use crate::{QualityScope, RecordDecision, RecordSteering, Service, ValidationOutcomeInput};
+use crate::{
+    DECISION_STATUSES, QualityScope, RecordDecision, RecordSteering, RetireDecision, Service,
+    ValidationOutcomeInput,
+};
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{TimeZone, Utc};
 use rand::random;
@@ -209,6 +212,20 @@ pub struct ScopeRequest {
     /// Optional symbol, path, or concept to narrow the result. Omit for the
     /// whole repository.
     pub scope: Option<String>,
+    #[serde(default = "default_list_limit")]
+    pub limit: usize,
+}
+
+/// Lists the decision ledger: newest first when `scope` is omitted, relevance
+/// order otherwise.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionListRequest {
+    /// Optional symbol, path, or concept to narrow the result. Omit for the
+    /// whole ledger.
+    pub scope: Option<String>,
+    /// `accepted`, `superseded`, or `retired`. Omit for every status.
+    pub status: Option<String>,
     #[serde(default = "default_list_limit")]
     pub limit: usize,
 }
@@ -870,12 +887,34 @@ impl Observatory {
         Service::open(self.root.as_ref().clone())?.record_decision(request)
     }
 
-    pub fn decision_list(&self, query: Option<&str>, limit: usize) -> Result<Value> {
+    pub fn decision_list(
+        &self,
+        query: Option<&str>,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Value> {
+        if let Some(status) = status {
+            validate_choice("decision status", status, DECISION_STATUSES)?;
+        }
+        let limit = list_limit(limit);
         let service = Service::open(self.root.as_ref().clone())?;
-        let decisions = service.decisions_for(query.unwrap_or(""))?;
-        Ok(
-            json!({"query":query.unwrap_or(""),"decisions":decisions,"limit":limit.clamp(1,200),"authority":"Architectural decisions are human-authored records, not Crusty inferences."}),
-        )
+        let decisions = service.decision_list(query.unwrap_or(""), status, limit as usize)?;
+        Ok(json!({
+            "query": query.unwrap_or(""),
+            "status": status,
+            "limit": limit,
+            "count": decisions.len(),
+            "decisions": decisions,
+            "authority": "Architectural decisions are human-authored records, not Crusty inferences.",
+            "lifecycle": {
+                "statuses": DECISION_STATUSES,
+                "note": "Only accepted decisions govern consultation and prepared changes; superseded and retired decisions stay in the ledger with their review history.",
+            },
+        }))
+    }
+
+    pub fn decision_retire(&self, request: RetireDecision) -> Result<Value> {
+        Service::open(self.root.as_ref().clone())?.retire_decision(request)
     }
 
     pub fn steering_record(&self, request: RecordSteering) -> Result<Value> {
@@ -2407,7 +2446,7 @@ fn ensure_column(db: &Connection, table: &str, column: &str, kind: &str) -> Resu
 fn migrate_legacy_summaries(db: &Connection) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     if attached_table_exists(db, "decisions")? {
-        db.execute("INSERT OR REPLACE INTO legacy_records(kind,id,payload_json,migrated_at) SELECT 'decision',id,json_object('title',title,'status',status,'rationale',rationale,'applies_to',applies_to,'consequences',consequences,'revision',revision,'created_at',created_at),?1 FROM legacy.decisions", [&now])?;
+        db.execute("INSERT OR REPLACE INTO legacy_records(kind,id,payload_json,migrated_at) SELECT 'decision',id,json_object('title',title,'status',status,'rationale',rationale,'applies_to',applies_to,'consequences',consequences,'supersedes',CASE WHEN supersedes IS NULL THEN json_array() WHEN json_valid(supersedes) THEN json(supersedes) ELSE json_array(supersedes) END,'revision',revision,'created_at',created_at),?1 FROM legacy.decisions", [&now])?;
     }
     if attached_table_exists(db, "steerings")? {
         db.execute("INSERT OR REPLACE INTO legacy_records(kind,id,payload_json,migrated_at) SELECT 'steering',id,json_object('title',title,'status',status,'priority',priority,'instruction',instruction,'scope',scope,'revision',revision,'created_at',created_at),?1 FROM legacy.steerings", [&now])?;
@@ -3342,7 +3381,7 @@ mod tests {
         legacy.execute_batch(
             "INSERT INTO decisions VALUES(
                 'DEC-2',2,'accepted','Secondary information','progressive disclosure',
-                '[\"work inspector\"]','[\"collapse evidence\"]',NULL,'r2','later');",
+                '[\"work inspector\"]','[\"collapse evidence\"]','DEC-1','r2','later');",
         )?;
         drop(legacy);
 
@@ -3350,6 +3389,8 @@ mod tests {
         let records = observatory.search_legacy_memory("collapse evidence", 10)?;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0]["id"], "DEC-2");
+        // A bare pre-0.3 `supersedes` value is mirrored in its list form.
+        assert_eq!(records[0]["payload"]["supersedes"], json!(["DEC-1"]));
         Ok(())
     }
 

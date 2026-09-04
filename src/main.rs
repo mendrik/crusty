@@ -7,13 +7,15 @@ use rmcp::{
 use rust_repo_intelligence::observatory::{
     ArchitectureFindingRequest, ArchitectureRequest, CheckpointCreateRequest,
     CheckpointDiffRequest, CheckpointRestoreRequest, ConsultRequest, ContextRequest,
-    FindingEvidenceRequest, MemorySearchRequest, Observatory, PrepareRequest, ProblemUpdateRequest,
-    PromoteFindingRequest, QualityMergeRequest, QualityReviewRequest, ResearchListRequest,
-    ResearchStartRequest, ResearchSubmitRequest, ReviewFindingRequest, ScopeRequest, SearchRequest,
-    SymbolRelationRequest, TargetRequest, TaskListRequest, ValidateRequest, WorkCreateRequest,
-    WorkUpdateRequest,
+    DecisionListRequest, FindingEvidenceRequest, MemorySearchRequest, Observatory, PrepareRequest,
+    ProblemUpdateRequest, PromoteFindingRequest, QualityMergeRequest, QualityReviewRequest,
+    ResearchListRequest, ResearchStartRequest, ResearchSubmitRequest, ReviewFindingRequest,
+    ScopeRequest, SearchRequest, SymbolRelationRequest, TargetRequest, TaskListRequest,
+    ValidateRequest, WorkCreateRequest, WorkUpdateRequest,
 };
-use rust_repo_intelligence::{RecordDecision, RecordSteering, ValidationOutcomeInput};
+use rust_repo_intelligence::{
+    RecordDecision, RecordSteering, RetireDecision, ValidationOutcomeInput,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -307,7 +309,7 @@ impl CrustyServer {
 
     #[tool(
         name = "decision.record",
-        description = "Record a human architectural decision so prepared changes and validation can cite it."
+        description = "Record a human architectural decision so prepared changes and validation can cite it. It may supersede accepted decisions by ID, which requires recorded_by."
     )]
     async fn decision_record(
         &self,
@@ -319,15 +321,33 @@ impl CrustyServer {
 
     #[tool(
         name = "decision.list",
-        description = "List human architectural decisions relevant to a symbol, path, or concept."
+        description = "List human architectural decisions: the whole ledger newest first, or those relevant to a symbol, path, or concept, optionally filtered by status."
     )]
     async fn decision_list(
         &self,
-        Parameters(request): Parameters<ScopeRequest>,
+        Parameters(request): Parameters<DecisionListRequest>,
     ) -> Result<Json<Value>, String> {
         let observatory = self.observatory.clone();
-        Self::offload(move || observatory.decision_list(request.scope.as_deref(), request.limit))
-            .await
+        Self::offload(move || {
+            observatory.decision_list(
+                request.scope.as_deref(),
+                request.status.as_deref(),
+                request.limit,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        name = "decision.retire",
+        description = "Retire an accepted human decision without replacing it. Requires the retiring human's identity; the record stays in the ledger as history."
+    )]
+    async fn decision_retire(
+        &self,
+        Parameters(request): Parameters<RetireDecision>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.decision_retire(request)).await
     }
 
     #[tool(
@@ -919,6 +939,7 @@ mod tests {
                 "dashboard.open",
                 "decision.list",
                 "decision.record",
+                "decision.retire",
                 "finding.evidence.add",
                 "finding.get",
                 "finding.list",
