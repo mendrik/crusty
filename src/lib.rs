@@ -3,8 +3,13 @@
 
 pub mod analysis;
 pub mod dashboard;
+mod execution;
 pub mod observatory;
 mod quality;
+mod response_budget;
+mod validation_diff;
+
+pub use validation_diff::{DiffSource, DiffTarget};
 
 pub use quality::{
     ProblemInput, QualityConstraintInput, QualityScope, ValidationOutcomeInput, ValidationRecipe,
@@ -26,9 +31,9 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{ChildStdin, Command, Stdio},
     sync::{
-        Mutex,
+        Arc, Mutex,
         mpsc::{self, Receiver},
     },
     thread,
@@ -334,43 +339,49 @@ fn active() -> String {
 }
 
 pub struct RustAnalyzerClient {
-    _child: Child,
+    _child: execution::OwnedChild,
     stdin: ChildStdin,
     responses: Receiver<Value>,
     next_id: u64,
-    opened_versions: HashMap<String, i64>,
+    opened_versions: HashMap<String, (i64, blake3::Hash)>,
 }
 
 impl RustAnalyzerClient {
     fn start(workspace: &Path, program: &Path) -> Result<Self> {
-        let mut child = Command::new(program)
-            .current_dir(workspace)
-            // Keep the analyzer's Cargo subprocesses from multiplying the
-            // worker limit below.  This is intentionally a conservative
-            // default for a background MCP service.
-            .env("CARGO_BUILD_JOBS", RUST_ANALYZER_THREADS.to_string())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("starting rust-analyzer at {}", program.display()))?;
+        let mut child = execution::OwnedChild::spawn(
+            Command::new(program)
+                .current_dir(workspace)
+                // Keep the analyzer's Cargo subprocesses from multiplying the
+                // worker limit below.  This is intentionally a conservative
+                // default for a background MCP service.
+                .env("CARGO_BUILD_JOBS", RUST_ANALYZER_THREADS.to_string())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+        )
+        .with_context(|| format!("starting rust-analyzer at {}", program.display()))?;
         let stdout = child
+            .child
             .stdout
             .take()
             .context("opening rust-analyzer stdout")?;
-        let (sender, responses) = mpsc::channel();
+        let (sender, responses) = mpsc::sync_channel(128);
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             while let Some(message) = read_lsp(&mut reader) {
-                if sender.send(message).is_err() {
+                if message.get("id").is_some() && sender.send(message).is_err() {
                     break;
                 }
             }
         });
-        let mut stdin = child.stdin.take().context("opening rust-analyzer stdin")?;
+        let mut stdin = child
+            .child
+            .stdin
+            .take()
+            .context("opening rust-analyzer stdin")?;
         let request = json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"processId": null, "rootUri": format!("file://{}", workspace.display()),
+            "params": {"processId": std::process::id(), "rootUri": format!("file://{}", workspace.display()),
                 "capabilities": {},
                 "initializationOptions": rust_analyzer_initialization_options(),
                 "workspaceFolders": [{"uri": format!("file://{}", workspace.display()), "name": "workspace"}]}
@@ -384,6 +395,9 @@ impl RustAnalyzerClient {
             let response = responses
                 .recv_timeout(wait)
                 .context("waiting for rust-analyzer initialization")?;
+            if answer_lsp_request(&mut stdin, &response)? {
+                continue;
+            }
             if response.get("id").and_then(Value::as_u64) == Some(1) {
                 ensure!(
                     response.get("error").is_none(),
@@ -407,14 +421,19 @@ impl RustAnalyzerClient {
     }
 
     fn did_change(&mut self, uri: &str, text: &str) {
-        if let Some(version) = self.opened_versions.get_mut(uri) {
+        let hash = blake3::hash(text.as_bytes());
+        if let Some((version, previous)) = self.opened_versions.get_mut(uri) {
+            if *previous == hash {
+                return;
+            }
+            *previous = hash;
             *version += 1;
             let _ = write_lsp(
                 &mut self.stdin,
                 &json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":uri,"version":*version},"contentChanges":[{"text":text}]}}),
             );
         } else {
-            self.opened_versions.insert(uri.to_owned(), 1);
+            self.opened_versions.insert(uri.to_owned(), (1, hash));
             let _ = write_lsp(
                 &mut self.stdin,
                 &json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"rust","version":1,"text":text}}}),
@@ -438,6 +457,9 @@ impl RustAnalyzerClient {
         let deadline = Instant::now() + Duration::from_secs(3);
         while let Some(wait) = deadline.checked_duration_since(Instant::now()) {
             let response = self.responses.recv_timeout(wait).ok()?;
+            if answer_lsp_request(&mut self.stdin, &response).ok()? {
+                continue;
+            }
             if response.get("id").and_then(Value::as_u64) == Some(id) {
                 return response.get("result").and_then(Value::as_array).cloned();
             }
@@ -452,6 +474,36 @@ impl RustAnalyzerClient {
     fn implementations(&mut self, uri: &str, line: usize, character: usize) -> Option<Vec<Value>> {
         self.locations("textDocument/implementation", uri, line, character)
     }
+}
+
+fn answer_lsp_request(stdin: &mut ChildStdin, message: &Value) -> Result<bool> {
+    let (Some(id), Some(method)) = (message.get("id"), message["method"].as_str()) else {
+        return Ok(false);
+    };
+    let result = match method {
+        "workspace/configuration" => json!(vec![
+            Value::Null;
+            message["params"]["items"]
+                .as_array()
+                .map_or(0, Vec::len)
+        ]),
+        "client/registerCapability"
+        | "client/unregisterCapability"
+        | "window/workDoneProgress/create"
+        | "workspace/semanticTokens/refresh" => Value::Null,
+        "workspace/applyEdit" => {
+            json!({"applied":false,"failureReason":"Crusty's semantic companion is read-only"})
+        }
+        _ => {
+            write_lsp(
+                stdin,
+                &json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Unsupported client method"}}),
+            )?;
+            return Ok(true);
+        }
+    };
+    write_lsp(stdin, &json!({"jsonrpc":"2.0","id":id,"result":result}))?;
+    Ok(true)
 }
 
 fn rust_analyzer_initialization_options() -> Value {
@@ -535,13 +587,6 @@ fn start_watcher(
     (Some(watcher), Some(receiver))
 }
 
-impl Drop for RustAnalyzerClient {
-    fn drop(&mut self) {
-        let _ = self._child.kill();
-        let _ = self._child.wait();
-    }
-}
-
 fn write_lsp(out: &mut ChildStdin, value: &Value) -> Result<()> {
     let body = serde_json::to_vec(value)?;
     write!(out, "Content-Length: {}\r\n\r\n", body.len())?;
@@ -573,16 +618,22 @@ fn read_lsp(reader: &mut impl BufRead) -> Option<Value> {
 pub struct Service {
     root: PathBuf,
     db: Connection,
-    ra: Option<Mutex<RustAnalyzerClient>>,
+    ra: Arc<Mutex<SemanticBackend>>,
+    execution: execution::ExecutionControl,
     ra_enabled: bool,
-    ra_start_attempted: bool,
     ra_program: PathBuf,
-    ra_start_error: Option<String>,
     watcher: Option<RecommendedWatcher>,
     watch_events: Option<Receiver<notify::Result<Event>>>,
     watcher_trusted: bool,
     last_reconcile: Instant,
     embedding_cache: RefCell<Option<EmbeddingCache>>,
+}
+
+#[derive(Default)]
+pub(crate) struct SemanticBackend {
+    client: Option<RustAnalyzerClient>,
+    start_attempted: bool,
+    start_error: Option<String>,
 }
 
 struct PublisherLease(File);
@@ -615,11 +666,10 @@ impl Service {
         Ok(Self {
             root,
             db,
-            ra: None,
+            ra: Arc::new(Mutex::new(SemanticBackend::default())),
+            execution: execution::ExecutionControl::default(),
             ra_enabled: rust_analyzer_enabled(std::env::var(RUST_ANALYZER_ENV).ok().as_deref()),
-            ra_start_attempted: false,
             ra_program,
-            ra_start_error: None,
             watcher,
             watch_events,
             watcher_trusted: false,
@@ -632,19 +682,34 @@ impl Service {
         &self.root
     }
 
-    fn start_rust_analyzer_if_enabled(&mut self) {
-        if !self.ra_enabled || self.ra_start_attempted {
+    pub(crate) fn with_backend(mut self, backend: Arc<Mutex<SemanticBackend>>) -> Self {
+        self.ra = backend;
+        self
+    }
+
+    pub(crate) fn with_execution(mut self, execution: execution::ExecutionControl) -> Self {
+        self.execution = execution;
+        self
+    }
+
+    fn start_rust_analyzer_if_enabled(&self) {
+        if !self.ra_enabled {
             return;
         }
-        self.ra_start_attempted = true;
+        let Ok(mut backend) = self.ra.lock() else {
+            return;
+        };
+        if backend.start_attempted {
+            return;
+        }
+        backend.start_attempted = true;
         match RustAnalyzerClient::start(&self.root, &self.ra_program) {
             Ok(client) => {
-                self.ra = Some(Mutex::new(client));
-                self.ra_start_error = None;
+                backend.client = Some(client);
+                backend.start_error = None;
             }
             Err(error) => {
-                self.ra = None;
-                self.ra_start_error = Some(format!("{error:#}"));
+                backend.start_error = Some(format!("{error:#}"));
             }
         }
     }
@@ -817,7 +882,6 @@ impl Service {
     }
 
     fn reindex_unlocked(&mut self) -> Result<()> {
-        self.start_rust_analyzer_if_enabled();
         self.with_savepoint("full_reindex", |service| service.reindex_inner())?;
         self.watcher_trusted = self.watcher.is_some();
         self.last_reconcile = Instant::now();
@@ -901,7 +965,6 @@ impl Service {
     /// never invalidates source symbols or graph edges.
     pub fn refresh_if_stale(&mut self) -> Result<()> {
         let _publisher_lease = self.acquire_publisher_lease()?;
-        self.start_rust_analyzer_if_enabled();
         let previous: BTreeMap<String, (String, String)> = self
             .db
             .prepare("SELECT path, kind, content_hash FROM input_state")?
@@ -1677,21 +1740,24 @@ impl Service {
             &mut used,
             max_bytes,
         );
-        Ok(json!({
-            "query":query,
-            "retrieval":"BM25 + subword embedding + typed graph expansion, fused with reciprocal-rank fusion",
-            "retrieval_provenance":self.retrieval_provenance(),
-            "ranked_symbols":ranked_symbols,
-            "source_slices":source_slices,
-            "documentation":documentation,
-            "decisions":decisions,
-            "steerings":steerings,
-            "work_items":work_items,
-            "context_budget":{"tokens":token_budget,"estimated_tokens":used.div_ceil(4)},
-            "generation":self.active_generation(),
-            "semantic_snapshot":self.semantic_snapshot_resource(),
-            "blind_spots":["Generated code, runtime registration, external consumers, and inactive feature/target profiles still require profile-specific confirmation."]
-        }))
+        Ok(response_budget::bound(
+            json!({
+                "query":query,
+                "retrieval":"BM25 + subword embedding + typed graph expansion, fused with reciprocal-rank fusion",
+                "retrieval_provenance":self.retrieval_provenance(),
+                "ranked_symbols":ranked_symbols,
+                "source_slices":source_slices,
+                "documentation":documentation,
+                "decisions":decisions,
+                "steerings":steerings,
+                "work_items":work_items,
+                "context_budget":{"tokens":token_budget,"estimated_tokens":used.div_ceil(4)},
+                "generation":self.active_generation(),
+                "semantic_snapshot":self.semantic_snapshot_resource(),
+                "blind_spots":["Generated code, runtime registration, external consumers, and inactive feature/target profiles still require profile-specific confirmation."]
+            }),
+            token_budget,
+        ))
     }
 
     fn refresh_git(&self, revision: &str) -> Result<()> {
@@ -1737,11 +1803,6 @@ impl Service {
                 unreadable.push(relative);
                 continue;
             };
-            if let Some(ra) = &self.ra
-                && let Ok(mut ra) = ra.lock()
-            {
-                ra.did_change(&format!("file://{}", path.display()), &text);
-            }
             let lines: Vec<_> = text.lines().collect();
             let crate_name = crate_for_file(packages, path);
             let parsed = parse_rust_symbols(&text).unwrap_or_else(|| regex_symbols(&lines));
@@ -2411,7 +2472,7 @@ impl Service {
         }
         let payload = json!({"context_id":context_id,"intent":intent,"revision":self.revision(),"snapshot":self.snapshot(),"automatic_problem_capture":automatic_problem_capture,"primary_symbols":target_nodes,"references":references,"reference_provenance":{"semantic":"RustAnalyzer (confidence 1.0), cached by semantic snapshot","fallback":"Syntax-derived, ambiguity-suppressed relationships (confidence labelled)"},"semantic_references":semantic_references,"uncertain_static_references":uncertain_static_references,"runtime_contracts":runtime_contracts,"tests":tests,"use_cases":use_cases,"decisions":decisions,"steerings":steerings,"lifecycle":lifecycle,"obsolete_candidates":obsolete.get("candidates"),"work_items":work.get("items"),"likely_change_surface":likely_surface,"source_slices":slices,"context_budget":{"tokens":token_budget,"estimated_tokens":used.div_ceil(4)},"generation":self.active_generation(),"semantic_snapshot":self.semantic_snapshot_resource(),"risk":risk(&target_nodes, &references),"validation_queue":validation_queue,"architecture_guard":architecture_guard,"unresolved_edges":["Ambiguous static references are reported separately and excluded from likely_change_surface.","Runtime registration, generated code, inactive feature/target profiles, external consumers, and deployment state require profile-specific or runtime verification."],"verification_plan":["cargo check --all-targets","cargo test","Use repo.matrix for no-default, individual-feature, and all-feature checks.","Validate changed GTK UI/Blueprint files with the project GTK tooling.","Compare changed D-Bus XML with runtime introspection and external consumer expectations."],"semantic_note":"rust-analyzer facts are resolved on demand and persisted for the active semantic snapshot. Syntax relationships are AST-derived; unresolved ambiguous names are retained as uncertainty, not impact edges."});
         self.db.execute("INSERT INTO change_contexts(id, intent, payload, revision, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![context_id, intent, payload.to_string(), self.revision().workspace_digest, Utc::now().to_rfc3339()])?;
-        Ok(payload)
+        Ok(response_budget::bound(payload, token_budget))
     }
 
     pub fn expand_context(&self, id: &str, around: &str, relation: &str) -> Result<Value> {
@@ -2511,15 +2572,18 @@ impl Service {
                     )
                 } else {
                     (
-                        semantic
-                            .iter()
-                            .map(serde_json::to_value)
-                            .collect::<serde_json::Result<Vec<_>>>()?,
+                        semantic.iter().map(semantic_location).collect::<Vec<_>>(),
                         "rust-analyzer",
                     )
                 }
             }
             "callers" | "references" => {
+                let semantic = self.semantic_locations(&nodes, "references");
+                if relation == "references" && !semantic.is_empty() {
+                    return Ok(
+                        json!({"symbol":symbol,"relation":relation,"definitions":definitions,"results":semantic.iter().take(limit).map(semantic_location).collect::<Vec<_>>(),"channel":"rust-analyzer","freshness":self.snapshot()}),
+                    );
+                }
                 let ids = nodes.iter().map(|node| node.id).collect::<Vec<_>>();
                 let wanted: &[&str] = if relation == "callers" {
                     &["CALLS_DIRECT"]
@@ -2980,6 +3044,20 @@ impl Service {
         diff: Option<&str>,
         run_checks: bool,
     ) -> Result<Value> {
+        let source = diff
+            .map(|text| DiffSource::Inline(text.to_owned()))
+            .unwrap_or(DiffSource::Pending);
+        self.validate_change_from_source(context_id, &source, run_checks)
+    }
+
+    /// Validate a locally resolved patch or Git comparison. Checks and static
+    /// analysis still run against the current worktree, never a checkout of HEAD.
+    pub fn validate_change_from_source(
+        &self,
+        context_id: &str,
+        source: &DiffSource,
+        run_checks: bool,
+    ) -> Result<Value> {
         let payload: String = self
             .db
             .query_row(
@@ -2990,14 +3068,8 @@ impl Service {
             .optional()?
             .context("unknown change context")?;
         let context: Value = serde_json::from_str(&payload)?;
-        // `git diff --` reports only unstaged work. An agent that staged its
-        // edits before validating used to get an empty diff and a clean-looking
-        // report; `HEAD` covers staged and unstaged changes alike.
-        let diff = diff
-            .map(str::to_string)
-            .or_else(|| command_text(&self.root, &["diff", "HEAD", "--"]))
-            .or_else(|| command_text(&self.root, &["diff", "--"]))
-            .unwrap_or_default();
+        let resolved = source.resolve(&self.root)?;
+        let diff = resolved.text;
         let changed_files = changed_files_in_diff(&diff);
         let architecture_baseline_truncated = context
             .pointer("/architecture_guard/summary/findings_truncated")
@@ -3052,25 +3124,26 @@ impl Service {
             .map(str::to_string)
             .collect();
         let unmodified: Vec<_> = expected.difference(&changed_files).cloned().collect();
-        let checks = if run_checks {
-            vec![
-                check(&self.root, &["fmt", "--check"]),
-                check(&self.root, &["check", "--all-targets"]),
-                check(
-                    &self.root,
-                    &["clippy", "--all-targets", "--", "-D", "warnings"],
-                ),
-                check(&self.root, &["test", "--all-targets"]),
-            ]
-        } else {
-            Vec::new()
-        };
+        self.execution.check()?;
+        let mut checks = Vec::new();
+        if run_checks {
+            for arguments in [
+                &["fmt", "--check"][..],
+                &["check", "--all-targets"][..],
+                &["clippy", "--all-targets", "--", "-D", "warnings"][..],
+                &["test", "--all-targets"][..],
+            ] {
+                self.execution.check()?;
+                checks.push(controlled_check(&self.root, arguments, &self.execution));
+                self.execution.check()?;
+            }
+        }
         let artifact_checks = if run_checks {
             changed_files
                 .iter()
                 .filter_map(|path| artifact_validator(Path::new(path)))
                 .map(|(program, arguments)| {
-                    run_optional_command_check(&self.root, program, &arguments)
+                    run_optional_command_check(&self.root, program, &arguments, &self.execution)
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -3100,9 +3173,17 @@ impl Service {
             })
             .filter(|symbol| diff.contains(symbol))
             .collect::<Vec<_>>();
+        self.execution.check()?;
         let blocking = self.blocking_obligation_status(context_id, run_checks)?;
+        let validation_status = validation_verdict(
+            run_checks,
+            &checks,
+            &artifact_checks,
+            &learned_checks,
+            &blocking,
+        );
         Ok(
-            json!({"context_id":context_id,"revision_before":context.get("revision"),"revision_after":self.revision(),"snapshot":self.snapshot(),"changed_files":changed_files,"expected_affected_files":expected,"unmodified_expected_callers":unmodified,"new_references":"Re-run change.prepare after signature changes to refresh static candidates.","architectural_violations":self.decision_conflicts(&diff)?,"architecture_delta":architecture_delta,"legacy_paths_touched":legacy_left,"unresolved_edges":context.get("unresolved_edges"),"recommended_tests":context.get("tests"),"recommended_commands":["cargo fmt --check","cargo check --all-targets","cargo clippy --all-targets -- -D warnings","cargo test","gtk4-builder-tool validate <changed.ui>","blueprint-compiler compile <changed.blp>","xmllint --noout <changed.xml>"],"validation_queue":validation_queue,"checks":checks,"artifact_checks":artifact_checks,"learned_checks":learned_checks,"blocking":blocking,"uncertainty":"Artifact validators and architecture detectors can identify current static evidence, but not runtime registration, generated-code drift, external-consumer compatibility, or deployment behavior."}),
+            json!({"context_id":context_id,"diff_scope":resolved.scope,"analysis_target":"current_worktree","revision_before":context.get("revision"),"revision_after":self.revision(),"snapshot":self.snapshot(),"changed_files":changed_files,"expected_affected_files":expected,"unmodified_expected_callers":unmodified,"new_references":"Re-run change.prepare after signature changes to refresh static candidates.","architectural_violations":self.decision_conflicts(&diff)?,"architecture_delta":architecture_delta,"legacy_paths_touched":legacy_left,"unresolved_edges":context.get("unresolved_edges"),"recommended_tests":context.get("tests"),"recommended_commands":["cargo fmt --check","cargo check --all-targets","cargo clippy --all-targets -- -D warnings","cargo test","gtk4-builder-tool validate <changed.ui>","blueprint-compiler compile <changed.blp>","xmllint --noout <changed.xml>"],"validation_queue":validation_queue,"checks":checks,"artifact_checks":artifact_checks,"learned_checks":learned_checks,"validation_status":validation_status,"blocking":blocking,"uncertainty":"Artifact validators and architecture detectors can identify current static evidence, but not runtime registration, generated-code drift, external-consumer compatibility, or deployment behavior."}),
         )
     }
 
@@ -3305,33 +3386,36 @@ impl Service {
                 relevant_sections.push(name);
             }
         }
-        Ok(json!({
-            "topic": topic,
-            "consulted": true,
-            "guidance_found": !relevant_sections.is_empty(),
-            "relevant_sections": relevant_sections,
-            "snapshot": self.snapshot(),
-            "decisions": decisions,
-            "steerings": steerings,
-            "learned_quality_constraints": learned_quality_constraints,
-            "governing_documents": governing_documents,
-            "known_work": known_work,
-            "lifecycle_risks": lifecycle_risks,
-            "runtime_contracts": runtime_contracts,
-            "next_steps": [
-                "Apply relevant human guidance before continuing.",
-                "If the request will modify repository files, call change.prepare before the first edit and change.validate after the edits.",
-                "Use repo.context when the consultation identifies a concept that needs deeper repository evidence."
-            ],
-            "authority": "Human decisions and steering govern. Indexed documents and relationships are freshness-labelled guidance; current source and runtime/compiler behavior remain authoritative.",
-            "context_budget": {
-                "tokens": token_budget,
-                "estimated_tokens": used.div_ceil(4),
-                "truncated": truncated,
-                "omitted": omitted,
-                "note": "Sections are filled in authority order until the budget is spent. Omitted counts name matching guidance that did not fit; raise budget or call repo.constraints to read the unbudgeted set.",
-            },
-        }))
+        Ok(response_budget::bound(
+            json!({
+                "topic": topic,
+                "consulted": true,
+                "guidance_found": !relevant_sections.is_empty(),
+                "relevant_sections": relevant_sections,
+                "snapshot": self.snapshot(),
+                "decisions": decisions,
+                "steerings": steerings,
+                "learned_quality_constraints": learned_quality_constraints,
+                "governing_documents": governing_documents,
+                "known_work": known_work,
+                "lifecycle_risks": lifecycle_risks,
+                "runtime_contracts": runtime_contracts,
+                "next_steps": [
+                    "Apply relevant human guidance before continuing.",
+                    "If the request will modify repository files, call change.prepare before the first edit and change.validate after the edits.",
+                    "Use repo.context when the consultation identifies a concept that needs deeper repository evidence."
+                ],
+                "authority": "Human decisions and steering govern. Indexed documents and relationships are freshness-labelled guidance; current source and runtime/compiler behavior remain authoritative.",
+                "context_budget": {
+                    "tokens": token_budget,
+                    "estimated_tokens": used.div_ceil(4),
+                    "truncated": truncated,
+                    "omitted": omitted,
+                    "note": "Sections are filled in authority order until the budget is spent. Omitted counts name matching guidance that did not fit; raise budget or call repo.constraints to read the unbudgeted set.",
+                },
+            }),
+            token_budget,
+        ))
     }
 
     fn governing_decisions(&self, topic: &str, limit: usize) -> Result<Vec<Value>> {
@@ -3491,6 +3575,9 @@ impl Service {
     }
 
     pub fn work_list(&self, query: Option<&str>, limit: usize) -> Result<Value> {
+        if let Some(work) = observatory::relevant_work(&self.root, query, limit)? {
+            return Ok(work);
+        }
         let query = query.unwrap_or("").to_lowercase();
         let mut statement = self.db.prepare("SELECT id,title,status,priority,kind,scope_json,evidence_json,depends_json,blocked_json,acceptance_json,verification_json,discovered_from,provenance,confidence,last_validated_snapshot,updated_at FROM work_items WHERE (lower(title) LIKE ?1 OR lower(scope_json) LIKE ?1 OR ?1='%%') AND (?3=1 OR provenance!='SourceDoc' OR status!='proposed' OR confidence>=0.5) ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, updated_at DESC LIMIT ?2")?;
         let items = statement
@@ -3760,7 +3847,8 @@ impl Service {
     }
 
     pub fn index_status(&self) -> Value {
-        json!({"semantic_engine":"rust-analyzer LSP companion (opt-in, on-demand, persisted by semantic snapshot)","rust_analyzer_enabled":self.ra_enabled,"rust_analyzer_running":self.ra.is_some(),"rust_analyzer_start_attempted":self.ra_start_attempted,"rust_analyzer_program":self.ra_program.to_string_lossy(),"rust_analyzer_error":self.ra_start_error,"filesystem_watcher":self.watcher.is_some(),"fallback":"AST Syntax index with ambiguity suppression; unresolved candidates are reported separately","embedding_model":EMBEDDING_MODEL,"embedding_dimensions":EMBEDDING_DIMENSIONS,"embedding_card_version":SYMBOL_CARD_VERSION,"embedding":self.embedding_index_status(),"retrieval":"BM25 + embedding + typed graph RRF","store":"SQLite FTS5 + graph + vectors"})
+        let backend = self.ra.lock().unwrap_or_else(|error| error.into_inner());
+        json!({"semantic_engine":"rust-analyzer LSP companion (opt-in, on-demand, persisted by semantic snapshot)","rust_analyzer_enabled":self.ra_enabled,"rust_analyzer_running":backend.client.is_some(),"rust_analyzer_start_attempted":backend.start_attempted,"rust_analyzer_program":self.ra_program.to_string_lossy(),"rust_analyzer_error":backend.start_error,"filesystem_watcher":self.watcher.is_some(),"fallback":"AST Syntax index with ambiguity suppression; unresolved candidates are reported separately","embedding_model":EMBEDDING_MODEL,"embedding_dimensions":EMBEDDING_DIMENSIONS,"embedding_card_version":SYMBOL_CARD_VERSION,"embedding":self.embedding_index_status(),"retrieval":"BM25 + embedding + typed graph RRF","store":"SQLite FTS5 + graph + vectors"})
     }
 
     fn embedding_index_status(&self) -> Value {
@@ -3929,10 +4017,20 @@ impl Service {
         let Some(snapshot) = self.active_semantic_snapshot_id() else {
             return Vec::new();
         };
+        let snapshot_current = self.indexed_revision().as_ref() == Some(&self.revision())
+            && self.semantic_snapshot(&index_inputs(&self.root)).id == snapshot;
         let mut slices = Vec::new();
         for target in targets.iter().take(8) {
-            if let Some(cached) = self.cached_semantic_slices(target, relation, &snapshot) {
+            if snapshot_current
+                && let Some(cached) = self.cached_semantic_slices(target, relation, &snapshot)
+            {
                 slices.extend(cached);
+                continue;
+            }
+            if self
+                .source_slice(target, "semantic target", relation)
+                .is_ok_and(|slice| slice.stale)
+            {
                 continue;
             }
             let path = self.root.join(&target.file);
@@ -3948,10 +4046,14 @@ impl Service {
             let character = line[..byte].encode_utf16().count();
             let uri = format!("file://{}", path.display());
             let locations = {
-                let Some(client) = &self.ra else { continue };
-                let Ok(mut client) = client.lock() else {
+                self.start_rust_analyzer_if_enabled();
+                let Ok(mut backend) = self.ra.lock() else {
                     continue;
                 };
+                let Some(client) = backend.client.as_mut() else {
+                    continue;
+                };
+                client.did_change(&uri, &text);
                 if relation == "implementations" {
                     client.implementations(&uri, target.start_line - 1, character)
                 } else {
@@ -3985,7 +4087,8 @@ impl Service {
                 else {
                     continue;
                 };
-                if let Some(source) = self.node_at_location(&path, start as usize)
+                if snapshot_current
+                    && let Some(source) = self.node_at_location(&path, start as usize)
                     && source.id != target.id
                 {
                     let kind = if relation == "implementations" {
@@ -4014,10 +4117,12 @@ impl Service {
                     slices.push(slice);
                 }
             }
-            let _ = self.db.execute(
+            if snapshot_current {
+                let _ = self.db.execute(
                 "INSERT OR REPLACE INTO semantic_queries(node_id,relation,semantic_snapshot,result_count,queried_at) VALUES (?1,?2,?3,?4,?5)",
                 params![target.id,relation,snapshot,persisted as i64,Utc::now().to_rfc3339()],
             );
+            }
         }
         slices
     }
@@ -4056,6 +4161,13 @@ impl Service {
                 .filter_map(|node| {
                     self.source_slice(&node, "cached rust-analyzer result", relation)
                         .ok()
+                        .map(|mut slice| {
+                            if !slice.stale {
+                                slice.provenance = "RustAnalyzerCached".into();
+                                slice.confidence = 1.0;
+                            }
+                            slice
+                        })
                 })
                 .collect(),
         )
@@ -4124,7 +4236,7 @@ impl Service {
                     symbol: node.canonical_name.clone(),
                     file: node.file.clone(),
                     range: [0, 0],
-                    content_hash: node.content_hash.clone(),
+                    content_hash: String::new(),
                     reason: format!("{reason}; indexed source is unavailable in the live worktree"),
                     semantic_relationship: relation.into(),
                     provenance: "StaticIndexStale".into(),
@@ -4139,8 +4251,11 @@ impl Service {
         let indexed_start = node.start_line.saturating_sub(1);
         let end = node.end_line.min(lines.len());
         let start = indexed_start.min(end);
-        let stale = indexed_start >= lines.len() || node.end_line > lines.len();
         let mut source = lines[start..end].join("\n");
+        let content_hash = format!("b3:{}", blake3::hash(source.as_bytes()).to_hex());
+        let stale = indexed_start >= lines.len()
+            || node.end_line > lines.len()
+            || content_hash != node.content_hash;
         if source.len() > MAX_SLICE_BYTES {
             source = trim_text(&source, MAX_SLICE_BYTES)
         }
@@ -4152,9 +4267,9 @@ impl Service {
             } else {
                 [start + 1, end]
             },
-            content_hash: node.content_hash.clone(),
+            content_hash,
             reason: if stale {
-                format!("{reason}; indexed line range exceeds the live file")
+                format!("{reason}; indexed range or content differs from the live file")
             } else {
                 reason.into()
             },
@@ -4444,6 +4559,20 @@ fn changed_files_in_diff(diff: &str) -> BTreeSet<String> {
         if line.starts_with("diff --git ") || line.starts_with("diff --cc ") {
             in_hunk = false;
             previous_old_path = None;
+            // Binary patches, empty files, and mode-only changes may have no
+            // ---/+++ headers. With unchanged names, the two Git header paths
+            // have equal byte lengths, including quoting and embedded spaces.
+            // Renames and copies use their explicit directives below.
+            if let Some(paths) = line.strip_prefix("diff --git ") {
+                let middle = paths.len() / 2;
+                if paths.as_bytes().get(middle) == Some(&b' ')
+                    && let (Some(old), Some(new)) = (paths.get(..middle), paths.get(middle + 1..))
+                    && let (Some(old), Some(new)) = (diff_path(old), diff_path(new))
+                    && old == new
+                {
+                    files.insert(old);
+                }
+            }
             continue;
         }
         if line.starts_with("@@") {
@@ -4453,9 +4582,15 @@ fn changed_files_in_diff(diff: &str) -> BTreeSet<String> {
         if in_hunk {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("rename from ") {
+        if let Some(rest) = line
+            .strip_prefix("rename from ")
+            .or_else(|| line.strip_prefix("copy from "))
+        {
             files.extend(diff_path(rest));
-        } else if let Some(rest) = line.strip_prefix("rename to ") {
+        } else if let Some(rest) = line
+            .strip_prefix("rename to ")
+            .or_else(|| line.strip_prefix("copy to "))
+        {
             files.extend(diff_path(rest));
         } else if let Some(rest) = line.strip_prefix("--- ") {
             previous_old_path = diff_path(rest);
@@ -5595,17 +5730,28 @@ fn decision_markdown(id: &str, d: &RecordDecision, supersedes: &[String]) -> Str
 /// `cargo test --all-targets` on a real workspace dumped its whole output into
 /// the MCP response and the compiler-error workflow got text where it needed
 /// file/line diagnostics.
+#[cfg(test)]
 fn check(root: &Path, args: &[&str]) -> Value {
+    controlled_check(root, args, &execution::ExecutionControl::default())
+}
+
+fn controlled_check(root: &Path, args: &[&str], control: &execution::ExecutionControl) -> Value {
     let command = format!("cargo {}", args.join(" "));
     // `cargo fmt` does not understand `--message-format`, and the JSON stream is
     // only useful for the compiler-driven commands.
     let structured = matches!(args.first(), Some(&"check" | &"clippy" | &"test"));
     let mut invocation = Command::new("cargo");
-    invocation.args(args).current_dir(root);
+    invocation.current_dir(root);
+    let separator = args
+        .iter()
+        .position(|argument| *argument == "--")
+        .unwrap_or(args.len());
+    invocation.args(&args[..separator]);
     if structured {
         invocation.arg("--message-format=json-diagnostic-rendered-ansi");
     }
-    match invocation.output() {
+    invocation.args(&args[separator..]);
+    match control.output(&mut invocation) {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5618,14 +5764,50 @@ fn check(root: &Path, args: &[&str]) -> Value {
                 "command": command,
                 "success": output.status.success(),
                 "diagnostics": diagnostics,
-                "truncated_output": trim_text(&stderr, MAX_CHECK_OUTPUT_BYTES),
-                "output_truncated": stderr.len() > MAX_CHECK_OUTPUT_BYTES,
+                "truncated_output": trim_text(&format!("{stderr}\n{stdout}"), MAX_CHECK_OUTPUT_BYTES),
+                "output_truncated": stderr.len() + stdout.len() > MAX_CHECK_OUTPUT_BYTES,
             })
         }
         Err(error) => {
             json!({"command":command,"success":false,"error":error.to_string()})
         }
     }
+}
+
+fn semantic_location(slice: &SourceSlice) -> Value {
+    json!({"symbol":slice.symbol,"file":slice.file,"line":slice.range[0],"end_line":slice.range[1],"location":format!("{}:{}",slice.file,slice.range[0]),"provenance":slice.provenance,"confidence":slice.confidence,"stale":slice.stale})
+}
+
+fn validation_verdict(
+    run_checks: bool,
+    checks: &[Value],
+    artifacts: &[Value],
+    learned: &[Value],
+    blocking: &Value,
+) -> Value {
+    let failed = checks
+        .iter()
+        .chain(artifacts)
+        .filter(|check| check["success"] == false)
+        .count()
+        + learned
+            .iter()
+            .filter(|check| check["status"] == "failed")
+            .count();
+    let unavailable = artifacts
+        .iter()
+        .filter(|check| check["skipped"] == true)
+        .count()
+        + learned
+            .iter()
+            .filter(|check| {
+                matches!(
+                    check["status"].as_str(),
+                    Some("unavailable" | "manual_required" | "queued" | "skipped")
+                )
+            })
+            .count();
+    json!({"verdict": if !run_checks { "not_run" } else if failed > 0 { "failed" } else if unavailable > 0 || blocking["blocked"] == true { "incomplete" } else { "passed" }, "failed_checks":failed,"unavailable_checks":unavailable,"checks_requested":run_checks,"note":"Task completion means the report was produced. This verdict describes executed checks; human-approved blocking obligations are reported separately."})
 }
 
 /// Extracts bounded `file:line` diagnostics from a cargo JSON message stream.
@@ -5682,7 +5864,12 @@ fn artifact_validator(path: &Path) -> Option<(&'static str, Vec<OsString>)> {
     ))
 }
 
-fn run_optional_command_check(root: &Path, program: &str, args: &[OsString]) -> Value {
+fn run_optional_command_check(
+    root: &Path,
+    program: &str,
+    args: &[OsString],
+    control: &execution::ExecutionControl,
+) -> Value {
     let command = std::iter::once(program.to_owned())
         .chain(
             args.iter()
@@ -5698,7 +5885,7 @@ fn run_optional_command_check(root: &Path, program: &str, args: &[OsString]) -> 
             "reason": format!("{program} is not available on PATH"),
         });
     }
-    match Command::new(program).args(args).current_dir(root).output() {
+    match control.output(Command::new(program).args(args).current_dir(root)) {
         Ok(output) => json!({
             "command": command,
             "success": output.status.success(),
@@ -5806,6 +5993,7 @@ mod tests {
         service.ra_enabled = true;
         service.ra_program = PathBuf::from("/definitely/missing/rust-analyzer");
         service.start_rust_analyzer_if_enabled();
+        service.start_rust_analyzer_if_enabled();
         let status = service.index_status();
         assert_eq!(status["rust_analyzer_start_attempted"], true);
         assert_eq!(status["rust_analyzer_running"], false);
@@ -5819,6 +6007,44 @@ mod tests {
             rust_analyzer_program(Some(OsString::from("/custom/rust-analyzer"))),
             PathBuf::from("/custom/rust-analyzer")
         );
+    }
+
+    #[test]
+    fn audit_same_length_source_edit_is_stale() {
+        let d = fixture();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        let node = service.search_nodes(&terms("Store"), 1).unwrap().remove(0);
+        let path = d.path().join(&node.file);
+        fs::write(
+            &path,
+            fs::read_to_string(&path).unwrap().replace("Store", "Other"),
+        )
+        .unwrap();
+        let slice = service.source_slice(&node, "audit", "DEFINES").unwrap();
+        assert!(slice.stale);
+        assert_ne!(slice.content_hash, node.content_hash);
+    }
+
+    #[test]
+    fn audit_clippy_arguments_work_for_clean_crate() {
+        let d = tempdir().unwrap();
+        fs::create_dir(d.path().join("src")).unwrap();
+        fs::write(
+            d.path().join("Cargo.toml"),
+            "[package]\nname='clean_audit'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("src/lib.rs"),
+            "pub fn answer() -> u32 { 42 }\n",
+        )
+        .unwrap();
+        let result = check(
+            d.path(),
+            &["clippy", "--all-targets", "--", "-D", "warnings"],
+        );
+        assert_eq!(result["success"], true, "{result}");
     }
 
     #[test]
@@ -6110,6 +6336,221 @@ mod tests {
         let snapshot = &service.status().unwrap()["snapshot"];
         assert!(snapshot["revision"].is_object());
         assert!(snapshot["indexing_timestamp"].is_string());
+    }
+
+    #[test]
+    fn validation_git_comparison_covers_committed_and_pending_changes() {
+        let d = git_fixture();
+        fs::write(d.path().join("deleted.txt"), "old\n").unwrap();
+        fs::write(d.path().join("old-name.txt"), "rename me\n").unwrap();
+        git(d.path(), &["add", "."]);
+        git(d.path(), &["commit", "-qm", "base"]);
+        let base = command_text(d.path(), &["rev-parse", "HEAD"]).unwrap();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        let context = service
+            .prepare_change("Update files", &[], 1, Some(1_000))
+            .unwrap();
+        let context_id = context["context_id"].as_str().unwrap();
+
+        fs::write(d.path().join("committed.txt"), "committed\n").unwrap();
+        fs::remove_file(d.path().join("deleted.txt")).unwrap();
+        fs::rename(d.path().join("old-name.txt"), d.path().join("new-name.txt")).unwrap();
+        git(
+            d.path(),
+            &[
+                "add",
+                "committed.txt",
+                "deleted.txt",
+                "old-name.txt",
+                "new-name.txt",
+            ],
+        );
+        git(d.path(), &["commit", "-qm", "committed changes"]);
+        let head = command_text(d.path(), &["rev-parse", "HEAD"]).unwrap();
+        fs::write(d.path().join("staged.txt"), "staged\n").unwrap();
+        git(d.path(), &["add", "staged.txt"]);
+        fs::write(d.path().join("src/lib.rs"), "pub struct Pending;\n").unwrap();
+        fs::write(d.path().join("untracked.txt"), "excluded\n").unwrap();
+        // Local validation must not invoke configured external diff programs.
+        git(
+            d.path(),
+            &["config", "diff.external", "nonexistent-diff-program"],
+        );
+        let committed = service
+            .validate_change_from_source(
+                context_id,
+                &DiffSource::GitComparison {
+                    base_ref: base.clone(),
+                    target: DiffTarget::Head,
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            committed["changed_files"],
+            json!([
+                "committed.txt",
+                "deleted.txt",
+                "new-name.txt",
+                "old-name.txt"
+            ])
+        );
+        assert_eq!(committed["diff_scope"]["base_commit"], base);
+        assert_eq!(committed["diff_scope"]["target_commit"], head);
+        assert_eq!(committed["analysis_target"], "current_worktree");
+        let combined = service
+            .validate_change_from_source(
+                context_id,
+                &DiffSource::GitComparison {
+                    base_ref: base,
+                    target: DiffTarget::Worktree,
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            combined["changed_files"],
+            json!([
+                "committed.txt",
+                "deleted.txt",
+                "new-name.txt",
+                "old-name.txt",
+                "src/lib.rs",
+                "staged.txt"
+            ])
+        );
+        assert_eq!(combined["diff_scope"]["head_commit"], head);
+        assert!(combined["diff_scope"]["target_commit"].is_null());
+        let pending = service.validate_change(context_id, None, false).unwrap();
+        assert_eq!(
+            pending["changed_files"],
+            json!(["src/lib.rs", "staged.txt"])
+        );
+        assert_eq!(pending["diff_scope"]["source"], "pending");
+    }
+
+    #[test]
+    fn validation_large_local_patch_matches_git_and_inline_inputs() {
+        let d = git_fixture();
+        fs::write(
+            d.path().join("large.txt"),
+            "a long repeated line of obsolete repository content to remove completely\n"
+                .repeat(16_000),
+        )
+        .unwrap();
+        git(d.path(), &["add", "large.txt"]);
+        git(d.path(), &["commit", "-qm", "large base"]);
+        let base = command_text(d.path(), &["rev-parse", "HEAD"]).unwrap();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        let context = service
+            .prepare_change("Remove obsolete content", &[], 1, Some(1_000))
+            .unwrap();
+        let context_id = context["context_id"].as_str().unwrap();
+        fs::remove_file(d.path().join("large.txt")).unwrap();
+        let source = DiffSource::GitComparison {
+            base_ref: base,
+            target: DiffTarget::Worktree,
+        };
+        let resolved = source.resolve(d.path()).unwrap();
+        assert!(resolved.text.len() > 890_000);
+        fs::write(d.path().join("validation.patch"), &resolved.text).unwrap();
+        let git_report = service
+            .validate_change_from_source(context_id, &source, false)
+            .unwrap();
+        let file_report = service
+            .validate_change_from_source(
+                context_id,
+                &DiffSource::PatchFile("validation.patch".into()),
+                false,
+            )
+            .unwrap();
+        let inline_report = service
+            .validate_change(context_id, Some(&resolved.text), false)
+            .unwrap();
+        for report in [&git_report, &file_report, &inline_report] {
+            assert_eq!(report["changed_files"], json!(["large.txt"]));
+            assert_eq!(report["diff_scope"]["bytes"], resolved.text.len());
+            assert_eq!(report["diff_scope"]["hash"], resolved.scope["hash"]);
+        }
+        assert_eq!(file_report["diff_scope"]["source"], "patch_file");
+        assert_eq!(inline_report["diff_scope"]["source"], "inline");
+        let absolute = DiffSource::PatchFile(d.path().join("validation.patch"))
+            .resolve(d.path())
+            .unwrap();
+        assert_eq!(absolute.scope["hash"], resolved.scope["hash"]);
+    }
+
+    #[test]
+    fn validation_git_scope_includes_binary_empty_and_mode_only_changes() {
+        let d = git_fixture();
+        fs::write(d.path().join("image with spaces.bin"), [0, 1, 2, 3]).unwrap();
+        fs::write(d.path().join("mode.txt"), "mode\n").unwrap();
+        git(d.path(), &["add", "image with spaces.bin", "mode.txt"]);
+        git(d.path(), &["commit", "-qm", "artifact base"]);
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        let context = service
+            .prepare_change("Update artifacts", &[], 1, Some(1_000))
+            .unwrap();
+        fs::write(d.path().join("image with spaces.bin"), [0, 4, 5, 6]).unwrap();
+        fs::write(d.path().join("empty.txt"), "").unwrap();
+        git(d.path(), &["add", "image with spaces.bin", "empty.txt"]);
+        git(d.path(), &["update-index", "--chmod=+x", "mode.txt"]);
+        git(d.path(), &["commit", "-qm", "artifact changes"]);
+        let source = DiffSource::GitComparison {
+            base_ref: "HEAD~1".into(),
+            target: DiffTarget::Head,
+        };
+        let resolved = source.resolve(d.path()).unwrap();
+        assert!(resolved.text.contains("GIT binary patch"));
+        let report = service
+            .validate_change_from_source(context["context_id"].as_str().unwrap(), &source, false)
+            .unwrap();
+        assert_eq!(
+            report["changed_files"],
+            json!(["empty.txt", "image with spaces.bin", "mode.txt"])
+        );
+    }
+
+    #[test]
+    fn validation_diff_errors_never_become_empty_successes() {
+        let d = git_fixture();
+        for reference in ["missing-ref", "--output=/tmp/unwanted", "HEAD..HEAD", ""] {
+            assert!(
+                DiffSource::GitComparison {
+                    base_ref: reference.into(),
+                    target: DiffTarget::Head
+                }
+                .resolve(d.path())
+                .is_err()
+            );
+        }
+        assert!(
+            DiffSource::PatchFile("missing.patch".into())
+                .resolve(d.path())
+                .is_err()
+        );
+        assert!(
+            DiffSource::PatchFile("src".into())
+                .resolve(d.path())
+                .is_err()
+        );
+        fs::write(d.path().join("invalid.patch"), [0xff]).unwrap();
+        assert!(
+            DiffSource::PatchFile("invalid.patch".into())
+                .resolve(d.path())
+                .is_err()
+        );
+        let no_git = fixture();
+        assert!(DiffSource::Pending.resolve(no_git.path()).is_err());
+        git(no_git.path(), &["init", "-q"]);
+        let unborn = DiffSource::Pending.resolve(no_git.path()).unwrap();
+        assert_eq!(unborn.scope["comparison"], "index_to_worktree");
+        assert!(unborn.scope["base_commit"].is_null());
+        let explicit_empty = DiffSource::Inline(String::new()).resolve(d.path()).unwrap();
+        assert_eq!(explicit_empty.scope["bytes"], 0);
     }
 
     #[test]
@@ -6699,7 +7140,7 @@ mod tests {
         let cached = service.semantic_locations(&[target], "references");
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].symbol, source.canonical_name);
-        assert_eq!(cached[0].provenance, "StaticIndex");
+        assert_eq!(cached[0].provenance, "RustAnalyzerCached");
     }
 
     #[test]

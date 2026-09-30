@@ -880,8 +880,10 @@ impl Service {
             .into_iter()
             .filter(|item| item["status"] == "queued")
         {
+            self.execution.check()?;
             let recipe: ValidationRecipe = serde_json::from_value(obligation["recipe"].clone())?;
             let (status, evidence) = self.run_validation_recipe(&recipe);
+            self.execution.check()?;
             let result = self.quality_validation_record(ValidationOutcomeInput {
                 obligation_id: obligation["id"].as_str().unwrap_or_default().to_owned(),
                 status,
@@ -1490,7 +1492,7 @@ impl Service {
                 process.env(key, value);
             }
         }
-        match process.output() {
+        match self.execution.output(&mut process) {
             Ok(output) => {
                 let mut evidence = Vec::new();
                 let stdout = trim_text(&String::from_utf8_lossy(&output.stdout), 4_000);

@@ -12,6 +12,10 @@ Crusty separates live navigation, rebuildable repository intelligence, and durab
 
 `index.status` reports the snapshot boundary plus the latest refresh task and publisher lock. `index.refresh` is the only public refresh entry point. It returns a task ID immediately; `task.list` recovers bounded task summaries after an interrupted session and `task.get` exposes one task's queued, running, completed, or failed state and full result. Readers keep using the previous generation while a single writer builds and publishes the replacement.
 
+Indexed source ranges are read from the live worktree and hash-checked against indexed content. A same-length edit is still stale; returned hashes describe the current range, and missing live source has no current hash. Stale ranges have reduced confidence and explicit provenance.
+
+The MCP server owns a persistent, opt-in rust-analyzer companion. Semantic requests start it lazily and send current document contents. Refresh does not start the companion. Cached semantic evidence is reused only when source and semantic-profile identities still match.
+
 Cargo/toolchain/profile inputs or an indexer-version change force a full rebuild. Ordinary source changes may use incremental invalidation. The semantic snapshot includes the source/Cargo digest, `Cargo.lock`, target triple, feature profile, build-environment fingerprint, and rust-analyzer version.
 
 ## Storage
@@ -21,10 +25,17 @@ Repository-local state lives under the ignored `.rust-repo-intelligence/` direct
 - `index.sqlite3` contains rebuildable source, Cargo, Git, document, graph, search, embedding, and prepared-change projections, the newest 20 snapshot-scoped architecture audits, plus the retained problem/quality/validation engine.
 - `memory.sqlite3` contains research runs, evidence, findings, task history, finding review decisions, the single human-owned work store, and searchable summaries of retained legacy guidance.
 - `index.lock` is the filesystem publisher lease used to reject concurrent writers.
+- `sessions/*.lock` identifies live server owners of tasks and research runs. Startup recovers only abandoned owners, while records from older versions without ownership are treated as interrupted.
+
+Consultation, context, explanations, and preparation join current work from `memory.sqlite3` read-only, including human ownership and readiness. Long intents match work by terms; mutable work state is never copied into the derived index.
 
 Both databases use SQLite WAL mode. Index publication is transactional, while durable-memory operations use short connections and a busy timeout. Indexing never modifies repository source files.
 
 Codex's own session history remains owned by Codex and is not copied into either Crusty database. `memory.search` reads it on demand, uses session metadata to restrict results to the exact active repository, includes side-session records represented in the thread-history projection, excludes assistant/tool/injected-context content, and returns bounded matching user prompts with provenance. This is recovery evidence, not a new canonical roadmap.
+
+Response budgets cover the complete logical JSON payload, including freshness and metadata, at an approximate four UTF-8 bytes per token. Governance takes priority and omitted sections are counted. `serialized_bytes` and `estimated_tokens` describe that payload, excluding MCP framing and duplicate text/structured representations. Prepared contexts are persisted in full before their bounded briefing is returned; `change.get` retrieves the complete context.
+
+Validation reports separate task completion from check outcomes through `validation_status.verdict`. Executed failures produce `failed`; unavailable checks or unresolved blocking obligations produce `incomplete`; checks not requested produce `not_run`. Cancellation and timeout are acknowledged after validation subprocesses have been terminated and reaped. Unix process groups include Cargo's descendants; other platforms terminate the direct child. Atomic index transactions finish at a safe boundary.
 
 ## Hybrid retrieval
 
@@ -41,6 +52,8 @@ GTK `.ui`, Blueprint, CSS, XML/D-Bus, desktop/service, Cargo, and common configu
 `change.prepare` captures a freshness-labelled impact briefing before edits. It returns a task ID; after polling `task.get`, the completed result contains the context ID, likely change surface, source slices, semantic/static provenance, governing evidence, ambiguity, validation queue, and current architecture-finding baseline. `change.get` recovers that prepared evidence by context ID, and `repo.matrix` supplies the bounded Cargo feature/profile plan referenced by its verification guidance.
 
 `change.validate` compares a diff with that prepared context and optionally runs checks. It is also task-backed and never refreshes first. Its architecture delta distinguishes new, worsened, resolved, and unchanged baseline findings and considers only files touched by the diff. Inferred architecture results remain advisory; only a separately human-approved quality constraint may block. When checks are requested, locally available Rust and artifact validators report explicit pass, failure, or unavailable evidence. Runtime registration, deployment behavior, and external compatibility remain separate obligations.
+
+Choose one validation input: inline `git_diff`, a local UTF-8 `diff_path` (absolute or repository-relative), or `base_ref` with optional `target` (`HEAD` or `worktree`, default `worktree`). Git comparisons resolve commits locally and compare the base directly, without an implicit merge-base. `HEAD` scopes the patch to committed changes; `worktree` also includes staged and unstaged tracked changes. Omitting all inputs keeps pending tracked changes against HEAD (against the index in an unborn repository). Git comparisons exclude untracked files. Conflicting inputs, invalid refs, and unreadable patches fail explicitly. The report records `diff_scope` with resolved commits, patch bytes, and a BLAKE3 hash alongside `changed_files`; `analysis_target` remains `current_worktree`, because analysis and checks do not switch checkouts. A prepared baseline must still represent the pre-change source to provide a meaningful architecture delta; changing the diff input cannot reconstruct a missing baseline.
 
 The minimal public quality loop exposes `problem.list/get/update`, `quality.list/get/review`, and `validation.queue/record`. Problem evidence can be completed or corrected, but activating a learned constraint requires an identified human reviewer and explicit confirmation. Constraint review history and validation outcomes are durable and inspectable. Historical constraints never create human work or expand implementation scope by themselves.
 

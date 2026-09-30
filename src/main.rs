@@ -496,7 +496,7 @@ impl CrustyServer {
 
     #[tool(
         name = "change.validate",
-        description = "Start diff validation against prepared evidence. Returns a task id and never waits for index refresh."
+        description = "Start diff validation against prepared evidence using one of git_diff, local diff_path, or base_ref with target HEAD/worktree (default worktree). With no source, validate pending tracked edits against HEAD. Returns a task id and never waits for index refresh."
     )]
     async fn change_validate(
         &self,
@@ -1054,6 +1054,20 @@ mod tests {
         assert!(required("repo.consult").contains(&"topic".to_owned()));
         assert!(required("symbol.relations").contains(&"symbol".to_owned()));
         assert!(required("change.validate").contains(&"context_id".to_owned()));
+        let validation_schema = &tools
+            .iter()
+            .find(|tool| tool.name == "change.validate")
+            .unwrap()
+            .input_schema;
+        let properties = validation_schema["properties"].as_object().unwrap();
+        for name in ["git_diff", "diff_path", "base_ref", "target"] {
+            assert!(
+                properties.contains_key(name),
+                "missing validation input {name}"
+            );
+            assert!(!required("change.validate").contains(&name.to_owned()));
+            assert!(properties[name]["description"].is_string());
+        }
         assert!(required("audit.finding.propose").contains(&"report_id".to_owned()));
         assert!(required("audit.finding.propose").contains(&"finding_id".to_owned()));
         assert!(required("work.update").contains(&"work_id".to_owned()));

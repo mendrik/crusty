@@ -5,11 +5,12 @@
 //! live in a database that is independent from the rebuildable index.
 
 use crate::{
-    DECISION_STATUSES, QualityScope, RecordDecision, RecordSteering, RetireDecision, Service,
-    ValidationOutcomeInput,
+    DECISION_STATUSES, DiffSource, DiffTarget, QualityScope, RecordDecision, RecordSteering,
+    RetireDecision, Service, ValidationOutcomeInput,
 };
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{TimeZone, Utc};
+use fs2::FileExt;
 use rand::random;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use schemars::JsonSchema;
@@ -27,7 +28,69 @@ use tokio::task;
 use walkdir::WalkDir;
 
 const STATE_DIRECTORY: &str = ".rust-repo-intelligence";
-const MEMORY_SCHEMA_VERSION: &str = "3";
+
+struct SessionLease {
+    id: String,
+    lock: fs::File,
+    path: PathBuf,
+}
+
+impl SessionLease {
+    fn acquire(state: &Path) -> Result<Self> {
+        let directory = state.join("sessions");
+        fs::create_dir_all(&directory)?;
+        let id = new_id("server");
+        let path = directory.join(format!("{id}.lock"));
+        let lock = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        FileExt::try_lock_exclusive(&lock)?;
+        Ok(Self { id, lock, path })
+    }
+}
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.lock);
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Join live project memory without opening another server or copying it into
+/// the rebuildable index. Long intents are matched by terms, not one substring.
+pub(crate) fn relevant_work(
+    root: &Path,
+    query: Option<&str>,
+    limit: usize,
+) -> Result<Option<Value>> {
+    let path = root.join(STATE_DIRECTORY).join("memory.sqlite3");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    db.busy_timeout(std::time::Duration::from_secs(2))?;
+    let query = query.unwrap_or("");
+    let mut statement = db.prepare("SELECT id,title,status,priority,kind,scope_json,evidence_json,depends_json,blocked_json,acceptance_json,verification_json,discovered_from,provenance,confidence,last_validated_snapshot,source_finding_id,human_owned,updated_at FROM work_items ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, updated_at DESC")?;
+    let mut matches = Vec::new();
+    for row in statement.query_map([], work_row)? {
+        let mut item = row?;
+        let text = format!("{} {} {}", item["title"], item["scope"], item["id"]);
+        if search_score(&text, query).is_none() {
+            continue;
+        }
+        decorate_work_readiness(&db, &mut item)?;
+        matches.push(item);
+        if matches.len() >= limit.clamp(1, 200) {
+            break;
+        }
+    }
+    Ok(Some(
+        json!({"query":query,"items":matches,"authority":"live human-owned project memory","source":"memory.sqlite3"}),
+    ))
+}
+const MEMORY_SCHEMA_VERSION: &str = "4";
 
 const MEMORY_SCHEMA: &str = r#"
 PRAGMA journal_mode=WAL;
@@ -294,9 +357,49 @@ pub struct QualityMergeRequest {
 #[serde(deny_unknown_fields)]
 pub struct ValidateRequest {
     pub context_id: String,
+    /// Inline patch. Mutually exclusive with diff_path and base_ref.
     pub git_diff: Option<String>,
+    /// Local UTF-8 patch file, absolute or relative to the repository root.
+    /// Mutually exclusive with git_diff and base_ref.
+    pub diff_path: Option<PathBuf>,
+    /// Commit/ref to compare directly against target; no implicit merge-base.
+    /// Mutually exclusive with git_diff and diff_path.
+    pub base_ref: Option<String>,
+    /// Requires base_ref. Defaults to worktree (committed plus pending tracked
+    /// edits); HEAD includes only committed changes. Untracked files are excluded.
+    pub target: Option<DiffTarget>,
     #[serde(default)]
     pub run_checks: bool,
+}
+
+impl ValidateRequest {
+    fn diff_source(&self) -> Result<DiffSource> {
+        let source_count = usize::from(self.git_diff.is_some())
+            + usize::from(self.diff_path.is_some())
+            + usize::from(self.base_ref.is_some());
+        ensure!(
+            source_count <= 1,
+            "git_diff, diff_path, and base_ref are mutually exclusive"
+        );
+        ensure!(
+            self.target.is_none() || self.base_ref.is_some(),
+            "target requires base_ref"
+        );
+        if let Some(text) = &self.git_diff {
+            Ok(DiffSource::Inline(text.clone()))
+        } else if let Some(path) = &self.diff_path {
+            ensure!(!path.as_os_str().is_empty(), "diff_path must not be empty");
+            Ok(DiffSource::PatchFile(path.clone()))
+        } else if let Some(base_ref) = &self.base_ref {
+            ensure!(!base_ref.trim().is_empty(), "base_ref must not be empty");
+            Ok(DiffSource::GitComparison {
+                base_ref: base_ref.clone(),
+                target: self.target.unwrap_or_default(),
+            })
+        } else {
+            Ok(DiffSource::Pending)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -532,9 +635,6 @@ pub(crate) const FINDING_STATUSES: &[&str] = &[
 /// one prepared statement per level, so an unbounded depth wedges the task
 /// thread with no way to cancel it.
 pub(crate) const MAX_PREPARE_DEPTH: usize = 16;
-/// Marker used to route a cooperative cancellation to `cancelled` rather than
-/// `failed`.
-const CANCELLED_BEFORE_START: &str = "task cancelled before start";
 /// Upper bound on evidence references attached to one submitted finding.
 const MAX_EVIDENCE_PER_FINDING: usize = 24;
 /// Upper bound on one line read from a Codex session log.
@@ -609,6 +709,9 @@ fn proposed() -> String {
 pub struct Observatory {
     root: Arc<PathBuf>,
     memory_path: Arc<PathBuf>,
+    session: Arc<SessionLease>,
+    semantic_backend: Arc<Mutex<crate::SemanticBackend>>,
+    execution: Option<crate::execution::ExecutionControl>,
     dashboard: Arc<Mutex<Option<crate::dashboard::DashboardHandle>>>,
 }
 
@@ -627,10 +730,14 @@ impl Observatory {
         let state = root.join(STATE_DIRECTORY);
         fs::create_dir_all(&state)?;
         let memory_path = state.join("memory.sqlite3");
+        let session = SessionLease::acquire(&state)?;
         let observatory = Self {
             root: Arc::new(root),
             memory_path: Arc::new(memory_path),
             dashboard: Arc::new(Mutex::new(None)),
+            session: Arc::new(session),
+            semantic_backend: Arc::new(Mutex::new(crate::SemanticBackend::default())),
+            execution: None,
         };
         observatory.initialize_memory()?;
         Ok(observatory)
@@ -646,7 +753,24 @@ impl Observatory {
         Ok(db)
     }
 
+    fn service(&self) -> Result<Service> {
+        let mut service =
+            Service::open(self.root.as_ref().clone())?.with_backend(self.semantic_backend.clone());
+        if let Some(control) = &self.execution {
+            service = service.with_execution(control.clone());
+        }
+        Ok(service)
+    }
+
     fn initialize_memory(&self) -> Result<()> {
+        // Serialize additive schema migration across concurrent server startups.
+        let migration_lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.root.join(STATE_DIRECTORY).join("memory-init.lock"))?;
+        FileExt::lock_exclusive(&migration_lock)?;
         let db = Connection::open(self.memory_path.as_path())?;
         db.execute_batch(MEMORY_SCHEMA)?;
         ensure_column(&db, "research_runs", "task_id", "TEXT")?;
@@ -654,7 +778,9 @@ impl Observatory {
             "INSERT OR REPLACE INTO metadata(key,value) VALUES ('schema_version',?1)",
             [MEMORY_SCHEMA_VERSION],
         )?;
-        Self::reconcile_interrupted_work(&db)?;
+        ensure_column(&db, "tasks", "owner", "TEXT")?;
+        ensure_column(&db, "research_runs", "owner", "TEXT")?;
+        self.reconcile_interrupted_work(&db)?;
         let migrated: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='legacy_v7_migrated')",
             [],
@@ -803,18 +929,23 @@ impl Observatory {
 
     pub async fn context(&self, request: ContextRequest) -> Result<Value> {
         let freshness = self.freshness("published_snapshot")?;
-        let root = self.root.as_ref().clone();
+        let this = self.clone();
+        let response_budget = request.budget;
         let result = task::spawn_blocking(move || {
-            Service::open(root)?.context_pack(&request.query, request.budget, request.limit)
+            this.service()?
+                .context_pack(&request.query, request.budget, request.limit)
         })
         .await
         .context("context worker stopped")??;
-        Ok(json!({"freshness":freshness,"result":result}))
+        Ok(crate::response_budget::bound(
+            json!({"freshness":freshness,"result":result}),
+            response_budget,
+        ))
     }
 
     pub fn matrix(&self) -> Result<Value> {
         let freshness = self.freshness("published_snapshot")?;
-        let result = Service::open(self.root.as_ref().clone())?.matrix()?;
+        let result = self.service()?.matrix()?;
         Ok(json!({"freshness":freshness,"result":result}))
     }
 
@@ -823,11 +954,9 @@ impl Observatory {
     pub fn symbol_relations(&self, request: SymbolRelationRequest) -> Result<Value> {
         ensure!(!request.symbol.trim().is_empty(), "symbol is required");
         let freshness = self.freshness("published_snapshot")?;
-        let result = Service::open(self.root.as_ref().clone())?.symbol_relations(
-            &request.symbol,
-            &request.relation,
-            request.limit,
-        )?;
+        let result =
+            self.service()?
+                .symbol_relations(&request.symbol, &request.relation, request.limit)?;
         Ok(json!({"freshness":freshness,"result":result}))
     }
 
@@ -835,14 +964,14 @@ impl Observatory {
     pub fn history(&self, symbol: &str) -> Result<Value> {
         ensure!(!symbol.trim().is_empty(), "symbol is required");
         let freshness = self.freshness("published_snapshot")?;
-        let result = Service::open(self.root.as_ref().clone())?.history(symbol)?;
+        let result = self.service()?.history(symbol)?;
         Ok(json!({"freshness":freshness,"result":result}))
     }
 
     /// Private symbols with no indexed inbound references.
     pub fn cleanup_candidates(&self, scope: Option<&str>) -> Result<Value> {
         let freshness = self.freshness("published_snapshot")?;
-        let result = Service::open(self.root.as_ref().clone())?.cleanup_candidates(scope)?;
+        let result = self.service()?.cleanup_candidates(scope)?;
         Ok(
             json!({"freshness":freshness,"result":result,"authority":"Deletion candidates are static inferences; confirm with the compiler before removing anything."}),
         )
@@ -851,7 +980,8 @@ impl Observatory {
     /// Superseded or legacy symbols retained as lifecycle evidence.
     pub fn obsolete_candidates(&self, scope: Option<&str>, limit: usize) -> Result<Value> {
         let freshness = self.freshness("published_snapshot")?;
-        let result = Service::open(self.root.as_ref().clone())?
+        let result = self
+            .service()?
             .obsolete_candidates(scope, limit.clamp(1, 200))?;
         Ok(json!({"freshness":freshness,"result":result}))
     }
@@ -860,8 +990,7 @@ impl Observatory {
     pub fn explain(&self, target: &str, budget: usize) -> Result<Value> {
         ensure!(!target.trim().is_empty(), "target is required");
         let freshness = self.freshness("published_snapshot")?;
-        let result =
-            Service::open(self.root.as_ref().clone())?.explain(target, budget.clamp(1, 40))?;
+        let result = self.service()?.explain(target, budget.clamp(1, 40))?;
         Ok(json!({"freshness":freshness,"result":result}))
     }
 
@@ -869,7 +998,7 @@ impl Observatory {
     pub fn constraints(&self, change: &str) -> Result<Value> {
         ensure!(!change.trim().is_empty(), "change is required");
         let freshness = self.freshness("published_snapshot")?;
-        let result = Service::open(self.root.as_ref().clone())?.constraints(change)?;
+        let result = self.service()?.constraints(change)?;
         Ok(json!({"freshness":freshness,"result":result}))
     }
 
@@ -877,14 +1006,16 @@ impl Observatory {
     pub fn consult(&self, topic: &str, budget: usize) -> Result<Value> {
         ensure!(!topic.trim().is_empty(), "topic is required");
         let freshness = self.freshness("published_snapshot")?;
-        let result =
-            Service::open(self.root.as_ref().clone())?.consult(topic, budget.clamp(250, 20_000))?;
-        Ok(json!({"freshness":freshness,"result":result}))
+        let result = self.service()?.consult(topic, budget.clamp(250, 20_000))?;
+        Ok(crate::response_budget::bound(
+            json!({"freshness":freshness,"result":result}),
+            budget,
+        ))
     }
 
     pub fn decision_record(&self, request: RecordDecision) -> Result<Value> {
         ensure!(!request.title.trim().is_empty(), "title is required");
-        Service::open(self.root.as_ref().clone())?.record_decision(request)
+        self.service()?.record_decision(request)
     }
 
     pub fn decision_list(
@@ -897,7 +1028,7 @@ impl Observatory {
             validate_choice("decision status", status, DECISION_STATUSES)?;
         }
         let limit = list_limit(limit);
-        let service = Service::open(self.root.as_ref().clone())?;
+        let service = self.service()?;
         let decisions = service.decision_list(query.unwrap_or(""), status, limit as usize)?;
         Ok(json!({
             "query": query.unwrap_or(""),
@@ -914,7 +1045,7 @@ impl Observatory {
     }
 
     pub fn decision_retire(&self, request: RetireDecision) -> Result<Value> {
-        Service::open(self.root.as_ref().clone())?.retire_decision(request)
+        self.service()?.retire_decision(request)
     }
 
     pub fn steering_record(&self, request: RecordSteering) -> Result<Value> {
@@ -922,18 +1053,18 @@ impl Observatory {
             !request.instruction.trim().is_empty(),
             "instruction is required"
         );
-        Service::open(self.root.as_ref().clone())?.record_steering(request)
+        self.service()?.record_steering(request)
     }
 
     pub fn steering_list(&self, query: Option<&str>, limit: usize) -> Result<Value> {
-        Service::open(self.root.as_ref().clone())?.steering_list(query, limit.clamp(1, 200))
+        self.service()?.steering_list(query, limit.clamp(1, 200))
     }
 
     /// Explicitly records a defect. Problems could previously only arrive
     /// through automatic capture, so an agent that noticed one mid-task had no
     /// way to file it.
     pub fn problem_record(&self, request: crate::quality::ProblemInput) -> Result<Value> {
-        Service::open(self.root.as_ref().clone())?.problem_record(request)
+        self.service()?.problem_record(request)
     }
 
     /// Proposes a learned quality constraint for human review. Proposal never
@@ -942,8 +1073,7 @@ impl Observatory {
         &self,
         request: crate::quality::QualityConstraintInput,
     ) -> Result<Value> {
-        let proposed =
-            Service::open(self.root.as_ref().clone())?.quality_constraint_propose(request)?;
+        let proposed = self.service()?.quality_constraint_propose(request)?;
         Ok(
             json!({"constraint":proposed,"status":"proposed","activation":"A human must call quality.review to activate this constraint."}),
         )
@@ -958,26 +1088,26 @@ impl Observatory {
             source != target,
             "a constraint cannot be merged into itself"
         );
-        Service::open(self.root.as_ref().clone())?.quality_constraint_merge(source, target)
+        self.service()?.quality_constraint_merge(source, target)
     }
 
     pub fn checkpoint_create(&self, label: &str, include_untracked: bool) -> Result<Value> {
         ensure!(!label.trim().is_empty(), "label is required");
-        Service::open(self.root.as_ref().clone())?.checkpoint_create(label, include_untracked)
+        self.service()?.checkpoint_create(label, include_untracked)
     }
 
     pub fn checkpoint_list(&self, limit: usize) -> Result<Value> {
-        Service::open(self.root.as_ref().clone())?.checkpoint_list(limit.clamp(1, 200))
+        self.service()?.checkpoint_list(limit.clamp(1, 200))
     }
 
     pub fn checkpoint_diff(&self, reference: &str, max_bytes: usize) -> Result<Value> {
-        Service::open(self.root.as_ref().clone())?
+        self.service()?
             .checkpoint_diff(reference, max_bytes.clamp(1_000, 400_000))
     }
 
     pub fn checkpoint_restore_branch(&self, reference: &str, branch: &str) -> Result<Value> {
         ensure!(!branch.trim().is_empty(), "branch is required");
-        Service::open(self.root.as_ref().clone())?
+        self.service()?
             .checkpoint_restore_branch(reference, Some(branch))
     }
 
@@ -986,7 +1116,8 @@ impl Observatory {
             (1..=1_000).contains(&request.max_findings),
             "max_findings must be between 1 and 1000"
         );
-        let result = Service::open(self.root.as_ref().clone())?
+        let result = self
+            .service()?
             .architecture(request.scope.as_deref(), request.max_findings)?;
         Ok(json!({
             "freshness":self.freshness("live_worktree")?,
@@ -1009,7 +1140,7 @@ impl Observatory {
                     10,
                     "reading live manifests and Rust syntax",
                 )?;
-                let service = Service::open(observatory.root.as_ref().clone())?;
+                let service = observatory.service()?;
                 observatory.update_task(
                     &task_id,
                     "running",
@@ -1034,12 +1165,12 @@ impl Observatory {
 
     pub fn architecture_audit_get(&self, id: &str) -> Result<Value> {
         ensure!(!id.trim().is_empty(), "audit id is required");
-        let report = Service::open(self.root.as_ref().clone())?.architecture_report(id)?;
+        let report = self.service()?.architecture_report(id)?;
         Ok(json!({"report":report}))
     }
 
     pub fn architecture_audit_list(&self, limit: usize) -> Result<Value> {
-        Service::open(self.root.as_ref().clone())?.architecture_reports(limit)
+        self.service()?.architecture_reports(limit)
     }
 
     /// Copy one audit result into the human-reviewed finding lifecycle.
@@ -1058,8 +1189,7 @@ impl Observatory {
             !request.finding_id.trim().is_empty(),
             "finding_id is required"
         );
-        let report =
-            Service::open(self.root.as_ref().clone())?.architecture_report(&request.report_id)?;
+        let report = self.service()?.architecture_report(&request.report_id)?;
         let finding = report["findings"]
             .as_array()
             .into_iter()
@@ -1178,7 +1308,8 @@ impl Observatory {
     pub fn change_get(&self, context_id: &str) -> Result<Value> {
         ensure!(!context_id.trim().is_empty(), "context_id is required");
         let freshness = self.freshness("published_snapshot")?;
-        let context = Service::open(self.root.as_ref().clone())?
+        let context = self
+            .service()?
             .resource(&format!("rustrepo://change/{context_id}"))
             .with_context(|| format!("unknown change context {context_id}"))?;
         Ok(json!({"freshness":freshness,"context":context}))
@@ -1186,9 +1317,10 @@ impl Observatory {
 
     pub async fn prepare_change(&self, request: PrepareRequest) -> Result<Value> {
         let freshness = self.freshness("published_snapshot")?;
-        let root = self.root.as_ref().clone();
+        let this = self.clone();
+        let response_budget = request.budget.unwrap_or(3_000).clamp(250, 10_000);
         let result = task::spawn_blocking(move || {
-            Service::open(root)?.prepare_change(
+            this.service()?.prepare_change(
                 &request.intent,
                 &request.targets,
                 request.depth,
@@ -1197,7 +1329,10 @@ impl Observatory {
         })
         .await
         .context("prepare worker stopped")??;
-        Ok(json!({"freshness":freshness,"result":result}))
+        Ok(crate::response_budget::bound(
+            json!({"freshness":freshness,"result":result}),
+            response_budget,
+        ))
     }
 
     pub fn start_prepare_change(&self, request: PrepareRequest) -> Result<Value> {
@@ -1212,7 +1347,7 @@ impl Observatory {
                 observatory.update_task(&task_id, "running", 10, "reading snapshot freshness")?;
                 let freshness = observatory.freshness("published_snapshot")?;
                 observatory.update_task(&task_id, "running", 30, "opening the published index")?;
-                let service = Service::open(observatory.root.as_ref().clone())?;
+                let service = observatory.service()?;
                 observatory.update_task(&task_id, "running", 55, "collecting change evidence")?;
                 let result = service.prepare_change(
                     &request.intent,
@@ -1226,18 +1361,22 @@ impl Observatory {
                     90,
                     "activating quality obligations",
                 )?;
-                Ok(json!({"freshness":freshness,"result":result}))
+                Ok(crate::response_budget::bound(
+                    json!({"freshness":freshness,"result":result}),
+                    request.budget.unwrap_or(3_000).clamp(250, 10_000),
+                ))
             },
         )
     }
 
     pub async fn validate_change(&self, request: ValidateRequest) -> Result<Value> {
+        let source = request.diff_source()?;
         let freshness = self.freshness("published_snapshot")?;
-        let root = self.root.as_ref().clone();
+        let this = self.clone();
         let result = task::spawn_blocking(move || {
-            Service::open(root)?.validate_change(
+            this.service()?.validate_change_from_source(
                 &request.context_id,
-                request.git_diff.as_deref(),
+                &source,
                 request.run_checks,
             )
         })
@@ -1251,6 +1390,7 @@ impl Observatory {
     }
 
     pub fn start_validate_change(&self, request: ValidateRequest) -> Result<Value> {
+        let source = request.diff_source()?;
         self.spawn_blocking_task(
             "change.validate",
             "queued for diff validation",
@@ -1262,10 +1402,10 @@ impl Observatory {
                     "validating prepared evidence",
                 )?;
                 let freshness = observatory.freshness("published_snapshot")?;
-                let service = Service::open(observatory.root.as_ref().clone())?;
-                let result = service.validate_change(
+                let service = observatory.service()?;
+                let result = service.validate_change_from_source(
                     &request.context_id,
-                    request.git_diff.as_deref(),
+                    &source,
                     request.run_checks,
                 )?;
                 Ok(json!({
@@ -1328,7 +1468,7 @@ impl Observatory {
         // Counts and backend health explain *why* a context came back empty:
         // a never-published index and "no relevant symbols" were previously
         // indistinguishable from the outside.
-        let service = Service::open(self.root.as_ref().clone())?;
+        let service = self.service()?;
         let counts = service.status()?;
         let never_published = counts["counts"]["nodes"].as_i64().unwrap_or(0) == 0;
         Ok(json!({
@@ -1348,34 +1488,10 @@ impl Observatory {
     }
 
     pub fn start_index_refresh(&self, scope: Option<String>) -> Result<Value> {
-        let id = self.create_task("index.refresh", "queued for the index publisher")?;
-        let this = self.clone();
-        let task_id = id.clone();
-        let background_id = id.clone();
-        tokio::spawn(async move {
-            let worker = this.clone();
-            let outcome =
-                task::spawn_blocking(move || worker.run_refresh(&task_id, scope.as_deref())).await;
-            match outcome {
-                Ok(Ok(value)) => {
-                    let _ = this.finish_task(&background_id, value);
-                }
-                Ok(Err(error)) => {
-                    let message = format!("{error:#}");
-                    if message.contains(CANCELLED_BEFORE_START) {
-                        let _ = this.cancel_task_record(&background_id);
-                    } else {
-                        let _ = this.fail_task(&background_id, &message);
-                    }
-                }
-                Err(error) => {
-                    let _ =
-                        this.fail_task(&background_id, &format!("refresh worker stopped: {error}"));
-                }
-            }
-        });
-        Ok(
-            json!({"task_id":id,"status":"queued","poll_with":"task.get","cancel_with":"task.cancel"}),
+        self.spawn_blocking_task(
+            "index.refresh",
+            "queued for the index publisher",
+            move |observatory, task_id| observatory.run_refresh(&task_id, scope.as_deref()),
         )
     }
 
@@ -1385,7 +1501,7 @@ impl Observatory {
             "task cancelled before start"
         );
         self.update_task(task_id, "running", 5, "acquiring publisher lease")?;
-        let mut service = Service::open(self.root.as_ref().clone())?;
+        let mut service = self.service()?;
         self.update_task(task_id, "running", 20, "refreshing derived index")?;
         let value = service.refresh(scope)?;
         self.update_task(task_id, "running", 95, "publishing generation")?;
@@ -1400,8 +1516,8 @@ impl Observatory {
             self.create_task("research.local_scan", "queued for bounded local research")?;
         let now = Utc::now().to_rfc3339();
         self.db()?.execute(
-            "INSERT INTO research_runs(id,topic,goals_json,status,budget_json,consumed_json,questions_json,packet_json,schedule,next_due_at,task_id,error,created_at,updated_at) VALUES (?1,?2,?3,'queued',?4,'{}','[]','{}',?5,NULL,?6,NULL,?7,?7)",
-            params![run_id, bounded(&request.topic, 500), serde_json::to_string(&request.goals)?, serde_json::to_string(&request.budget)?, request.schedule, task_id, now],
+            "INSERT INTO research_runs(id,topic,goals_json,status,budget_json,consumed_json,questions_json,packet_json,schedule,next_due_at,task_id,error,created_at,updated_at,owner) VALUES (?1,?2,?3,'queued',?4,'{}','[]','{}',?5,NULL,?6,NULL,?7,?7,?8)",
+            params![run_id, bounded(&request.topic, 500), serde_json::to_string(&request.goals)?, serde_json::to_string(&request.budget)?, request.schedule, task_id, now, self.session.id],
         )?;
         let this = self.clone();
         let async_run_id = run_id.clone();
@@ -1997,14 +2113,14 @@ impl Observatory {
 
     pub fn problem_list(&self, query: Option<&str>, limit: usize) -> Result<Value> {
         let freshness = self.freshness("published_snapshot")?;
-        let result =
-            Service::open(self.root.as_ref().clone())?.problem_list(query, limit.clamp(1, 200))?;
+        let result = self.service()?.problem_list(query, limit.clamp(1, 200))?;
         Ok(json!({"freshness":freshness,"result":result}))
     }
 
     pub fn problem_get(&self, id: &str) -> Result<Value> {
         let freshness = self.freshness("published_snapshot")?;
-        let problem = Service::open(self.root.as_ref().clone())?
+        let problem = self
+            .service()?
             .resource(&format!("rustrepo://problem/{id}"))
             .with_context(|| format!("unknown problem {id}"))?;
         Ok(json!({"freshness":freshness,"problem":problem}))
@@ -2043,7 +2159,8 @@ impl Observatory {
             patch.insert("related".into(), json!(value));
         }
         ensure!(!patch.is_empty(), "problem update cannot be empty");
-        let result = Service::open(self.root.as_ref().clone())?
+        let result = self
+            .service()?
             .problem_update(&request.problem_id, &Value::Object(patch))?;
         self.sync_legacy_memory()?;
         Ok(json!({"freshness":self.freshness("published_snapshot")?,"result":result}))
@@ -2051,14 +2168,16 @@ impl Observatory {
 
     pub fn quality_list(&self, query: Option<&str>, limit: usize) -> Result<Value> {
         let freshness = self.freshness("published_snapshot")?;
-        let result = Service::open(self.root.as_ref().clone())?
+        let result = self
+            .service()?
             .quality_constraint_list(query, limit.clamp(1, 200))?;
         Ok(json!({"freshness":freshness,"result":result}))
     }
 
     pub fn quality_get(&self, id: &str) -> Result<Value> {
         let freshness = self.freshness("published_snapshot")?;
-        let constraint = Service::open(self.root.as_ref().clone())?
+        let constraint = self
+            .service()?
             .resource(&format!("rustrepo://quality/{id}"))
             .with_context(|| format!("unknown quality constraint {id}"))?;
         Ok(json!({"freshness":freshness,"constraint":constraint}))
@@ -2066,7 +2185,7 @@ impl Observatory {
 
     pub fn quality_review(&self, request: QualityReviewRequest) -> Result<Value> {
         ensure!(request.confirm_human, "human confirmation is required");
-        let result = Service::open(self.root.as_ref().clone())?.quality_constraint_review(
+        let result = self.service()?.quality_constraint_review(
             &request.constraint_id,
             &request.decision,
             &request.reviewed_by,
@@ -2079,13 +2198,12 @@ impl Observatory {
 
     pub fn validation_queue(&self, context_id: &str) -> Result<Value> {
         let freshness = self.freshness("published_snapshot")?;
-        let result =
-            Service::open(self.root.as_ref().clone())?.quality_validation_queue(context_id)?;
+        let result = self.service()?.quality_validation_queue(context_id)?;
         Ok(json!({"freshness":freshness,"result":result}))
     }
 
     pub fn validation_record(&self, input: ValidationOutcomeInput) -> Result<Value> {
-        let result = Service::open(self.root.as_ref().clone())?.quality_validation_record(input)?;
+        let result = self.service()?.quality_validation_record(input)?;
         Ok(json!({"freshness":self.freshness("published_snapshot")?,"result":result}))
     }
 
@@ -2221,42 +2339,57 @@ impl Observatory {
         )
     }
 
-    /// Fails tasks and research runs that a previous process left mid-flight.
-    ///
-    /// Tasks only ever advanced through the in-process closure that owned them,
-    /// and nothing reconciled the table on startup. A server killed during a
-    /// refresh left that task reporting `running` forever; a research run killed
-    /// during its scan was stuck in `scanning`, which made `research.submit`
-    /// reject it and `research.packet` return nothing — permanently unusable
-    /// with no way back except cancelling it.
-    fn reconcile_interrupted_work(db: &Connection) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        let interrupted = db.execute(
-            "UPDATE tasks SET status='failed',message='interrupted',error=?1,updated_at=?2 \
-             WHERE status IN ('queued','running')",
-            params![
-                "The Crusty process stopped before this task finished. No result was published; start it again.",
-                now
-            ],
-        )?;
-        // A run whose packet never completed cannot reach `awaiting_agent` on
-        // its own, so it is returned to `queued` and can be restarted.
-        db.execute(
-            "UPDATE research_runs SET status='failed',updated_at=?1 WHERE status IN ('queued','scanning')",
-            [&now],
-        )?;
-        if interrupted > 0 {
-            eprintln!(
-                "Crusty: marked {interrupted} interrupted task(s) as failed after an unclean shutdown."
-            );
+    /// Recover only owners whose filesystem session lease has been released.
+    fn reconcile_interrupted_work(&self, db: &Connection) -> Result<()> {
+        // Session locks survive clones but are released by process exit. PID reuse
+        // and a second live server cannot be mistaken for an abandoned owner.
+        let owners = db.prepare("SELECT DISTINCT owner FROM tasks WHERE status IN ('queued','running') UNION SELECT DISTINCT owner FROM research_runs WHERE status IN ('queued','scanning')")?
+            .query_map([], |row| row.get::<_, Option<String>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for owner in owners {
+            if let Some(owner) = &owner {
+                if owner == &self.session.id {
+                    continue;
+                }
+                let path = self
+                    .root
+                    .join(STATE_DIRECTORY)
+                    .join("sessions")
+                    .join(format!("{owner}.lock"));
+                match fs::OpenOptions::new().read(true).write(true).open(path) {
+                    Ok(lock) => {
+                        match FileExt::try_lock_exclusive(&lock) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                continue;
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                        // Keep the recovered lease while updating both tables.
+                        self.fail_abandoned_owner(db, Some(owner.as_str()))?;
+                        continue;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            self.fail_abandoned_owner(db, owner.as_deref())?;
         }
+        Ok(())
+    }
+
+    fn fail_abandoned_owner(&self, db: &Connection, owner: Option<&str>) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        db.execute("UPDATE tasks SET status='failed',message='interrupted',error=?1,updated_at=?2 WHERE status IN ('queued','running') AND owner IS ?3",
+            params!["The Crusty process stopped before this task finished. No result was published; start it again.", now, owner])?;
+        db.execute("UPDATE research_runs SET status='failed',updated_at=?1 WHERE status IN ('queued','scanning') AND owner IS ?2", params![now, owner])?;
         Ok(())
     }
 
     fn create_task(&self, kind: &str, message: &str) -> Result<String> {
         let id = new_id("task");
         let now = Utc::now().to_rfc3339();
-        self.db()?.execute("INSERT INTO tasks(id,kind,status,progress,message,result_json,error,cancel_requested,created_at,updated_at) VALUES (?1,?2,'queued',0,?3,NULL,NULL,0,?4,?4)", params![id,kind,message,now])?;
+        self.db()?.execute("INSERT INTO tasks(id,kind,status,progress,message,result_json,error,cancel_requested,created_at,updated_at,owner) VALUES (?1,?2,'queued',0,?3,NULL,NULL,0,?4,?4,?5)", params![id,kind,message,now,self.session.id])?;
         Ok(id)
     }
 
@@ -2268,37 +2401,38 @@ impl Observatory {
         let background_id = id.clone();
         let this = self.clone();
         tokio::spawn(async move {
-            let worker = this.clone();
+            let mut worker = this.clone();
             let worker_id = background_id.clone();
-            let work = task::spawn_blocking(move || {
-                if worker.task_cancelled(&worker_id)? {
-                    // Distinguished from a genuine failure below.
-                    bail!("{CANCELLED_BEFORE_START}");
-                }
-                operation(worker, worker_id)
+            let memory_path = worker.memory_path.clone();
+            let cancellation_id = worker_id.clone();
+            let control = crate::execution::ExecutionControl::new(TASK_TIMEOUT, move || {
+                let db = Connection::open(memory_path.as_path()).map_err(std::io::Error::other)?;
+                db.busy_timeout(std::time::Duration::from_secs(2))
+                    .map_err(std::io::Error::other)?;
+                db.query_row(
+                    "SELECT cancel_requested FROM tasks WHERE id=?1",
+                    [&cancellation_id],
+                    |row| row.get(0),
+                )
+                .map_err(std::io::Error::other)
             });
-            // Nothing bounded a task's runtime, so a hung `cargo test` under
-            // `change.validate` pinned a blocking worker with no recourse.
-            let outcome = match tokio::time::timeout(TASK_TIMEOUT, work).await {
-                Ok(outcome) => outcome,
-                Err(_) => {
-                    let _ = this.fail_task(
-                        &background_id,
-                        &format!(
-                            "task exceeded its {}s budget and was abandoned; the worker may still be running a subprocess",
-                            TASK_TIMEOUT.as_secs()
-                        ),
-                    );
-                    return;
-                }
-            };
+            worker.execution = Some(control.clone());
+            // Await the worker's acknowledgement. Dropping its JoinHandle cannot
+            // stop a blocking closure and previously abandoned live subprocesses.
+            let outcome = task::spawn_blocking(move || -> Result<Value> {
+                control.check()?;
+                let value = operation(worker, worker_id)?;
+                control.check()?;
+                Ok(value)
+            })
+            .await;
             match outcome {
                 Ok(Ok(value)) => {
                     let _ = this.finish_task(&background_id, value);
                 }
                 Ok(Err(error)) => {
                     let message = format!("{error:#}");
-                    if message.contains(CANCELLED_BEFORE_START) {
+                    if message.contains(crate::execution::CANCELLED) {
                         let _ = this.cancel_task_record(&background_id);
                     } else {
                         let _ = this.fail_task(&background_id, &message);
@@ -2354,7 +2488,8 @@ impl Observatory {
             serialized
         };
         let db = self.db()?;
-        db.execute("UPDATE tasks SET status='completed',progress=100,message='completed',result_json=?1,updated_at=?2 WHERE id=?3", params![stored,Utc::now().to_rfc3339(),id])?;
+        db.execute("UPDATE tasks SET status='completed',progress=100,message='completed',error=NULL,result_json=?1,updated_at=?2 WHERE id=?3 AND status IN ('queued','running') AND cancel_requested=0", params![stored,Utc::now().to_rfc3339(),id])?;
+        db.execute("UPDATE tasks SET status='cancelled',message='cancelled',error=NULL,updated_at=?1 WHERE id=?2 AND status IN ('queued','running') AND cancel_requested=1", params![Utc::now().to_rfc3339(),id])?;
         Self::prune_task_history(&db)?;
         Ok(())
     }
@@ -3988,6 +4123,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validation_local_patch_is_task_backed_and_reports_scope() -> Result<()> {
+        let (directory, observatory) = workspace()?;
+        let mut indexer = Service::open(directory.path())?;
+        indexer.refresh(None)?;
+        let context = indexer.prepare_change("Update fixture", &[], 1, Some(1_000))?;
+        drop(indexer);
+        let patch = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1 @@\n+pub struct Added;\n";
+        fs::write(directory.path().join("changes.patch"), patch)?;
+        let request: ValidateRequest = serde_json::from_value(json!({
+            "context_id":context["context_id"], "diff_path":"changes.patch"
+        }))?;
+        let started = observatory.start_validate_change(request)?;
+        let task = wait_for_task(&observatory, started["task_id"].as_str().unwrap()).await?;
+        assert_eq!(task["status"], "completed", "{task}");
+        assert_eq!(
+            task["result"]["result"]["changed_files"],
+            json!(["src/lib.rs"])
+        );
+        assert_eq!(task["result"]["result"]["diff_scope"]["bytes"], patch.len());
+
+        let request = serde_json::from_value(json!({
+            "context_id":context["context_id"], "diff_path":"missing.patch"
+        }))?;
+        let started = observatory.start_validate_change(request)?;
+        let task = wait_for_task(&observatory, started["task_id"].as_str().unwrap()).await?;
+        assert_eq!(task["status"], "failed", "{task}");
+        assert!(task["error"].as_str().unwrap().contains("missing.patch"));
+        Ok(())
+    }
+
+    #[test]
+    fn validation_requests_reject_ambiguous_or_incomplete_sources() -> Result<()> {
+        for fields in [
+            json!({"git_diff":"", "diff_path":"changes.patch"}),
+            json!({"git_diff":"", "base_ref":"HEAD"}),
+            json!({"diff_path":"changes.patch", "base_ref":"HEAD"}),
+            json!({"target":"HEAD"}),
+            json!({"git_diff":"", "target":"worktree"}),
+            json!({"base_ref":"  "}),
+            json!({"diff_path":""}),
+        ] {
+            let mut payload = fields;
+            payload["context_id"] = json!("context");
+            let request: ValidateRequest = serde_json::from_value(payload.clone())?;
+            assert!(request.diff_source().is_err(), "{payload}");
+        }
+        let request: ValidateRequest =
+            serde_json::from_value(json!({"context_id":"context", "base_ref":"main"}))?;
+        assert!(matches!(
+            request.diff_source()?,
+            DiffSource::GitComparison {
+                target: DiffTarget::Worktree,
+                ..
+            }
+        ));
+        assert!(
+            serde_json::from_value::<ValidateRequest>(
+                json!({"context_id":"context", "base_ref":"main", "target":"invalid"})
+            )
+            .is_err()
+        );
+        let request: ValidateRequest = serde_json::from_value(json!({"context_id":"context"}))?;
+        assert!(matches!(request.diff_source()?, DiffSource::Pending));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn prepare_and_validate_acknowledge_as_tasks_without_refresh() -> Result<()> {
         let (directory, observatory) = workspace()?;
         let mut indexer = Service::open(directory.path())?;
@@ -4024,6 +4226,9 @@ mod tests {
         let validation = observatory.start_validate_change(ValidateRequest {
             context_id: context_id.clone(),
             git_diff: Some(String::new()),
+            diff_path: None,
+            base_ref: None,
+            target: None,
             run_checks: false,
         })?;
         assert!(started_at.elapsed() < std::time::Duration::from_millis(250));
@@ -4328,6 +4533,84 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    fn audit_second_server_preserves_live_tasks() -> Result<()> {
+        let (repository, observatory) = workspace()?;
+        let id = observatory.create_task("audit", "live")?;
+        let second = Observatory::open(repository.path())?;
+        assert_eq!(second.task_get(&id)?["task"]["status"], "queued");
+        drop(observatory);
+        drop(second);
+        let recovered = Observatory::open(repository.path())?;
+        assert_eq!(recovered.task_get(&id)?["task"]["status"], "failed");
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_startups_serialize_memory_schema_migration() -> Result<()> {
+        let repository = tempdir()?;
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let barrier = barrier.clone();
+            let root = repository.path().to_path_buf();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                Observatory::open(root)
+            }));
+        }
+        barrier.wait();
+        let servers = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Result<Vec<_>>>()?;
+        let id = servers[0].create_task("audit", "live")?;
+        assert_eq!(servers[1].task_get(&id)?["task"]["status"], "queued");
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_at_completion_cannot_publish_success() -> Result<()> {
+        let (_repository, observatory) = workspace()?;
+        let id = observatory.create_task("audit", "completing")?;
+        observatory.task_cancel(&id)?;
+        observatory.finish_task(&id, json!({"finished":true}))?;
+        let task = observatory.task_get(&id)?;
+        assert_eq!(task["task"]["status"], "cancelled");
+        assert!(task["task"]["result"].is_null());
+        assert!(task["task"]["error"].is_null());
+        let id = observatory.create_task("audit", "failed")?;
+        observatory.fail_task(&id, "owner failed")?;
+        observatory.finish_task(&id, json!({"late":true}))?;
+        assert_eq!(observatory.task_get(&id)?["task"]["status"], "failed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_complete_context_response_respects_budget() -> Result<()> {
+        let (repository, observatory) = workspace()?;
+        Service::open(repository.path())?.refresh(None)?;
+        let value = observatory
+            .context(ContextRequest {
+                query: "indexed".into(),
+                budget: 250,
+                limit: 20,
+            })
+            .await?;
+        assert!(
+            value.to_string().len() <= 1000,
+            "{} bytes",
+            value.to_string().len()
+        );
+        let value = observatory.consult("indexed", 250)?;
+        assert!(
+            value.to_string().len() <= 1000,
+            "{} bytes",
+            value.to_string().len()
+        );
+        Ok(())
+    }
+
     #[test]
     fn interrupted_tasks_and_research_runs_are_reconciled_on_reopen() -> Result<()> {
         let (repository, observatory) = workspace()?;
