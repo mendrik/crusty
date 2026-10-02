@@ -4,11 +4,65 @@ Crusty helps an attached coding agent find, organize, research, and track improv
 
 ## Language
 
+### Coordinated delivery
+
+**Coding session**:
+A bounded period of work with an identified owner, intent, worktree, and renewable right to participate in coordinated changes.
+_Avoid_: Server session, task, work item
+
+**Change surface claim**:
+A coding session's exclusive declaration of the repository paths it intends to modify while its lease remains active.
+_Avoid_: File lock, deletion proof, merge conflict
+
+**Commit plan**:
+A proposed grouping of a session's owned changes into cohesive commits, bound to the observed branch, head, and file contents.
+_Avoid_: Staging area, completed commit, work chunk
+
+**Work chunk**:
+A coherent deliverable connecting accepted intent, participating sessions, commits, verification evidence, and its eventual pull request.
+_Avoid_: Finding, single commit, arbitrary batch
+
+**Integration conflict**:
+A disagreement Git observes when combining identified branch revisions, requiring a validated resolution before incorporation.
+_Avoid_: Claim overlap, permission conflict, harmless concurrent work
+
+**Reviewed revision**:
+The identified pull-request head and base for which review findings and verification evidence were collected.
+_Avoid_: Latest PR, permanent approval, green branch
+
 **Crusty**:
 The local repository observatory for Rust projects.
 _Avoid_: rust-repo-intelligence when referring to the product
 
 ### Repository evidence
+
+**Engineering guidance**:
+Versioned conditional advice with rationale, exceptions and evidence requirements for the actual Rust change.
+_Avoid_: Blocking policy, unconditional checklist, proof
+
+**Approved domain model**:
+A human-reviewed contract for concept owners, invariants, mutation rights and dependency directions.
+_Avoid_: Inferred architecture, automatic source conformance, proposed model
+
+**Verification profile**:
+An explicit supported selection of workspace members, Cargo features, target and toolchain for a check run.
+_Avoid_: All possible configurations, project matrix, green build
+
+**Verification run**:
+Executed checks and artifacts bound to source, head, profile, environment and tool versions.
+_Avoid_: Task completion, validation reference, permanent permission to deliver
+
+**Delivery policy**:
+Explicit human authorization bounded by repository, base, allowed actions, expiry and mutation budget.
+_Avoid_: Product implementation consent, remote protection bypass, agent-created authority
+
+**Delivery action**:
+A durable remote mutation intent and its observed outcome, recoverable independently of task retention.
+_Avoid_: Actual merge, proof of review, unconditional retry
+
+**Measured workload**:
+Comparable baseline/candidate execution samples for a declared operation and correctness oracle.
+_Avoid_: Universal optimization, profiler evidence, statistical significance
 
 **Live worktree**:
 The current Rust source read directly from disk for exact navigation.

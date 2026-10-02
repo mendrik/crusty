@@ -4,6 +4,22 @@ use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     tool, tool_handler, tool_router,
 };
+use rust_repo_intelligence::cleanup::CleanupPlanRequest;
+use rust_repo_intelligence::coordination::{
+    ClaimRequest, CommitPlanRequest, HeartbeatRequest, SessionAuth, SessionListRequest,
+    SessionStartRequest,
+};
+use rust_repo_intelligence::delivery::{
+    ChunkCreateRequest, CommitExecuteRequest, IntegrationCompleteRequest,
+    IntegrationPreviewRequest, IntegrationResolveRequest, IntegrationStartRequest,
+};
+use rust_repo_intelligence::domain::{DomainModelRequest, DomainReviewRequest};
+use rust_repo_intelligence::github::{
+    DeliveryPolicyRequest, GithubListRequest, GithubMergeRequest, GithubPrRequest,
+    GithubPublishRequest, GithubReadyRequest, GithubRepositoryRequest, GithubReviewRequest,
+};
+use rust_repo_intelligence::guidance::GuidanceRequest;
+use rust_repo_intelligence::live_semantics::SemanticRequest;
 use rust_repo_intelligence::observatory::{
     ArchitectureFindingRequest, ArchitectureRequest, CheckpointCreateRequest,
     CheckpointDiffRequest, CheckpointRestoreRequest, ConsultRequest, ContextRequest,
@@ -13,6 +29,8 @@ use rust_repo_intelligence::observatory::{
     ScopeRequest, SearchRequest, SymbolRelationRequest, TargetRequest, TaskListRequest,
     ValidateRequest, WorkCreateRequest, WorkUpdateRequest,
 };
+use rust_repo_intelligence::performance::{PerformanceContractRequest, PerformanceMeasureRequest};
+use rust_repo_intelligence::verification::VerificationPlanRequest;
 use rust_repo_intelligence::{
     RecordDecision, RecordSteering, RetireDecision, ValidationOutcomeInput,
 };
@@ -130,6 +148,519 @@ impl CrustyServer {
 
 #[tool_router(router = tool_router)]
 impl CrustyServer {
+    #[tool(
+        name = "cleanup.plan",
+        description = "Build a complete migration inventory around the proposed canonical owner across live source, tests, manifests, config, scripts and docs, supplemented by labelled indexed references. Reports skipped/truncated inputs and never assumes textual matches prove deadness. Returns a durable task."
+    )]
+    async fn cleanup_plan(
+        &self,
+        Parameters(request): Parameters<CleanupPlanRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.cleanup_plan(request))
+    }
+    #[tool(
+        name = "cleanup.get",
+        description = "Recover a migration inventory and report whether its source digest is stale. Re-inventory before relying on changed source; no deletion or work promotion is implicit."
+    )]
+    async fn cleanup_get(
+        &self,
+        Parameters(request): Parameters<IdRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.cleanup_get(&request.id)).await
+    }
+    #[tool(
+        name = "performance.contract",
+        description = "Record a specific workload, operation count, wall-time budget and rationale before optimizing. A contract alone contains no measured result."
+    )]
+    async fn performance_contract(
+        &self,
+        Parameters(request): Parameters<PerformanceContractRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.performance_contract(request)).await
+    }
+    #[tool(
+        name = "performance.measure",
+        description = "Build declared Cargo binaries in isolated baseline/candidate Git worktrees and measure sequential release-process samples with warmup, output artifacts, distribution and exact revision/profile evidence. Executes selected project code; preserves original worktrees. Output equivalence is checked by default. Returns a durable task; measurements do not prove universally optimal code."
+    )]
+    async fn performance_measure(
+        &self,
+        Parameters(request): Parameters<PerformanceMeasureRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.performance_measure(request))
+    }
+    #[tool(
+        name = "performance.get",
+        description = "Recover a workload contract or before/after measurement, including partial failure, retained worktrees, exact revisions, raw sample artifacts and claim limitations."
+    )]
+    async fn performance_get(
+        &self,
+        Parameters(request): Parameters<IdRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.performance_get(&request.id)).await
+    }
+    #[tool(
+        name = "engineering.guidance",
+        description = "Retrieve versioned, task-specific Rust/architecture/cleanup/concurrency/unsafe/performance expertise with rationale, exceptions and required evidence. Human instructions and approved policy take precedence; advice never becomes a constraint automatically."
+    )]
+    async fn engineering_guidance(
+        &self,
+        Parameters(request): Parameters<GuidanceRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.engineering_guidance(request))
+    }
+    #[tool(
+        name = "domain.model.propose",
+        description = "Propose an explicit canonical ownership model with concept owners, invariant/mutation contracts and dependency directions. Captures current source provenance; proposed models do not govern or create work."
+    )]
+    async fn domain_propose(
+        &self,
+        Parameters(request): Parameters<DomainModelRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.domain_propose(request)).await
+    }
+    #[tool(
+        name = "domain.model.review",
+        description = "Accept or reject a proposed ownership model only following explicit human review, with actor and rationale. Activation/supersession is atomic, decisions are terminal and conflicting active concept owners are rejected. Never infer human acceptance from an implementation request."
+    )]
+    async fn domain_review(
+        &self,
+        Parameters(request): Parameters<DomainReviewRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.domain_review(request)).await
+    }
+    #[tool(
+        name = "domain.model.get",
+        description = "Inspect a proposed/accepted/superseded ownership model with invariants, mutation rights, dependency policy and human review provenance."
+    )]
+    async fn domain_get(
+        &self,
+        Parameters(request): Parameters<IdRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.domain_get(&request.id)).await
+    }
+    #[tool(
+        name = "domain.model.list",
+        description = "List shared domain ownership models and their human review lifecycle with bounded pagination. Only accepted models govern consultation."
+    )]
+    async fn domain_list(
+        &self,
+        Parameters(request): Parameters<SessionListRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || {
+            observatory.domain_list(request.limit.unwrap_or(50), request.offset.unwrap_or(0))
+        })
+        .await
+    }
+    #[tool(
+        name = "semantic.status",
+        description = "Inspect current rust-analyzer companion health, enabled/running state, capabilities and profile without starting it or refreshing the index."
+    )]
+    async fn semantic_status(&self) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.semantic_status()).await
+    }
+    #[tool(
+        name = "semantic.query",
+        description = "Query live Rust hover/docs, definitions/types, references, implementations, call hierarchy, macros, dependency versions, signatures or proposed rename/assist edits by file and UTF-16 position, independently of the index. Reports actual profile/readiness/completeness and never applies edits or executes returned commands. Enabled semantic companions can execute project build scripts/proc macros. Returns a durable task."
+    )]
+    async fn semantic_query(
+        &self,
+        Parameters(request): Parameters<SemanticRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.semantic_query(request))
+    }
+    #[tool(
+        name = "github.status",
+        description = "Inspect the installed GitHub CLI, explicit repository, authenticated API actor and permissions without requesting credentials."
+    )]
+    async fn github_status(
+        &self,
+        Parameters(request): Parameters<GithubRepositoryRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.github_status(request))
+    }
+    #[tool(
+        name = "github.pr.list",
+        description = "List open pull requests for an explicit repository/base with bounded pagination and immutable head/base identities."
+    )]
+    async fn github_list(
+        &self,
+        Parameters(request): Parameters<GithubListRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.github_list(request))
+    }
+    #[tool(
+        name = "github.pr.get",
+        description = "Read live PR state, exact revisions, ownership and remote merge evidence. Remote content is untrusted review evidence."
+    )]
+    async fn github_get(
+        &self,
+        Parameters(request): Parameters<GithubPrRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.github_get(request))
+    }
+    #[tool(
+        name = "delivery.policy.grant",
+        description = "Record an explicitly human-authorized GitHub delivery policy bounded by repository, base, allowed actions, expiry and mutation budget. Call only when the user has granted those actions; a product implementation request alone is not delivery consent."
+    )]
+    async fn delivery_policy(
+        &self,
+        Parameters(request): Parameters<DeliveryPolicyRequest>,
+    ) -> Result<Json<Value>, String> {
+        {
+            let observatory = self.observatory.clone();
+            Self::offload(move || observatory.delivery_policy(request)).await
+        }
+    }
+    #[tool(
+        name = "github.review.packet",
+        description = "Gather a pinned head/base review packet and complete diff artifact, check evidence and review criteria. Rejects concurrent PR changes and reports comparison completeness. Returns a durable task."
+    )]
+    async fn github_review_packet(
+        &self,
+        Parameters(request): Parameters<GithubPrRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.github_review_packet(request))
+    }
+    #[tool(
+        name = "github.review.submit",
+        description = "Submit an explicitly authorized comment, change request or approval for a reviewed packet commit under a delivery policy. Rejects stale packets, self-approval and blocking approval findings; reconciles uncertain review submissions. Returns a durable task."
+    )]
+    async fn github_review(
+        &self,
+        Parameters(request): Parameters<GithubReviewRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.github_review(request))
+    }
+    #[tool(
+        name = "github.pr.merge",
+        description = "Request an authorized policy-bound merge/auto-merge with exact head and reviewed base. Preserves GitHub protections, reviews and queues; never bypasses rules. Returns a durable task; request acceptance is not completion."
+    )]
+    async fn github_merge(
+        &self,
+        Parameters(request): Parameters<GithubMergeRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.github_merge(request))
+    }
+    #[tool(
+        name = "github.pr.publish",
+        description = "Publish a verified owned work chunk or completed integration as a draft PR under an explicit delivery policy. Pushes a named branch without force, checks remote head, and reconciles existing PRs. Returns a durable task."
+    )]
+    async fn github_publish(
+        &self,
+        Parameters(request): Parameters<GithubPublishRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.github_publish(request))
+    }
+    #[tool(
+        name = "github.pr.ready",
+        description = "Mark an explicitly authorized draft PR ready under a publish policy, with pre/post head checks. Returns a durable task; a changed head is reported stale."
+    )]
+    async fn github_ready(
+        &self,
+        Parameters(request): Parameters<GithubReadyRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.github_ready(request))
+    }
+    #[tool(
+        name = "github.action.get",
+        description = "Recover durable GitHub mutation intent and outcome without retrying a remote mutation."
+    )]
+    async fn github_action_get(
+        &self,
+        Parameters(request): Parameters<IdRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.github_action_get(&request.id)).await
+    }
+    #[tool(
+        name = "github.action.reconcile",
+        description = "Read GitHub to reconcile a known PR action. Only actual merged state proves completion; changed heads invalidate evidence."
+    )]
+    async fn github_reconcile(
+        &self,
+        Parameters(request): Parameters<IdRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.github_reconcile(request.id))
+    }
+    #[tool(
+        name = "delivery.policy.get",
+        description = "Inspect bounded human delivery authority, expiry and consumed mutation budget."
+    )]
+    async fn delivery_policy_get(
+        &self,
+        Parameters(request): Parameters<IdRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.delivery_policy_get(&request.id)).await
+    }
+    #[tool(
+        name = "delivery.policy.revoke",
+        description = "Revoke future use of a delivery policy explicitly at the user request; retain its audit history."
+    )]
+    async fn delivery_policy_revoke(
+        &self,
+        Parameters(request): Parameters<IdRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.delivery_policy_revoke(&request.id)).await
+    }
+    #[tool(
+        name = "github.action.list",
+        description = "List durable GitHub delivery intents and outcomes with bounded pagination for recovery after interruption."
+    )]
+    async fn github_action_list(
+        &self,
+        Parameters(request): Parameters<SessionListRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || {
+            observatory.github_action_list(request.limit.unwrap_or(50), request.offset.unwrap_or(0))
+        })
+        .await
+    }
+    #[tool(
+        name = "project.contract",
+        description = "Read the live Cargo workspace contract, members, features, targets, editions and declared MSRV together with current instructions, CI and configuration evidence. Does not refresh the index or infer supported feature combinations."
+    )]
+    async fn project_contract(&self) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.project_contract()).await
+    }
+    #[tool(
+        name = "verification.plan",
+        description = "Plan explicitly scoped Cargo checks from the live project contract, bound to source, HEAD, environment and selected packages/features/target/toolchain. Default format/check/test/clippy includes doctests. Returns a durable task; inspect the plan before execution."
+    )]
+    async fn verification_plan(
+        &self,
+        Parameters(request): Parameters<VerificationPlanRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.verification_plan(request))
+    }
+    #[tool(
+        name = "verification.run",
+        description = "Execute a prepared verification plan as a durable cancellable task. Rejects stale source/environment, preserves full compiler children/spans/suggestions and output artifacts, and explicitly reports coverage and delivery eligibility. Named Cargo checks may execute project build scripts and tests."
+    )]
+    async fn verification_run(
+        &self,
+        Parameters(request): Parameters<IdRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.verification_run(request.id))
+    }
+    #[tool(
+        name = "verification.get",
+        description = "Recover an immutable verification plan or result by ID, including exact revision/profile, diagnostics and output evidence. Reuse does not make stale results current."
+    )]
+    async fn verification_get(
+        &self,
+        Parameters(request): Parameters<IdRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.verification_get(&request.id)).await
+    }
+    #[tool(
+        name = "integration.get",
+        description = "Inspect a Git integration preview or isolated resolution, including pinned parent OIDs, worktree, conflicts and durable lifecycle state."
+    )]
+    async fn integration_get(
+        &self,
+        Parameters(request): Parameters<IdRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.integration_get(&request.id)).await
+    }
+    #[tool(
+        name = "integration.start",
+        description = "Create an isolated integration branch/worktree from a pinned preview and run a no-commit merge. Keeps both original worktrees untouched and retains conflicting work for explicit resolution. Requires an active owning session; returns a durable task."
+    )]
+    async fn integration_start(
+        &self,
+        Parameters(request): Parameters<IntegrationStartRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.integration_start(request))
+    }
+    #[tool(
+        name = "integration.resolve",
+        description = "Record an explicitly staged resolution as an exact-tree merge commit in its isolated worktree. Rejects unresolved/unstaged paths and changed parents. Does not run hooks. Run verification from that worktree afterwards; returns a durable task."
+    )]
+    async fn integration_resolve(
+        &self,
+        Parameters(request): Parameters<IntegrationResolveRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.integration_resolve(request))
+    }
+    #[tool(
+        name = "integration.complete",
+        description = "Confirm a resolved integration using current, complete revision-bound format/check/test/clippy evidence from its worktree. Retains the validated branch for PR delivery without overwriting checked-out main. Returns a durable task."
+    )]
+    async fn integration_complete(
+        &self,
+        Parameters(request): Parameters<IntegrationCompleteRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.integration_complete(request))
+    }
+    #[tool(
+        name = "commit.execute",
+        description = "Execute an immutable owned commit plan using a private index and compare-and-swap HEAD. Preserves unrelated staged work and worktree files; honors commit signing, but does not run Git hooks. Run project verification first. Returns a durable task; retry the same plan to reconcile interrupted execution."
+    )]
+    async fn commit_execute(
+        &self,
+        Parameters(request): Parameters<CommitExecuteRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.commit_execute(request))
+    }
+
+    #[tool(
+        name = "commit.get",
+        description = "Recover a commit plan and its durable execution state, generated commit OIDs and delivery status."
+    )]
+    async fn commit_get(
+        &self,
+        Parameters(request): Parameters<IdRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.commit_get(&request.id)).await
+    }
+
+    #[tool(
+        name = "chunk.create",
+        description = "Record a cohesive delivery chunk from this session's completed commit execution at current HEAD, linking human-owned work and validation references. Does not publish or assume referenced checks are valid."
+    )]
+    async fn chunk_create(
+        &self,
+        Parameters(request): Parameters<ChunkCreateRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.chunk_create(request)).await
+    }
+
+    #[tool(
+        name = "chunk.get",
+        description = "Inspect an immutable work chunk and its exact base/head, commits, ownership and validation references."
+    )]
+    async fn chunk_get(
+        &self,
+        Parameters(request): Parameters<IdRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.chunk_get(&request.id)).await
+    }
+
+    #[tool(
+        name = "chunk.list",
+        description = "List delivery chunks shared across all linked worktrees, with bounded pagination."
+    )]
+    async fn chunk_list(
+        &self,
+        Parameters(request): Parameters<SessionListRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || {
+            observatory.chunk_list(request.limit.unwrap_or(50), request.offset.unwrap_or(0))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "integration.preview",
+        description = "Resolve source/base refs and compute Git merge-tree evidence without modifying either index or worktree. Returns clean/conflicted state, immutable OIDs, conflicting paths and explanatory messages as a durable task."
+    )]
+    async fn integration_preview(
+        &self,
+        Parameters(request): Parameters<IntegrationPreviewRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.integration_preview(request))
+    }
+
+    #[tool(
+        name = "session.start",
+        description = "Register a leased coding session shared across Git worktrees; optionally create an isolated branch/worktree without copying dirty files. Returns a durable task; poll task.get for its session and private lease token."
+    )]
+    async fn session_start(
+        &self,
+        Parameters(request): Parameters<SessionStartRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.session_start(request))
+    }
+
+    #[tool(
+        name = "session.heartbeat",
+        description = "Renew an active coding session lease and describe current activity. Requires its private lease token; closed or expired sessions cannot be revived."
+    )]
+    async fn session_heartbeat(
+        &self,
+        Parameters(request): Parameters<HeartbeatRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.session_heartbeat(request)).await
+    }
+
+    #[tool(
+        name = "session.claim",
+        description = "Atomically replace this session's file/subtree ownership claims. Overlap reports identify the current owner and preserve existing claims. An empty paths list releases claims; use the registered worktree and lease token."
+    )]
+    async fn session_claim(
+        &self,
+        Parameters(request): Parameters<ClaimRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.session_claim(request)).await
+    }
+
+    #[tool(
+        name = "session.get",
+        description = "Inspect one coding session's owner, intent, worktree, branch, lease status, activity and claims without exposing its private token."
+    )]
+    async fn session_get(
+        &self,
+        Parameters(request): Parameters<IdRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.session_get(&request.id)).await
+    }
+
+    #[tool(
+        name = "session.list",
+        description = "List active parallel coding sessions across all linked Git worktrees, with owners, intent, activity and claimed paths. Supports explicit pagination and inactive history."
+    )]
+    async fn session_list(
+        &self,
+        Parameters(request): Parameters<SessionListRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.session_list(request)).await
+    }
+
+    #[tool(
+        name = "session.close",
+        description = "Close an active coding session and release its ownership claims using its private lease token. Retains branches and worktrees so no uncommitted or committed work is deleted."
+    )]
+    async fn session_close(
+        &self,
+        Parameters(request): Parameters<SessionAuth>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.session_close(request)).await
+    }
+
+    #[tool(
+        name = "commit.plan",
+        description = "Prepare cohesive whole-file commit groups from live changes owned by the coding session. Records HEAD and content fingerprints, reports unassigned paths, and never stages another session's files. Returns a durable task."
+    )]
+    async fn commit_plan(
+        &self,
+        Parameters(request): Parameters<CommitPlanRequest>,
+    ) -> Result<Json<Value>, String> {
+        Self::value(self.observatory.commit_plan(request))
+    }
+
     #[tool(
         name = "repo.consult",
         description = "Mandatory first-call preflight for every repository-scoped user request. Returns global and topical decisions, steering, design and quality constraints, restrictions, governing documentation, workflows, lifecycle risks, runtime contracts, and known work before planning, answering, or acting."
@@ -894,7 +1425,7 @@ impl CrustyServer {
 #[tool_handler(
     name = "Crusty",
     version = "0.3.0",
-    instructions = "Crusty is a Rust repository observatory. For every repository-scoped user prompt, call repo.consult first with the user's complete intent before planning, answering, or acting; do not skip consultation for design, review, questions, documentation, configuration, or non-code work. Apply relevant human decisions, steering, design and quality constraints, restrictions, governing documents, and workflows returned by the consultation. Consultation is read-only and does not replace change preparation: use change.prepare before edits and change.validate afterwards, polling both with task.get; task.list and change.get recover interrupted workflows. Use repo.architecture for a bounded live architecture map and audit.start for a durable contextual audit. Change preparation captures an architecture baseline; validation reports advisory new, worsened, and resolved findings without blocking on inferred debt. Use repo.search exact for live call-site work and symbol.relations for callers, references, implementations, and definitions; neither refreshes. When a broad read is empty, check index.status: never_published distinguishes an unbuilt index from no matches. Change preparation, validation, refresh, audit, and research are explicit durable tasks. Research uses local repository evidence plus primary-first web_search by the attached agent; no external connectors are available. Findings are proposals and only a human may review or promote them into work. Quality proposal never activates a constraint: activation, merging, finding promotion, and work writes require explicit human confirmation. Source, compiler/runtime behavior, and human ownership remain authoritative."
+    instructions = "Crusty is a Rust repository observatory. For every repository-scoped user prompt, call repo.consult first with the user's complete intent before planning, answering, or acting; do not skip consultation for design, review, questions, documentation, configuration, or non-code work. Apply relevant human decisions, steering, design and quality constraints, restrictions, governing documents, and workflows returned by the consultation. Consultation is read-only and does not replace change preparation: use change.prepare before edits and change.validate afterwards, polling both with task.get; task.list and change.get recover interrupted workflows. Use repo.architecture for a bounded live architecture map and audit.start for a durable contextual audit. Change preparation captures an architecture baseline; validation reports advisory new, worsened, and resolved findings without blocking on inferred debt. Use repo.search exact for live call-site work and symbol.relations for callers, references, implementations, and definitions; neither refreshes. When a broad read is empty, check index.status: never_published distinguishes an unbuilt index from no matches. Change preparation, validation, refresh, audit, and research are explicit durable tasks. Research uses local repository evidence plus primary-first web_search by the attached agent. GitHub delivery uses the installed gh CLI only under explicit bounded human delivery policy; never infer remote mutation consent from research or implementation requests. Findings are proposals and only a human may review or promote them into work. Quality proposal never activates a constraint: activation, merging, finding promotion, and work writes require explicit human confirmation. For parallel coding, register owner/intent with session.start, prefer an isolated worktree, claim paths before edits, heartbeat before expiry, and close after handoff. Claim conflicts require narrowing scope or owner handoff. Use commit.plan and commit.execute for cohesive owned whole-file changes; execution preserves unrelated staging and uses exact trees without running hooks. Consult project.contract, obtain engineering guidance, and run revision-bound verification before publishing chunks or completed integrations. Reviews pin head/base evidence; queued merge requests remain pending until actual merge is observed. Source, compiler/runtime behavior, and human ownership remain authoritative."
 )]
 impl ServerHandler for CrustyServer {}
 
@@ -936,22 +1467,58 @@ mod tests {
                 "checkpoint.diff",
                 "checkpoint.list",
                 "checkpoint.restore",
+                "chunk.create",
+                "chunk.get",
+                "chunk.list",
+                "cleanup.get",
+                "cleanup.plan",
+                "commit.execute",
+                "commit.get",
+                "commit.plan",
                 "dashboard.open",
                 "decision.list",
                 "decision.record",
                 "decision.retire",
+                "delivery.policy.get",
+                "delivery.policy.grant",
+                "delivery.policy.revoke",
+                "domain.model.get",
+                "domain.model.list",
+                "domain.model.propose",
+                "domain.model.review",
+                "engineering.guidance",
                 "finding.evidence.add",
                 "finding.get",
                 "finding.list",
                 "finding.promote",
                 "finding.review",
+                "github.action.get",
+                "github.action.list",
+                "github.action.reconcile",
+                "github.pr.get",
+                "github.pr.list",
+                "github.pr.merge",
+                "github.pr.publish",
+                "github.pr.ready",
+                "github.review.packet",
+                "github.review.submit",
+                "github.status",
                 "index.refresh",
                 "index.status",
+                "integration.complete",
+                "integration.get",
+                "integration.preview",
+                "integration.resolve",
+                "integration.start",
                 "memory.search",
+                "performance.contract",
+                "performance.get",
+                "performance.measure",
                 "problem.get",
                 "problem.list",
                 "problem.record",
                 "problem.update",
+                "project.contract",
                 "quality.get",
                 "quality.list",
                 "quality.merge",
@@ -974,6 +1541,14 @@ mod tests {
                 "research.packet",
                 "research.start",
                 "research.submit",
+                "semantic.query",
+                "semantic.status",
+                "session.claim",
+                "session.close",
+                "session.get",
+                "session.heartbeat",
+                "session.list",
+                "session.start",
                 "steering.list",
                 "steering.record",
                 "symbol.relations",
@@ -982,6 +1557,9 @@ mod tests {
                 "task.list",
                 "validation.queue",
                 "validation.record",
+                "verification.get",
+                "verification.plan",
+                "verification.run",
                 "work.create",
                 "work.get",
                 "work.list",
@@ -1053,6 +1631,17 @@ mod tests {
         assert!(required("repo.search").contains(&"query".to_owned()));
         assert!(required("repo.consult").contains(&"topic".to_owned()));
         assert!(required("symbol.relations").contains(&"symbol".to_owned()));
+        for name in [
+            "session.claim",
+            "session.close",
+            "session.heartbeat",
+            "commit.plan",
+        ] {
+            assert!(required(name).contains(&"session_id".to_owned()));
+            assert!(required(name).contains(&"lease_token".to_owned()));
+        }
+        assert!(required("session.claim").contains(&"paths".to_owned()));
+        assert!(required("commit.plan").contains(&"groups".to_owned()));
         assert!(required("change.validate").contains(&"context_id".to_owned()));
         let validation_schema = &tools
             .iter()

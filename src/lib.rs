@@ -2,12 +2,21 @@
 //! Semantic facts returned by a static scan are explicitly marked as such.
 
 pub mod analysis;
+pub mod cleanup;
+pub mod coordination;
 pub mod dashboard;
+pub mod delivery;
+pub mod domain;
 mod execution;
+pub mod github;
+pub mod guidance;
+pub mod live_semantics;
 pub mod observatory;
+pub mod performance;
 mod quality;
 mod response_budget;
 mod validation_diff;
+pub mod verification;
 
 pub use validation_diff::{DiffSource, DiffTarget};
 
@@ -29,7 +38,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{ChildStdin, Command, Stdio},
     sync::{
@@ -50,10 +59,6 @@ const MAX_SEARCH_BODY_BYTES: usize = 48_000;
 /// `.xml`, `.yaml`, and `.md`, so a checked-in fixture could otherwise be read
 /// whole into memory and inserted verbatim.
 const MAX_DOCUMENT_BYTES: usize = 256_000;
-/// Upper bound on the raw command output attached to a check result.
-const MAX_CHECK_OUTPUT_BYTES: usize = 8_000;
-/// Upper bound on structured diagnostics attached to a check result.
-const MAX_CHECK_DIAGNOSTICS: usize = 40;
 /// Superseded index generations retained for publishing history.
 const MAX_RETAINED_GENERATIONS: i64 = 20;
 /// Upper bound on full-text decision hits examined before status filtering;
@@ -344,12 +349,33 @@ pub struct RustAnalyzerClient {
     responses: Receiver<Value>,
     next_id: u64,
     opened_versions: HashMap<String, (i64, blake3::Hash)>,
+    capabilities: Value,
+    server_status: Value,
+    configuration: Value,
 }
 
 impl RustAnalyzerClient {
     fn start(workspace: &Path, program: &Path) -> Result<Self> {
+        Self::start_configured(
+            workspace,
+            program,
+            rust_analyzer_initialization_options(),
+            None,
+        )
+    }
+
+    fn start_configured(
+        workspace: &Path,
+        program: &Path,
+        options: Value,
+        toolchain: Option<&str>,
+    ) -> Result<Self> {
+        let mut command = Command::new(program);
+        if let Some(toolchain) = toolchain {
+            command.env("RUSTUP_TOOLCHAIN", toolchain);
+        }
         let mut child = execution::OwnedChild::spawn(
-            Command::new(program)
+            command
                 .current_dir(workspace)
                 // Keep the analyzer's Cargo subprocesses from multiplying the
                 // worker limit below.  This is intentionally a conservative
@@ -369,7 +395,9 @@ impl RustAnalyzerClient {
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             while let Some(message) = read_lsp(&mut reader) {
-                if message.get("id").is_some() && sender.send(message).is_err() {
+                if (message.get("id").is_some() || message["method"] == "experimental/serverStatus")
+                    && sender.send(message).is_err()
+                {
                     break;
                 }
             }
@@ -381,21 +409,22 @@ impl RustAnalyzerClient {
             .context("opening rust-analyzer stdin")?;
         let request = json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"processId": std::process::id(), "rootUri": format!("file://{}", workspace.display()),
-                "capabilities": {},
-                "initializationOptions": rust_analyzer_initialization_options(),
-                "workspaceFolders": [{"uri": format!("file://{}", workspace.display()), "name": "workspace"}]}
+            "params": {"processId": std::process::id(), "rootUri": live_semantics::file_uri(workspace),
+                "capabilities": {"general":{"positionEncodings":["utf-16"]},"experimental":{"serverStatusNotification":true},
+                    "workspace":{"configuration":true},"textDocument":{"codeAction":{"codeActionLiteralSupport":{"codeActionKind":{"valueSet":["quickfix","refactor"]}}}}},
+                "initializationOptions": options,
+                "workspaceFolders": [{"uri": live_semantics::file_uri(workspace), "name": "workspace"}]}
         });
         write_lsp(&mut stdin, &request)?;
         let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
+        let capabilities = loop {
             let wait = deadline
                 .checked_duration_since(Instant::now())
                 .context("rust-analyzer initialization timed out")?;
             let response = responses
                 .recv_timeout(wait)
                 .context("waiting for rust-analyzer initialization")?;
-            if answer_lsp_request(&mut stdin, &response)? {
+            if answer_lsp_request_configured(&mut stdin, &response, &options)? {
                 continue;
             }
             if response.get("id").and_then(Value::as_u64) == Some(1) {
@@ -404,9 +433,9 @@ impl RustAnalyzerClient {
                     "rust-analyzer initialization failed: {}",
                     response["error"]
                 );
-                break;
+                break response["result"]["capabilities"].clone();
             }
-        }
+        };
         write_lsp(
             &mut stdin,
             &json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
@@ -417,6 +446,9 @@ impl RustAnalyzerClient {
             responses,
             next_id: 2,
             opened_versions: HashMap::new(),
+            capabilities,
+            server_status: Value::Null,
+            configuration: options,
         })
     }
 
@@ -477,16 +509,37 @@ impl RustAnalyzerClient {
 }
 
 fn answer_lsp_request(stdin: &mut ChildStdin, message: &Value) -> Result<bool> {
+    answer_lsp_request_configured(stdin, message, &rust_analyzer_initialization_options())
+}
+
+fn answer_lsp_request_configured(
+    stdin: &mut ChildStdin,
+    message: &Value,
+    configuration: &Value,
+) -> Result<bool> {
     let (Some(id), Some(method)) = (message.get("id"), message["method"].as_str()) else {
         return Ok(false);
     };
     let result = match method {
-        "workspace/configuration" => json!(vec![
-            Value::Null;
+        "workspace/configuration" => json!(
             message["params"]["items"]
                 .as_array()
-                .map_or(0, Vec::len)
-        ]),
+                .into_iter()
+                .flatten()
+                .map(|item| {
+                    let section = item["section"].as_str().unwrap_or("");
+                    if section.is_empty() || section == "rust-analyzer" {
+                        configuration.clone()
+                    } else if let Some(path) = section.strip_prefix("rust-analyzer.") {
+                        path.split('.')
+                            .fold(configuration, |value, key| &value[key])
+                            .clone()
+                    } else {
+                        Value::Null
+                    }
+                })
+                .collect::<Vec<_>>()
+        ),
         "client/registerCapability"
         | "client/unregisterCapability"
         | "window/workDoneProgress/create"
@@ -507,7 +560,7 @@ fn answer_lsp_request(stdin: &mut ChildStdin, message: &Value) -> Result<bool> {
 }
 
 fn rust_analyzer_initialization_options() -> Value {
-    json!({
+    let mut options = json!({
         // This process is not an editor and does not need diagnostics after
         // every didOpen notification.  Semantic reference requests still work.
         "checkOnSave": false,
@@ -526,7 +579,28 @@ fn rust_analyzer_initialization_options() -> Value {
                 "CARGO_BUILD_JOBS": RUST_ANALYZER_THREADS.to_string(),
             },
         },
-    })
+    });
+    if let Ok(features) = std::env::var("RUST_REPO_INTELLIGENCE_FEATURES")
+        && features != "cargo-default"
+    {
+        options["cargo"]["features"] = if features == "all" {
+            json!("all")
+        } else {
+            json!(
+                features
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            )
+        };
+    }
+    if let Ok(target) = std::env::var("CARGO_BUILD_TARGET")
+        && !target.is_empty()
+    {
+        options["cargo"]["target"] = json!(target);
+    }
+    options
 }
 
 fn rust_analyzer_enabled(value: Option<&str>) -> bool {
@@ -610,7 +684,11 @@ fn read_lsp(reader: &mut impl BufRead) -> Option<Value> {
             content_length = value.trim().parse::<usize>().ok();
         }
     }
-    let mut body = vec![0; content_length?];
+    let length = content_length?;
+    if length > execution::MAX_CAPTURE_BYTES {
+        return None;
+    }
+    let mut body = vec![0; length];
     reader.read_exact(&mut body).ok()?;
     serde_json::from_slice(&body).ok()
 }
@@ -634,6 +712,7 @@ pub(crate) struct SemanticBackend {
     client: Option<RustAnalyzerClient>,
     start_attempted: bool,
     start_error: Option<String>,
+    live_profile: Option<String>,
 }
 
 struct PublisherLease(File);
@@ -699,9 +778,20 @@ impl Service {
         let Ok(mut backend) = self.ra.lock() else {
             return;
         };
-        if backend.start_attempted {
+        let profile = format!(
+            "index:{}",
+            blake3::hash(
+                rust_analyzer_initialization_options()
+                    .to_string()
+                    .as_bytes()
+            )
+            .to_hex()
+        );
+        if backend.start_attempted && backend.live_profile.as_deref() == Some(&profile) {
             return;
         }
+        backend.client = None;
+        backend.live_profile = Some(profile);
         backend.start_attempted = true;
         match RustAnalyzerClient::start(&self.root, &self.ra_program) {
             Ok(client) => {
@@ -2470,7 +2560,7 @@ impl Service {
             used += slice.source.len();
             slices.push(slice);
         }
-        let payload = json!({"context_id":context_id,"intent":intent,"revision":self.revision(),"snapshot":self.snapshot(),"automatic_problem_capture":automatic_problem_capture,"primary_symbols":target_nodes,"references":references,"reference_provenance":{"semantic":"RustAnalyzer (confidence 1.0), cached by semantic snapshot","fallback":"Syntax-derived, ambiguity-suppressed relationships (confidence labelled)"},"semantic_references":semantic_references,"uncertain_static_references":uncertain_static_references,"runtime_contracts":runtime_contracts,"tests":tests,"use_cases":use_cases,"decisions":decisions,"steerings":steerings,"lifecycle":lifecycle,"obsolete_candidates":obsolete.get("candidates"),"work_items":work.get("items"),"likely_change_surface":likely_surface,"source_slices":slices,"context_budget":{"tokens":token_budget,"estimated_tokens":used.div_ceil(4)},"generation":self.active_generation(),"semantic_snapshot":self.semantic_snapshot_resource(),"risk":risk(&target_nodes, &references),"validation_queue":validation_queue,"architecture_guard":architecture_guard,"unresolved_edges":["Ambiguous static references are reported separately and excluded from likely_change_surface.","Runtime registration, generated code, inactive feature/target profiles, external consumers, and deployment state require profile-specific or runtime verification."],"verification_plan":["cargo check --all-targets","cargo test","Use repo.matrix for no-default, individual-feature, and all-feature checks.","Validate changed GTK UI/Blueprint files with the project GTK tooling.","Compare changed D-Bus XML with runtime introspection and external consumer expectations."],"semantic_note":"rust-analyzer facts are resolved on demand and persisted for the active semantic snapshot. Syntax relationships are AST-derived; unresolved ambiguous names are retained as uncertainty, not impact edges."});
+        let payload = json!({"context_id":context_id,"intent":intent,"revision":self.revision(),"snapshot":self.snapshot(),"automatic_problem_capture":automatic_problem_capture,"primary_symbols":target_nodes,"references":references,"reference_provenance":{"semantic":"RustAnalyzer (confidence 1.0), cached by semantic snapshot","fallback":"Syntax-derived, ambiguity-suppressed relationships (confidence labelled)"},"semantic_references":semantic_references,"uncertain_static_references":uncertain_static_references,"runtime_contracts":runtime_contracts,"tests":tests,"use_cases":use_cases,"decisions":decisions,"steerings":steerings,"lifecycle":lifecycle,"obsolete_candidates":obsolete.get("candidates"),"work_items":work.get("items"),"likely_change_surface":likely_surface,"source_slices":slices,"context_budget":{"tokens":token_budget,"estimated_tokens":used.div_ceil(4)},"generation":self.active_generation(),"semantic_snapshot":self.semantic_snapshot_resource(),"risk":risk(&target_nodes, &references),"validation_queue":validation_queue,"architecture_guard":architecture_guard,"approved_models":domain::approved_for_root(&self.root,&self.execution)?,"live_instructions":self.live_instructions()?,"engineering_route":guidance::guidance_hint(intent),"unresolved_edges":["Ambiguous static references are reported separately and excluded from likely_change_surface.","Runtime registration, generated code, inactive feature/target profiles, external consumers, and deployment state require profile-specific or runtime verification."],"verification_plan":["Read current project.contract and engineering.guidance for this change.","Use verification.plan for the supported Cargo profiles, targets, MSRV and lint policy; default tests include doctests.","Run relevant changed-artifact and specialized correctness/performance checks.","Results are revision/profile bound; incomplete or stale evidence cannot authorize delivery."],"semantic_note":"rust-analyzer facts are resolved on demand and persisted for the active semantic snapshot. Syntax relationships are AST-derived; unresolved ambiguous names are retained as uncertainty, not impact edges."});
         self.db.execute("INSERT INTO change_contexts(id, intent, payload, revision, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![context_id, intent, payload.to_string(), self.revision().workspace_digest, Utc::now().to_rfc3339()])?;
         Ok(response_budget::bound(payload, token_budget))
     }
@@ -3125,18 +3215,53 @@ impl Service {
             .collect();
         let unmodified: Vec<_> = expected.difference(&changed_files).cloned().collect();
         self.execution.check()?;
-        let mut checks = Vec::new();
-        if run_checks {
-            for arguments in [
-                &["fmt", "--check"][..],
-                &["check", "--all-targets"][..],
-                &["clippy", "--all-targets", "--", "-D", "warnings"][..],
-                &["test", "--all-targets"][..],
-            ] {
-                self.execution.check()?;
-                checks.push(controlled_check(&self.root, arguments, &self.execution));
-                self.execution.check()?;
-            }
+        let verification = if run_checks {
+            let coordinator = coordination::Coordinator::open(&self.root, self.execution.clone())?;
+            let plan = coordinator.verification_plan(verification::VerificationPlanRequest {
+                profile: verification::BuildProfile::default(),
+                checks: vec![
+                    verification::CheckKind::Format,
+                    verification::CheckKind::Check,
+                    verification::CheckKind::Test,
+                    verification::CheckKind::Clippy,
+                ],
+                offline: false,
+                test_filter: None,
+                deny_warnings: None,
+            })?;
+            Some(
+                coordinator.verification_run(
+                    plan["id"].as_str().context("verification plan has no ID")?,
+                )?,
+            )
+        } else {
+            None
+        };
+        let mut checks = verification
+            .as_ref()
+            .and_then(|report| report["checks"].as_array())
+            .into_iter()
+            .flatten()
+            .map(|check| {
+                let mut check = check.clone();
+                check["success"] = check["passed"].clone();
+                check["command"] = json!(format!(
+                    "cargo {}",
+                    check["args"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ));
+                check
+            })
+            .collect::<Vec<_>>();
+        if let Some(verification) = &verification
+            && verification["source_unchanged"] != true
+        {
+            checks.push(json!({"command":"revision/environment binding","success":false,"reason":"Source, toolchain or environment changed while checks ran; results do not validate current code."}));
         }
         let artifact_checks = if run_checks {
             changed_files
@@ -3183,7 +3308,7 @@ impl Service {
             &blocking,
         );
         Ok(
-            json!({"context_id":context_id,"diff_scope":resolved.scope,"analysis_target":"current_worktree","revision_before":context.get("revision"),"revision_after":self.revision(),"snapshot":self.snapshot(),"changed_files":changed_files,"expected_affected_files":expected,"unmodified_expected_callers":unmodified,"new_references":"Re-run change.prepare after signature changes to refresh static candidates.","architectural_violations":self.decision_conflicts(&diff)?,"architecture_delta":architecture_delta,"legacy_paths_touched":legacy_left,"unresolved_edges":context.get("unresolved_edges"),"recommended_tests":context.get("tests"),"recommended_commands":["cargo fmt --check","cargo check --all-targets","cargo clippy --all-targets -- -D warnings","cargo test","gtk4-builder-tool validate <changed.ui>","blueprint-compiler compile <changed.blp>","xmllint --noout <changed.xml>"],"validation_queue":validation_queue,"checks":checks,"artifact_checks":artifact_checks,"learned_checks":learned_checks,"validation_status":validation_status,"blocking":blocking,"uncertainty":"Artifact validators and architecture detectors can identify current static evidence, but not runtime registration, generated-code drift, external-consumer compatibility, or deployment behavior."}),
+            json!({"context_id":context_id,"diff_scope":resolved.scope,"analysis_target":"current_worktree","revision_before":context.get("revision"),"revision_after":self.revision(),"snapshot":self.snapshot(),"changed_files":changed_files,"expected_affected_files":expected,"unmodified_expected_callers":unmodified,"new_references":"Re-run change.prepare after signature changes to refresh static candidates.","architectural_violations":self.decision_conflicts(&diff)?,"architecture_delta":architecture_delta,"legacy_paths_touched":legacy_left,"unresolved_edges":context.get("unresolved_edges"),"recommended_tests":context.get("tests"),"recommended_commands":["Read project.contract and use verification.plan for supported profiles and current lint policy.","Run applicable artifact and human-approved specialized checks; report every unrun profile."],"validation_queue":validation_queue,"checks":checks,"artifact_checks":artifact_checks,"learned_checks":learned_checks,"validation_status":validation_status,"verification":verification,"blocking":blocking,"uncertainty":"Artifact validators and architecture detectors can identify current static evidence, but not runtime registration, generated-code drift, external-consumer compatibility, or deployment behavior."}),
         )
     }
 
@@ -3332,6 +3457,8 @@ impl Service {
             &mut used,
             max_bytes,
         );
+        let (live_instructions, omitted_instructions) =
+            budget_section(self.live_instructions()?, &mut used, max_bytes);
         let (governing_documents, omitted_documents) =
             budget_section(self.governing_documents(topic, 12)?, &mut used, max_bytes);
         let (known_work, omitted_work) = budget_section(
@@ -3363,6 +3490,7 @@ impl Service {
             "known_work": omitted_work,
             "lifecycle_risks": omitted_risks,
             "runtime_contracts": omitted_contracts,
+            "live_instructions": omitted_instructions,
         });
         let truncated = omitted_decisions
             + omitted_steerings
@@ -3371,6 +3499,7 @@ impl Service {
             + omitted_work
             + omitted_risks
             + omitted_contracts
+            + omitted_instructions
             > 0;
         let mut relevant_sections = Vec::new();
         for (name, values) in [
@@ -3381,6 +3510,7 @@ impl Service {
             ("known_work", &known_work),
             ("lifecycle_risks", &lifecycle_risks),
             ("runtime_contracts", &runtime_contracts),
+            ("live_instructions", &live_instructions),
         ] {
             if !values.is_empty() {
                 relevant_sections.push(name);
@@ -3400,6 +3530,8 @@ impl Service {
                 "known_work": known_work,
                 "lifecycle_risks": lifecycle_risks,
                 "runtime_contracts": runtime_contracts,
+                "live_instructions": live_instructions,
+                "engineering_route":guidance::guidance_hint(topic),
                 "next_steps": [
                     "Apply relevant human guidance before continuing.",
                     "If the request will modify repository files, call change.prepare before the first edit and change.validate after the edits.",
@@ -3513,6 +3645,61 @@ impl Service {
                 .is_some_and(|path| seen.insert(path.to_owned()))
         });
         documents.truncate(limit);
+        Ok(documents)
+    }
+
+    fn live_instructions(&self) -> Result<Vec<Value>> {
+        let mut documents = Vec::new();
+        let entries = walkdir::WalkDir::new(&self.root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| {
+                entry.depth() == 0
+                    || !(matches!(
+                        entry.file_name().to_str(),
+                        Some(".git" | ".rust-repo-intelligence")
+                    ) || entry.depth() == 1 && entry.file_name() == "target")
+            });
+        for (scanned, entry) in entries.enumerate() {
+            self.execution.check()?;
+            if scanned >= 100_000 {
+                documents.push(json!({"complete":false,"provenance":"LiveInstructionScanLimit","next":"The scan reached 100000 entries. Read scoped instructions directly."}));
+                break;
+            }
+            let entry = entry?;
+            if !entry.file_type().is_file()
+                || !matches!(
+                    entry.file_name().to_str(),
+                    Some("AGENTS.md" | "CLAUDE.md" | "CONTEXT.md" | "CONTRIBUTING.md")
+                )
+            {
+                continue;
+            }
+            let path = entry
+                .path()
+                .strip_prefix(&self.root)?
+                .to_string_lossy()
+                .into_owned();
+            let mut bytes = Vec::new();
+            File::open(entry.path())?
+                .take(64_001)
+                .read_to_end(&mut bytes)?;
+            let complete = bytes.len() <= 64_000;
+            bytes.truncate(64_000);
+            let source = String::from_utf8_lossy(&bytes);
+            documents.push(json!({"path":path,"scope":entry.path().parent().unwrap_or(&self.root).strip_prefix(&self.root)?.to_string_lossy(),
+                "evidence":source,"content_digest":format!("b3:{}",blake3::hash(&bytes).to_hex()),"digest_scope":if complete {"file"} else {"captured_prefix"},"complete":complete,"provenance":"LiveInstructionFile"}));
+            if documents.len() >= 100 {
+                documents.push(json!({"complete":false,"provenance":"LiveInstructionScanLimit","next":"Read additional scoped instructions directly; more than 100 documents were encountered."}));
+                break;
+            }
+        }
+        documents.sort_by_key(|doc| {
+            (
+                doc["scope"].as_str().unwrap_or("").split('/').count(),
+                doc["path"].as_str().unwrap_or("").to_owned(),
+            )
+        });
         Ok(documents)
     }
 
@@ -5724,56 +5911,6 @@ fn decision_markdown(id: &str, d: &RecordDecision, supersedes: &[String]) -> Str
             .join("\n")
     )
 }
-/// Runs one cargo command and returns a bounded, structured result.
-///
-/// This previously returned the entire uncapped `stderr` as prose, so a failing
-/// `cargo test --all-targets` on a real workspace dumped its whole output into
-/// the MCP response and the compiler-error workflow got text where it needed
-/// file/line diagnostics.
-#[cfg(test)]
-fn check(root: &Path, args: &[&str]) -> Value {
-    controlled_check(root, args, &execution::ExecutionControl::default())
-}
-
-fn controlled_check(root: &Path, args: &[&str], control: &execution::ExecutionControl) -> Value {
-    let command = format!("cargo {}", args.join(" "));
-    // `cargo fmt` does not understand `--message-format`, and the JSON stream is
-    // only useful for the compiler-driven commands.
-    let structured = matches!(args.first(), Some(&"check" | &"clippy" | &"test"));
-    let mut invocation = Command::new("cargo");
-    invocation.current_dir(root);
-    let separator = args
-        .iter()
-        .position(|argument| *argument == "--")
-        .unwrap_or(args.len());
-    invocation.args(&args[..separator]);
-    if structured {
-        invocation.arg("--message-format=json-diagnostic-rendered-ansi");
-    }
-    invocation.args(&args[separator..]);
-    match control.output(&mut invocation) {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let diagnostics = if structured {
-                cargo_diagnostics(&stdout)
-            } else {
-                Vec::new()
-            };
-            json!({
-                "command": command,
-                "success": output.status.success(),
-                "diagnostics": diagnostics,
-                "truncated_output": trim_text(&format!("{stderr}\n{stdout}"), MAX_CHECK_OUTPUT_BYTES),
-                "output_truncated": stderr.len() + stdout.len() > MAX_CHECK_OUTPUT_BYTES,
-            })
-        }
-        Err(error) => {
-            json!({"command":command,"success":false,"error":error.to_string()})
-        }
-    }
-}
-
 fn semantic_location(slice: &SourceSlice) -> Value {
     json!({"symbol":slice.symbol,"file":slice.file,"line":slice.range[0],"end_line":slice.range[1],"location":format!("{}:{}",slice.file,slice.range[0]),"provenance":slice.provenance,"confidence":slice.confidence,"stale":slice.stale})
 }
@@ -5808,46 +5945,6 @@ fn validation_verdict(
             })
             .count();
     json!({"verdict": if !run_checks { "not_run" } else if failed > 0 { "failed" } else if unavailable > 0 || blocking["blocked"] == true { "incomplete" } else { "passed" }, "failed_checks":failed,"unavailable_checks":unavailable,"checks_requested":run_checks,"note":"Task completion means the report was produced. This verdict describes executed checks; human-approved blocking obligations are reported separately."})
-}
-
-/// Extracts bounded `file:line` diagnostics from a cargo JSON message stream.
-fn cargo_diagnostics(stdout: &str) -> Vec<Value> {
-    let mut diagnostics = Vec::new();
-    for line in stdout.lines() {
-        if diagnostics.len() >= MAX_CHECK_DIAGNOSTICS {
-            break;
-        }
-        let Ok(message) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if message["reason"] != "compiler-message" {
-            continue;
-        }
-        let diagnostic = &message["message"];
-        let level = diagnostic["level"].as_str().unwrap_or("");
-        if !matches!(level, "error" | "warning") {
-            continue;
-        }
-        let span = diagnostic["spans"]
-            .as_array()
-            .and_then(|spans| spans.iter().find(|span| span["is_primary"] == true));
-        diagnostics.push(json!({
-            "level": level,
-            "code": diagnostic["code"]["code"].as_str(),
-            "message": trim_text(diagnostic["message"].as_str().unwrap_or(""), 1_000),
-            "file": span.and_then(|span| span["file_name"].as_str()),
-            "line": span.and_then(|span| span["line_start"].as_u64()),
-            "column": span.and_then(|span| span["column_start"].as_u64()),
-            "location": span.and_then(|span| {
-                Some(format!(
-                    "{}:{}",
-                    span["file_name"].as_str()?,
-                    span["line_start"].as_u64()?
-                ))
-            }),
-        }));
-    }
-    diagnostics
 }
 
 fn artifact_validator(path: &Path) -> Option<(&'static str, Vec<OsString>)> {
@@ -6024,27 +6121,6 @@ mod tests {
         let slice = service.source_slice(&node, "audit", "DEFINES").unwrap();
         assert!(slice.stale);
         assert_ne!(slice.content_hash, node.content_hash);
-    }
-
-    #[test]
-    fn audit_clippy_arguments_work_for_clean_crate() {
-        let d = tempdir().unwrap();
-        fs::create_dir(d.path().join("src")).unwrap();
-        fs::write(
-            d.path().join("Cargo.toml"),
-            "[package]\nname='clean_audit'\nversion='0.1.0'\nedition='2024'\n",
-        )
-        .unwrap();
-        fs::write(
-            d.path().join("src/lib.rs"),
-            "pub fn answer() -> u32 { 42 }\n",
-        )
-        .unwrap();
-        let result = check(
-            d.path(),
-            &["clippy", "--all-targets", "--", "-D", "warnings"],
-        );
-        assert_eq!(result["success"], true, "{result}");
     }
 
     #[test]
@@ -6916,6 +6992,49 @@ mod tests {
     }
 
     #[test]
+    fn current_scoped_instructions_are_bounded_and_available_before_refresh() {
+        let d = fixture();
+        fs::create_dir_all(d.path().join("src/nested")).unwrap();
+        fs::write(d.path().join("AGENTS.md"), "current root policy\n").unwrap();
+        fs::write(d.path().join("src/nested/AGENTS.md"), "x".repeat(90_000)).unwrap();
+        fs::create_dir_all(d.path().join("target/generated")).unwrap();
+        fs::write(
+            d.path().join("target/generated/AGENTS.md"),
+            "generated instruction is ignored",
+        )
+        .unwrap();
+        let service = Service::open(d.path()).unwrap();
+        let instructions = service.live_instructions().unwrap();
+        let root = instructions
+            .iter()
+            .find(|item| item["path"] == "AGENTS.md")
+            .unwrap();
+        assert_eq!(root["complete"], true);
+        assert_eq!(root["digest_scope"], "file");
+        let nested = instructions
+            .iter()
+            .find(|item| item["path"] == "src/nested/AGENTS.md")
+            .unwrap();
+        assert_eq!(nested["complete"], false);
+        assert_eq!(nested["digest_scope"], "captured_prefix");
+        assert_eq!(nested["evidence"].as_str().unwrap().len(), 64_000);
+        assert!(
+            instructions
+                .iter()
+                .all(|item| !item["path"].as_str().unwrap_or("").starts_with("target/"))
+        );
+        fs::write(d.path().join("AGENTS.md"), "edited live policy\n").unwrap();
+        assert!(
+            service
+                .live_instructions()
+                .unwrap()
+                .iter()
+                .any(|item| item["evidence"] == "edited live policy\n")
+        );
+        assert!(service.active_generation().is_none());
+    }
+
+    #[test]
     fn consultation_includes_global_governance_and_policy_documents() {
         let d = fixture();
         fs::write(
@@ -7568,26 +7687,6 @@ mod tests {
             )
             .is_some()
         );
-    }
-
-    #[test]
-    fn check_results_are_bounded_and_carry_structured_diagnostics() {
-        // `check` returned the entire uncapped stderr as prose, so a failing
-        // `cargo test --all-targets` dumped its whole output into the response
-        // and the compiler-error workflow got text instead of file:line.
-        let stream = r#"{"reason":"compiler-message","message":{"level":"error","code":{"code":"E0308"},"message":"mismatched types","spans":[{"is_primary":true,"file_name":"src/lib.rs","line_start":42,"column_start":9}]}}
-{"reason":"compiler-artifact","package_id":"x"}
-{"reason":"compiler-message","message":{"level":"note","message":"ignored","spans":[]}}"#;
-        let diagnostics = cargo_diagnostics(stream);
-        assert_eq!(
-            diagnostics.len(),
-            1,
-            "only errors and warnings are reported"
-        );
-        assert_eq!(diagnostics[0]["level"], "error");
-        assert_eq!(diagnostics[0]["code"], "E0308");
-        assert_eq!(diagnostics[0]["location"], "src/lib.rs:42");
-        assert_eq!(diagnostics[0]["line"], 42);
     }
 
     fn decision(title: &str, applies_to: &[&str]) -> RecordDecision {

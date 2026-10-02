@@ -44,6 +44,9 @@ jobs:
       - name: Tests
         run: cargo test --locked
 
+      - name: Engineering evaluation oracles
+        run: python3 tests/engineering_evaluation.py self-test
+
       - name: Latency budget
         run: cargo run --release --example observatory_evaluate --locked -- "$GITHUB_WORKSPACE"
 

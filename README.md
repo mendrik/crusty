@@ -3,7 +3,7 @@
 [![CI](https://github.com/mendrik/crusty/actions/workflows/ci.yml/badge.svg)](https://github.com/mendrik/crusty/actions/workflows/ci.yml)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 
-Crusty is a local repository observatory for Rust. It gives an attached coding agent fast source navigation, snapshot-aware change intelligence, durable work memory, and budgeted technical/product/design research without turning an index or an autonomous suggestion into authority.
+Crusty is a local repository observatory and engineering service for Rust. It gives an attached coding agent live Rust semantics, project-specific guidance, revision-bound checks, durable work memory, coordinated coding sessions, and GitHub delivery under explicit policy.
 
 The Cargo package and executable remain named `rust-repo-intelligence`.
 
@@ -29,6 +29,11 @@ Crusty is useful when an agent needs to work in a Rust repository without repeat
 | Guarded research | Budgeted research packets, evidence qualification, human review, and explicit promotion from findings to work. |
 | Safe local dashboard | A loopback-only finding inbox protected by one-time bootstrap, session, CSRF, and CSP controls. |
 | Git-safe checkpoints | Recoverable refs and diffs that never move `HEAD` or rewrite repository history. |
+| Rust engineering | Conditional ownership/API/architecture/cleanup/concurrency/unsafe/performance guidance and human-reviewed domain models. |
+| Live LSP queries | File-position hover, definitions, references, implementations, call hierarchy, macros, dependency information and proposed edits, independent of index publication. |
+| Verification | Current Cargo/instruction contracts, explicit feature/target/toolchain profiles, bounded compiler diagnostics and source/environment-bound results. |
+| Coordinated delivery | Shared sessions and claims, coherent exact-tree commits, isolated conflict resolution, draft PRs, revision-bound reviews, approvals and reconciled merge requests. |
+| Measured optimization | Pinned baseline/candidate release workloads, instrumented timings, output oracles and retained sample artifacts. |
 
 ## How it works
 
@@ -51,7 +56,7 @@ attached agent ─ local scan + web_search ─► findings ─ human review ─�
 - Refresh, checks, and research are task-backed operations with durable progress and cooperative cancellation.
 - A publisher lease prevents two Crusty processes from publishing the same repository index concurrently.
 - Findings, evidence, research runs, tasks, and human-owned work live outside the rebuildable index.
-- Research uses local evidence plus primary-first `web_search` by the attached agent. Crusty has no GitHub, CI, telemetry, analytics, or product-management connector.
+- Research uses local evidence plus primary-first `web_search` by the attached agent. GitHub delivery uses the installed `gh` CLI with an explicit repository and bounded human policy; remote CI and protections remain authoritative.
 - Findings cannot become work without human review and explicit promotion.
 - `memory.search` recovers repository-scoped, user-authored Codex prompts from primary and side-session history and searches preserved legacy guidance without copying either into the work queue.
 - The local dashboard puts the finding inbox first and requires a one-time bootstrap token, an HttpOnly SameSite session, CSRF validation, and a restrictive CSP.
@@ -64,6 +69,7 @@ Crusty results are guidance and provenance—not proof. Current source, compiler
 - Git and a local Rust repository to observe;
 - Codex or another MCP client that supports local stdio servers;
 - optionally, rust-analyzer for the highest-confidence relationship evidence.
+- optionally, an authenticated GitHub CLI (`gh`) for PR delivery and reviews.
 
 ## Install and connect to Codex
 
@@ -149,6 +155,16 @@ Validation reports include `validation_status.verdict`: `passed`, `failed`, `inc
 
 `repo.consult`, `repo.context`, and prepared-change responses budget the entire logical JSON payload, including freshness and metadata, using UTF-8 bytes divided by four as an approximate token estimate. They prioritize human guidance, report omitted sections, and expose `serialized_bytes`. The complete prepared evidence remains available through `change.get`. MCP's text/structured representations and framing add transport overhead; this estimate is not a measurement of model tokens or net token savings.
 
+### Rust intelligence, verification and measured changes
+
+`engineering.guidance` returns conditional Rust expertise with rationale, exceptions and evidence requirements. `project.contract` reads current Cargo metadata and instruction/configuration/CI evidence. `semantic.status/query` expose opt-in live LSP queries with explicit readiness, profile and completeness. `verification.plan/run/get` execute supported Cargo checks and preserve diagnostics and logs; default tests include doctests. `domain.model.propose/review/get/list` record ownership and invariants, activating a model only after explicit human review. `cleanup.plan/get` inventory the complete migration surface. `performance.contract/measure/get` compare measured workloads at pinned revisions. See [engineering workflow and limits](docs/engineering-workflow.md).
+
+### Parallel sessions, commits and GitHub delivery
+
+`session.start` registers owner, intent and work references, optionally creating an isolated Git branch/worktree. `session.claim` acquires exclusive file/subtree ownership across linked worktrees; `session.heartbeat` renews its lease and activity. `session.list/get` expose who is doing what, and `session.close` releases ownership while retaining work. `commit.plan/execute/get` group and commit owned whole-file changes while preserving unrelated staging. `chunk.create/get/list` retain immutable deliverables. `integration.preview/start/resolve/complete/get` preview Git conflicts and validate resolutions in retained isolated worktrees. See [session coordination](docs/session-coordination.md).
+
+`github.status`, `github.pr.list/get`, and `github.review.packet` gather explicit remote evidence. `delivery.policy.grant/get/revoke` govern publication, reviews, approvals and merges. `github.pr.publish/ready`, `github.review.submit`, and `github.pr.merge` execute authorized actions; `github.action.get/list/reconcile` recover their actual remote outcomes. See [GitHub delivery and recovery](docs/github-delivery.md), the [implementation plan](docs/implementation-plan.md), and [evaluation corpus](docs/engineering-evaluation.md).
+
 ### Index and tasks
 
 - `index.status`, `index.refresh`
@@ -214,10 +230,11 @@ The tool starts an Axum server on a random `127.0.0.1` port and returns a one-ti
 
 ## Storage and migration
 
-Crusty uses two SQLite files:
+Crusty uses worktree-local evidence stores and a shared coordination ledger:
 
 - `.rust-repo-intelligence/index.sqlite3`: rebuildable source/Cargo/Git/document projections, prepared contexts, and the newest 20 snapshot-scoped architecture audits, plus the retained problem/quality/validation engine;
 - `.rust-repo-intelligence/memory.sqlite3`: findings, evidence, research runs, tasks, work, and searchable summaries of retained decision/quality records.
+- `<canonical Git common directory>/crusty/coordination.sqlite3`: linked-worktree sessions, claims, commit/delivery intents, accepted models, verification and measurement records. Non-Git roots use `.rust-repo-intelligence/coordination/`. Artifact logs and retained integration/measurement worktrees live beside this ledger.
 
 On first 0.2-or-newer startup, Crusty copies legacy work into the current work store and preserves decisions, steerings, problem records, and learned quality constraints as JSON legacy records. On later opens it refreshes those preserved read-only summaries so guidance added after the initial migration remains discoverable. The old database is never deleted. Both databases use WAL mode; durable memory writes use short connections and a busy timeout.
 

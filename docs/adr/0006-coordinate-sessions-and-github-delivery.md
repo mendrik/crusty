@@ -1,0 +1,5 @@
+# Coordinate coding sessions and GitHub delivery
+
+At the owner's explicit 2026-10-01 request, Crusty will manage parallel coding ownership, coherent work chunks, Git integration and GitHub pull-request delivery alongside Rust engineering intelligence. This replaces ADR 0003's product restriction against GitHub integration for delivery; its attached-agent research workflow and human ownership of proposed findings remain in force. GitHub mutations must identify their repository, branch and revision under explicit authorization or bounded delivery policy, while remote protections remain authoritative.
+
+Coding sessions and path claims share state through Git's canonical common directory so linked worktrees can coordinate without rebuilding or conflating their separate source indexes. Leases fence abandoned sessions; isolation preserves dirty work; reviews and verification bind to identified revisions. We use the existing durable task runner and owned subprocess execution rather than introducing a second agent orchestrator or hosted coordination service.

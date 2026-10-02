@@ -747,6 +747,270 @@ impl Observatory {
         self.root.as_path()
     }
 
+    fn coordinator(&self) -> Result<crate::coordination::Coordinator> {
+        crate::coordination::Coordinator::open(
+            self.root(),
+            self.execution.clone().unwrap_or_default(),
+        )
+    }
+
+    pub fn session_start(
+        &self,
+        request: crate::coordination::SessionStartRequest,
+    ) -> Result<Value> {
+        self.spawn_blocking_task(
+            "session.start",
+            "registering coding session",
+            move |worker, _| worker.coordinator()?.start(request),
+        )
+    }
+
+    pub fn session_heartbeat(
+        &self,
+        request: crate::coordination::HeartbeatRequest,
+    ) -> Result<Value> {
+        self.coordinator()?.heartbeat(request)
+    }
+
+    pub fn session_claim(&self, request: crate::coordination::ClaimRequest) -> Result<Value> {
+        self.coordinator()?.claim(request)
+    }
+
+    pub fn session_get(&self, id: &str) -> Result<Value> {
+        self.coordinator()?.get(id)
+    }
+
+    pub fn session_list(&self, request: crate::coordination::SessionListRequest) -> Result<Value> {
+        self.coordinator()?.list(request)
+    }
+
+    pub fn session_close(&self, request: crate::coordination::SessionAuth) -> Result<Value> {
+        self.coordinator()?.close(request)
+    }
+
+    pub fn commit_plan(&self, request: crate::coordination::CommitPlanRequest) -> Result<Value> {
+        self.spawn_blocking_task(
+            "commit.plan",
+            "planning owned commit groups",
+            move |worker, _| worker.coordinator()?.plan_commits(request),
+        )
+    }
+
+    pub fn commit_execute(&self, request: crate::delivery::CommitExecuteRequest) -> Result<Value> {
+        self.spawn_blocking_task(
+            "commit.execute",
+            "delivering planned commit groups",
+            move |worker, _| worker.coordinator()?.execute_commits(request),
+        )
+    }
+
+    pub fn commit_get(&self, id: &str) -> Result<Value> {
+        self.coordinator()?.commit_get(id)
+    }
+
+    pub fn chunk_create(&self, request: crate::delivery::ChunkCreateRequest) -> Result<Value> {
+        self.coordinator()?.chunk_create(request)
+    }
+
+    pub fn chunk_get(&self, id: &str) -> Result<Value> {
+        self.coordinator()?.chunk_get(id)
+    }
+
+    pub fn chunk_list(&self, limit: usize, offset: usize) -> Result<Value> {
+        self.coordinator()?.chunk_list(limit, offset)
+    }
+
+    pub fn integration_preview(
+        &self,
+        request: crate::delivery::IntegrationPreviewRequest,
+    ) -> Result<Value> {
+        self.spawn_blocking_task(
+            "integration.preview",
+            "computing Git integration evidence",
+            move |worker, _| worker.coordinator()?.integration_preview(request),
+        )
+    }
+
+    pub fn integration_get(&self, id: &str) -> Result<Value> {
+        self.coordinator()?.integration_get(id)
+    }
+    pub fn integration_start(
+        &self,
+        request: crate::delivery::IntegrationStartRequest,
+    ) -> Result<Value> {
+        self.spawn_blocking_task(
+            "integration.start",
+            "creating isolated integration worktree",
+            move |worker, _| worker.coordinator()?.integration_start(request),
+        )
+    }
+    pub fn integration_resolve(
+        &self,
+        request: crate::delivery::IntegrationResolveRequest,
+    ) -> Result<Value> {
+        self.spawn_blocking_task(
+            "integration.resolve",
+            "recording explicit conflict resolution",
+            move |worker, _| worker.coordinator()?.integration_resolve(request),
+        )
+    }
+    pub fn integration_complete(
+        &self,
+        request: crate::delivery::IntegrationCompleteRequest,
+    ) -> Result<Value> {
+        self.spawn_blocking_task(
+            "integration.complete",
+            "checking resolved integration evidence",
+            move |worker, _| worker.coordinator()?.integration_complete(request),
+        )
+    }
+    pub fn project_contract(&self) -> Result<Value> {
+        self.coordinator()?.project_contract()
+    }
+
+    pub fn semantic_status(&self) -> Result<Value> {
+        self.service()?.semantic_status()
+    }
+    pub fn semantic_query(&self, request: crate::live_semantics::SemanticRequest) -> Result<Value> {
+        self.spawn_blocking_task(
+            "semantic.query",
+            "querying current Rust semantics",
+            move |worker, _| worker.service()?.semantic_query(request),
+        )
+    }
+    pub fn verification_plan(
+        &self,
+        request: crate::verification::VerificationPlanRequest,
+    ) -> Result<Value> {
+        self.spawn_blocking_task(
+            "verification.plan",
+            "planning project verification",
+            move |worker, _| worker.coordinator()?.verification_plan(request),
+        )
+    }
+    pub fn verification_run(&self, id: String) -> Result<Value> {
+        self.spawn_blocking_task(
+            "verification.run",
+            "executing revision-bound checks",
+            move |worker, _| worker.coordinator()?.verification_run(&id),
+        )
+    }
+    pub fn verification_get(&self, id: &str) -> Result<Value> {
+        self.coordinator()?.verification_get(id)
+    }
+
+    pub fn github_status(&self, request: crate::github::GithubRepositoryRequest) -> Result<Value> {
+        self.spawn_blocking_task("github.status", "github.status", move |worker, _| {
+            worker.coordinator()?.github_status(request)
+        })
+    }
+    pub fn github_list(&self, request: crate::github::GithubListRequest) -> Result<Value> {
+        self.spawn_blocking_task("github.pr.list", "github.pr.list", move |worker, _| {
+            worker.coordinator()?.github_list(request)
+        })
+    }
+    pub fn github_get(&self, request: crate::github::GithubPrRequest) -> Result<Value> {
+        self.spawn_blocking_task("github.pr.get", "github.pr.get", move |worker, _| {
+            worker.coordinator()?.github_get(request)
+        })
+    }
+    pub fn delivery_policy(&self, request: crate::github::DeliveryPolicyRequest) -> Result<Value> {
+        self.coordinator()?.delivery_policy(request)
+    }
+    pub fn github_review_packet(&self, request: crate::github::GithubPrRequest) -> Result<Value> {
+        self.spawn_blocking_task(
+            "github.review.packet",
+            "github.review.packet",
+            move |worker, _| worker.coordinator()?.github_review_packet(request),
+        )
+    }
+    pub fn github_review(&self, request: crate::github::GithubReviewRequest) -> Result<Value> {
+        self.spawn_blocking_task(
+            "github.review.submit",
+            "github.review.submit",
+            move |worker, _| worker.coordinator()?.github_review(request),
+        )
+    }
+    pub fn github_merge(&self, request: crate::github::GithubMergeRequest) -> Result<Value> {
+        self.spawn_blocking_task("github.pr.merge", "github.pr.merge", move |worker, _| {
+            worker.coordinator()?.github_merge(request)
+        })
+    }
+    pub fn github_publish(&self, request: crate::github::GithubPublishRequest) -> Result<Value> {
+        self.spawn_blocking_task(
+            "github.pr.publish",
+            "github.pr.publish",
+            move |worker, _| worker.coordinator()?.github_publish(request),
+        )
+    }
+    pub fn github_ready(&self, request: crate::github::GithubReadyRequest) -> Result<Value> {
+        self.spawn_blocking_task("github.pr.ready", "github.pr.ready", move |worker, _| {
+            worker.coordinator()?.github_ready(request)
+        })
+    }
+    pub fn github_action_get(&self, id: &str) -> Result<Value> {
+        self.coordinator()?.github_action_get(id)
+    }
+    pub fn github_reconcile(&self, id: String) -> Result<Value> {
+        self.spawn_blocking_task(
+            "github.action.reconcile",
+            "reconciling GitHub action",
+            move |worker, _| worker.coordinator()?.github_reconcile(&id),
+        )
+    }
+    pub fn delivery_policy_get(&self, id: &str) -> Result<Value> {
+        self.coordinator()?.delivery_policy_get(id)
+    }
+    pub fn delivery_policy_revoke(&self, id: &str) -> Result<Value> {
+        self.coordinator()?.delivery_policy_revoke(id)
+    }
+    pub fn github_action_list(&self, limit: usize, offset: usize) -> Result<Value> {
+        self.coordinator()?.github_action_list(limit, offset)
+    }
+    pub fn engineering_guidance(&self, request: crate::guidance::GuidanceRequest) -> Result<Value> {
+        crate::guidance::guidance(request)
+    }
+    pub fn domain_propose(&self, request: crate::domain::DomainModelRequest) -> Result<Value> {
+        self.coordinator()?.domain_propose(request)
+    }
+    pub fn domain_review(&self, request: crate::domain::DomainReviewRequest) -> Result<Value> {
+        self.coordinator()?.domain_review(request)
+    }
+    pub fn domain_get(&self, id: &str) -> Result<Value> {
+        self.coordinator()?.domain_get(id)
+    }
+    pub fn domain_list(&self, limit: usize, offset: usize) -> Result<Value> {
+        self.coordinator()?.domain_list(limit, offset)
+    }
+    pub fn cleanup_plan(&self, request: crate::cleanup::CleanupPlanRequest) -> Result<Value> {
+        self.spawn_blocking_task(
+            "cleanup.plan",
+            "inventorying complete migration surface",
+            move |worker, _| worker.coordinator()?.cleanup_plan(request),
+        )
+    }
+    pub fn cleanup_get(&self, id: &str) -> Result<Value> {
+        self.coordinator()?.cleanup_get(id)
+    }
+    pub fn performance_contract(
+        &self,
+        request: crate::performance::PerformanceContractRequest,
+    ) -> Result<Value> {
+        self.coordinator()?.performance_contract(request)
+    }
+    pub fn performance_measure(
+        &self,
+        request: crate::performance::PerformanceMeasureRequest,
+    ) -> Result<Value> {
+        self.spawn_blocking_task(
+            "performance.measure",
+            "measuring isolated release revisions",
+            move |worker, _| worker.coordinator()?.performance_measure(request),
+        )
+    }
+    pub fn performance_get(&self, id: &str) -> Result<Value> {
+        self.coordinator()?.performance_get(id)
+    }
     fn db(&self) -> Result<Connection> {
         let db = Connection::open(self.memory_path.as_path())?;
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=2500;")?;
@@ -1006,7 +1270,18 @@ impl Observatory {
     pub fn consult(&self, topic: &str, budget: usize) -> Result<Value> {
         ensure!(!topic.trim().is_empty(), "topic is required");
         let freshness = self.freshness("published_snapshot")?;
-        let result = self.service()?.consult(topic, budget.clamp(250, 20_000))?;
+        let mut result = self.service()?.consult(topic, budget.clamp(250, 20_000))?;
+        let models = crate::domain::approved_for_root(
+            self.root(),
+            &self.execution.clone().unwrap_or_default(),
+        )?;
+        if !models.is_empty() {
+            result["guidance_found"] = json!(true);
+            if let Some(sections) = result["relevant_sections"].as_array_mut() {
+                sections.push(json!("approved_models"));
+            }
+        }
+        result["approved_models"] = json!(models);
         Ok(crate::response_budget::bound(
             json!({"freshness":freshness,"result":result}),
             budget,
@@ -2421,6 +2696,7 @@ impl Observatory {
             // stop a blocking closure and previously abandoned live subprocesses.
             let outcome = task::spawn_blocking(move || -> Result<Value> {
                 control.check()?;
+                worker.update_task(&worker_id, "running", 0, "running")?;
                 let value = operation(worker, worker_id)?;
                 control.check()?;
                 Ok(value)
@@ -2481,6 +2757,8 @@ impl Observatory {
                     "context_id": result.pointer("/result/context_id"),
                     "report_id": result.pointer("/report/id"),
                     "run_id": result.get("run_id"),
+                    "id": result.get("id"),
+                    "plan_id": result.get("plan_id"),
                 }
             })
             .to_string()

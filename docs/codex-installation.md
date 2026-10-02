@@ -69,7 +69,7 @@ If `config.toml` contains per-tool approval rules, rename or remove rules that t
 | `repo.work.list`, `repo.work.next` | `work.list`, `work.recommend` |
 | `repo.work.propose`, `repo.work.update` | `work.create`, `work.update` |
 
-The 0.3 API keeps legacy decisions, steerings, and checkpoints out of the public mutation surface. It exposes a bounded problem/quality lifecycle (`problem.*`, `quality.*`, and `validation.*`) plus live and durable architecture audits. Existing quality memory can contribute evidence to prepared changes and validation, while new improvement discovery still flows through proposed findings, human review, and explicitly human-owned work.
+The 0.3 API exposes explicit decision/steering and safe checkpoint operations alongside the bounded problem/quality lifecycle, architecture audits, live semantics, engineering guidance, profile-bound verification and coordinated delivery. Human-owned records and remote actions retain their explicit authorization boundaries. New research discoveries still flow through proposed findings and human review. Consult the [current public API](../README.md#public-mcp-api) and [delivery policy](github-delivery.md).
 
 Project instructions such as `AGENTS.md` must also stop naming removed tools. They should require `repo.consult` as the first call for every repository-scoped prompt, while retaining the separate `change.prepare` and `change.validate` edit workflow. The repository's own [`AGENTS.md`](../AGENTS.md) is a minimal 0.3 policy example.
 
@@ -90,10 +90,10 @@ Projects can migrate lazily when next opened. Before the refresh, `repo.search(m
 
 ## Verify the installation
 
-A successful installation reports server name `Crusty`, version `0.3.0`, and the 61-tool clean-break surface. A useful smoke sequence is:
+A successful installation reports server name `Crusty` and the package version. Inspect MCP `tools/list` for the installed capability surface rather than relying on a stale tool count. A useful smoke sequence is:
 
-1. `repo.authority`
-2. `repo.consult` with a repository design or implementation topic; confirm the response contains a freshness envelope and governing guidance sections
+1. `repo.consult` with the intended repository task
+2. `repo.authority`; also confirm the consultation response contains freshness and governing guidance sections
 3. `index.status`
 4. `repo.search` with `mode=exact`, then `symbol.relations` with `relation=callers`
 5. `repo.architecture`; confirm facts and findings remain separately labelled and evidence-bounded

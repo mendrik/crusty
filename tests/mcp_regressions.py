@@ -128,6 +128,8 @@ from pathlib import Path
 out = Path(os.environ['AUDIT_PROBE_DIR'])
 if sys.argv[1] == 'metadata':
     os.execv(os.environ['AUDIT_REAL_CARGO'], [os.environ['AUDIT_REAL_CARGO'], *sys.argv[1:]])
+if sys.argv[1] == '--version':
+    print('cargo fixture-version'); sys.exit(0)
 with (out/'cargo.jsonl').open('a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')
 if sys.argv[1] == 'fmt':
     (out/'check-started').touch()
@@ -215,8 +217,12 @@ try:
     assert completed['status'] == 'completed', completed
     assert report['validation_status']['verdict'] == 'failed', report
     assert report['checks'][1]['success'] is False
+    clippy_plan = client.tool('verification.plan', {'checks':['clippy'],'deny_warnings':True})[0]
+    clippy_plan = client.settled(clippy_plan['task_id'])['result']
+    clippy_run = client.tool('verification.run', {'id':clippy_plan['id']})[0]
+    assert client.settled(clippy_run['task_id'])['result']['passed'] is True
     clippy = next(json.loads(line) for line in (OUT/'cargo.jsonl').read_text().splitlines() if json.loads(line)[0] == 'clippy')
-    assert clippy.index('--message-format=json-diagnostic-rendered-ansi') < clippy.index('--'), clippy
+    assert clippy.index('--message-format=json') < clippy.index('--'), clippy
     results['failed_check_verdict'] = {'task_status':completed['status'],'checks':report['checks'],'blocking':report['blocking'],'top_level_report_keys':list(report)}
 
     # A second active server must not declare the first server's work dead.
@@ -248,6 +254,141 @@ try:
         assert result['context_budget']['estimated_tokens'] == (compact+3)//4
         measurements.append({'tool':name,'budget':args['budget'],'reported_budget':result.get('context_budget'),'payload_bytes':compact,'payload_bytes_div4_proxy':compact/4,'mcp_result_bytes':raw_bytes,'mcp_result_keys':list(raw)})
     results['payload_budgets']=measurements
+    # Coding coordination is shared by independent servers and linked worktrees.
+    coordination_root = OUT / 'coordination-fixture'
+    coordination_root.mkdir()
+    (coordination_root / 'src').mkdir()
+    (coordination_root / 'src/lib.rs').write_text('pub fn owned() {}\n')
+    (coordination_root / 'Cargo.toml').write_text('[package]\nname="coordination_fixture"\nversion="0.1.0"\nedition="2024"\n')
+    subprocess.run([REAL_CARGO, 'generate-lockfile', '--offline'], cwd=coordination_root, check=True, capture_output=True)
+    git(coordination_root, 'init', '-q')
+    git(coordination_root, 'branch', '-M', 'main')
+    git(coordination_root, 'config', 'user.name', 'Coordination Fixture')
+    git(coordination_root, 'config', 'user.email', 'coordination@example.invalid')
+    git(coordination_root, 'add', '.')
+    git(coordination_root, 'commit', '-qm', 'fixture')
+    owner_server = MCP(coordination_root, env); clients.append(owner_server)
+    owner_server.tool('repo.consult', {'topic':'coordinate parallel code changes'})
+    started = owner_server.tool('session.start', {'owner':'one','intent':'owned function','isolate':True})[0]
+    completed = owner_server.settled(started['task_id'])
+    assert completed['status'] == 'completed', completed
+    one = completed['result']
+    isolated_server = MCP(Path(one['session']['worktree']), env); clients.append(isolated_server)
+    isolated_server.tool('repo.consult', {'topic':'coordinate parallel code changes'})
+    git(coordination_root, 'checkout', '-qb', 'delivery')
+    peer_server = MCP(coordination_root, env); clients.append(peer_server)
+    peer_server.tool('repo.consult', {'topic':'coordinate parallel code changes'})
+    started = peer_server.tool('session.start', {'owner':'two','intent':'another change'})[0]
+    completed = peer_server.settled(started['task_id'])
+    assert completed['status'] == 'completed', completed
+    two = completed['result']
+    credentials = lambda item: {'session_id':item['session']['id'],'lease_token':item['lease_token']}
+    acquired = isolated_server.tool('session.claim', {**credentials(one),'paths':['src']})[0]
+    assert acquired['acquired'] is True
+    collision = peer_server.tool('session.claim', {**credentials(two),'paths':['src/lib.rs']})[0]
+    assert collision['acquired'] is False
+    assert collision['conflicts'][0]['session_id'] == one['session']['id']
+    listed = peer_server.tool('session.list', {})[0]
+    assert len(listed['sessions']) == 2
+    assert one['lease_token'] not in json.dumps(listed)
+    isolated_server.tool('session.close', credentials(one))
+    assert peer_server.tool('session.claim', {**credentials(two),'paths':['src/lib.rs']})[0]['acquired'] is True
+    peer_server.tool('session.heartbeat', {**credentials(two),'summary':'planning cohesive commit'})
+    (coordination_root / 'src/lib.rs').write_text('pub fn owned() -> bool {\n    true\n}\n')
+    pending = peer_server.tool('commit.plan', {**credentials(two),'groups':[{'message':'Return owned result','paths':['src/lib.rs']}]})[0]
+    planned = peer_server.settled(pending['task_id'])
+    assert planned['status'] == 'completed', planned
+    assert planned['result']['groups'][0]['paths'] == ['src/lib.rs']
+    assert planned['result']['executed'] is False
+    assert not subprocess.check_output(['git','diff','--cached'],cwd=coordination_root)
+    executed_task = peer_server.tool('commit.execute', {**credentials(two),'plan_id':planned['result']['plan_id']})[0]
+    executed = peer_server.settled(executed_task['task_id'])
+    assert executed['status'] == 'completed' and executed['result']['state'] == 'completed', executed
+    chunk = peer_server.tool('chunk.create', {**credentials(two),'plan_id':planned['result']['plan_id'],
+        'title':'Return owned result','summary':'The function exposes a boolean result.'})[0]
+    # Run real Cargo checks, then exercise GitHub through an instrumented CLI and
+    # redirect only the exact GitHub push URL to a local bare fixture repository.
+    gh_bin = OUT / 'github-bin'; gh_bin.mkdir()
+    shutil.copy(REPO / 'tests/github_mock.py', gh_bin / 'gh'); (gh_bin / 'gh').chmod(0o755)
+    gh_state = OUT / 'github-state.json'
+    bare = OUT / 'remote.git'; git(OUT, 'init', '--bare', '-q', str(bare))
+    base_oid = subprocess.check_output(['git','rev-parse','main'],cwd=coordination_root,text=True).strip()
+    git(coordination_root, 'push', str(bare), base_oid+':refs/heads/delivery')
+    gh_state.write_text(json.dumps({'head':chunk['head'],'base':base_oid,'actor':'author','bare':str(bare)}))
+    (gh_bin / 'git').write_text("""#!/usr/bin/env python3
+import json, os, sys
+args=sys.argv[1:]
+if args and args[0] in ('push','ls-remote'):
+    assert args[1] in ('--porcelain','--heads') and args[2]=='https://github.test/fixture/repo.git', args
+    args[2]=json.load(open(os.environ['CRUSTY_GITHUB_MOCK_STATE']))['bare']
+os.execv('/usr/bin/git',['/usr/bin/git',*args])
+""")
+    (gh_bin / 'git').chmod(0o755)
+    gh_env = os.environ.copy()
+    gh_env.update(PATH=str(gh_bin)+os.pathsep+gh_env['PATH'],CRUSTY_GITHUB_MOCK_STATE=str(gh_state),
+                  RUST_REPO_INTELLIGENCE_ENABLE_WATCHER='0',RUST_REPO_INTELLIGENCE_ENABLE_RUST_ANALYZER='0')
+    delivery_server = MCP(coordination_root,gh_env); clients.append(delivery_server)
+    def completed(client,name,args):
+        pending=client.tool(name,args)[0]
+        task=client.settled(pending['task_id'])
+        assert task['status']=='completed',(name,task)
+        return task['result']
+    contract = delivery_server.tool('project.contract',{})[0]
+    assert contract['members'][0]['name']=='coordination_fixture'
+    check_plan = completed(delivery_server,'verification.plan',{'offline':True})
+    checks = completed(delivery_server,'verification.run',{'id':check_plan['id']})
+    assert checks['passed'] is True and checks['delivery_eligible'] is True, checks
+    policy = delivery_server.tool('delivery.policy.grant',{'repository':'github.test/fixture/repo','base':'main',
+        'granted_by':'fixture human','actions':['publish','review','approve','merge'],'expires_at':int(time.time())+600,'max_mutations':30})[0]
+    target = {'repository':'github.test/fixture/repo','number':42}
+    publish_args = {**credentials(two),'policy_id':policy['id'],
+        'repository':target['repository'],'base':'main','chunk_id':chunk['id'],'verification_id':checks['id'],
+        'title':'Return owned result','body':'The function now exposes its owned result. Validated with format, check, tests and Clippy.'}
+    pending=delivery_server.tool('github.pr.publish',publish_args)[0]
+    rejected=delivery_server.settled(pending['task_id'])
+    assert rejected['status']=='failed' and 'remote branch changed or already exists' in rejected['error'], rejected
+    assert subprocess.check_output(['git','--git-dir',str(bare),'rev-parse','refs/heads/delivery'],text=True).strip()==base_oid
+    published = completed(delivery_server,'github.pr.publish',{**publish_args,'expected_remote_head':base_oid})
+    assert published['state']=='completed' and published['number']==42
+    assert json.loads(gh_state.read_text())['draft'] is True
+    ready = completed(delivery_server,'github.pr.ready',{**target,'policy_id':policy['id'],'expected_head':chunk['head']})
+    assert ready['state']=='completed'
+    packet = completed(delivery_server,'github.review.packet',target)
+    assert packet['head']==chunk['head'] and packet['complete'] is True
+    review_policy = delivery_server.tool('delivery.policy.grant',{'repository':target['repository'],'base':'main',
+        'granted_by':'fixture human','actions':['approve'],'expires_at':int(time.time())+600,'max_mutations':1})[0]
+    review_args={**target,'policy_id':review_policy['id'],'packet_id':packet['id'],'event':'approve','body':'Reviewed invariants and full diff. Tests pass. Literal $(never-execute) stays text.'}
+    pending=delivery_server.tool('github.review.submit',review_args)[0]
+    assert 'approving their own PRs' in delivery_server.settled(pending['task_id'])['error']
+    state=json.loads(gh_state.read_text()); state['actor']='reviewer';state['timeout_after_review']=True;state['expected_body']=review_args['body'];gh_state.write_text(json.dumps(state))
+    pending=delivery_server.tool('github.review.submit',review_args)[0]
+    assert delivery_server.settled(pending['task_id'])['status']=='failed'
+    assert len(json.loads(gh_state.read_text())['reviews'])==1
+    review=completed(delivery_server,'github.review.submit',review_args)
+    assert review['state']=='completed' and len(json.loads(gh_state.read_text())['reviews'])==1
+    # A changed head blocks submission before any new remote review.
+    state=json.loads(gh_state.read_text());state['head']='e'*40;gh_state.write_text(json.dumps(state))
+    pending=delivery_server.tool('github.review.submit',review_args)[0]
+    assert 'PR changed since review' in delivery_server.settled(pending['task_id'])['error']
+    state['head']=chunk['head'];state['queue']=True;gh_state.write_text(json.dumps(state))
+    merge=completed(delivery_server,'github.pr.merge',{**target,'policy_id':policy['id'],'expected_head':chunk['head'],
+        'expected_base':base_oid,'method':'merge','auto':True})
+    assert merge['state']=='requested' and json.loads(gh_state.read_text())['merge_calls']==1
+    reconciled=completed(delivery_server,'github.action.reconcile',{'id':merge['id']})
+    assert reconciled['state']=='requested'
+    state=json.loads(gh_state.read_text());state.update(merged=True,pr_state='closed',merge_commit='d'*40);gh_state.write_text(json.dumps(state))
+    reconciled=completed(delivery_server,'github.action.reconcile',{'id':merge['id']})
+    assert reconciled['state']=='merged' and reconciled['merge_commit']=='d'*40
+    state['head']='e'*40;gh_state.write_text(json.dumps(state))
+    assert completed(delivery_server,'github.action.reconcile',{'id':merge['id']})['state']=='stale'
+    revoked=delivery_server.tool('delivery.policy.revoke',{'id':policy['id']})[0]
+    assert revoked['expires_at']==0
+    results['github_delivery']={'transport':'instrumented CLI and local bare Git remote','actual_remote_mutations':False,
+        'draft_publish':True,'remote_branch_fence':True,'real_verification':True,'head_bound_reviews':True,
+        'ambiguous_review_recovered_at_budget_limit':True,'queue_reconciled':True}
+    peer_server.tool('session.close', credentials(two))
+    assert peer_server.tool('session.list', {})[0]['sessions'] == []
+    results['coding_coordination'] = {'independent_servers':3,'linked_worktrees':True,'claim_handoff':True,'commit_planning':True}
     print('MCP regressions passed: analyzer reuse, work joins, stale hashes, cancellation, failed verdict, concurrent ownership, response budgets')
 finally:
     (OUT/'release-check').touch()

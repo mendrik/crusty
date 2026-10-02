@@ -4,6 +4,8 @@ use serde_json::{Map, Value, json};
 const PRIORITY: &[&str] = &[
     "decisions",
     "steerings",
+    "approved_models",
+    "live_instructions",
     "learned_quality_constraints",
     "known_work",
     "work_items",
@@ -17,6 +19,7 @@ const PRIORITY: &[&str] = &[
     "source_slices",
     "semantic_references",
     "documentation",
+    "engineering_guidance",
 ];
 
 pub(crate) fn bound(mut value: Value, tokens: usize) -> Value {
@@ -50,6 +53,8 @@ pub(crate) fn bound(mut value: Value, tokens: usize) -> Value {
         "consulted",
         "guidance_found",
         "generation",
+        "guidance_version",
+        "engineering_route",
     ] {
         if let Some(item) = body.get(key) {
             let item = if let Some(text) = item.as_str() {

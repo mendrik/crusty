@@ -69,7 +69,7 @@ Databases written before multi-target supersession stored one bare decision ID i
 
 ## Research, findings, and work
 
-`research.start` performs a bounded local scan and prepares primary-first web-search queries for the attached agent. `research.list` recovers run and task IDs, while `research.get` returns the run, task, budget consumption, packet, and resulting findings. Crusty itself has no GitHub, CI, analytics, telemetry, or arbitrary external connector. The attached agent performs `web_search` and submits qualified local, primary-web, or secondary-web evidence through `research.submit`.
+`research.start` performs a bounded local scan and prepares primary-first web-search queries for the attached agent. `research.list` recovers run and task IDs, while `research.get` returns the run, task, budget consumption, packet, and resulting findings. Research does not invoke arbitrary external connectors. The separate [GitHub delivery adapter](github-delivery.md) uses the installed authenticated CLI under explicit policy. The attached agent performs `web_search` and submits qualified local, primary-web, or secondary-web evidence through `research.submit`.
 
 Every finding is categorized as technical, product, or design and begins as `proposed`. Architecture audit results remain in their report unless `audit.finding.propose` explicitly copies one into this lifecycle with local evidence, counter-evidence, and limitations. `finding.review` records an append-only human decision. When the result is `needs_evidence`, `finding.evidence.add` can append qualified evidence and reopen the proposal without discarding review history. `finding.promote` can create project work only after acceptance and explicit human confirmation.
 

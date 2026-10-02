@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAX_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const CANCELLED: &str = "task cancelled";
 
 #[derive(Clone)]
@@ -111,6 +111,10 @@ pub(crate) struct OwnedChild {
     terminated: bool,
 }
 impl OwnedChild {
+    pub(crate) fn is_running(&mut self) -> io::Result<bool> {
+        Ok(self.child.try_wait()?.is_none())
+    }
+
     pub(crate) fn spawn(command: &mut Command) -> io::Result<Self> {
         #[cfg(unix)]
         {
