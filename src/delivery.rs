@@ -1,10 +1,13 @@
 //! Immutable delivery identities and recoverable, exact-content Git mutations.
 
 use crate::{
-    coordination::{CommitGroup, Coordinator, SessionAuth, authorize, covers, file_fingerprint},
+    coordination::{
+        CodingSession, CommitGroup, Coordinator, SessionAuth, authorize, authorize_implicit,
+        close_implicit, covers, file_fingerprint,
+    },
     execution::MAX_CAPTURE_BYTES,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use rand::random;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -32,9 +35,19 @@ CREATE TABLE IF NOT EXISTS integrations(
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CommitExecuteRequest {
-    pub session_id: String,
-    pub lease_token: String,
+    /// Omit with lease_token to execute a plan made without a session; it is
+    /// refused once any other coding session is active.
+    pub session_id: Option<String>,
+    pub lease_token: Option<String>,
     pub plan_id: String,
+}
+
+/// How a commit execution proves ownership of its plan.
+enum PlanCredentials {
+    Lease(SessionAuth),
+    /// A single-agent plan: its implicit session must still be active and
+    /// alone in the shared repository.
+    Implicit,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -100,6 +113,9 @@ struct CommitPlan {
     branch: Option<String>,
     groups: Vec<CommitGroup>,
     fingerprints: Vec<Fingerprint>,
+    /// Plans recorded before implicit sessions existed are explicit.
+    #[serde(default)]
+    implicit_session: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -150,21 +166,30 @@ impl Coordinator {
         Ok(serde_json::from_str(&payload)?)
     }
 
-    fn check_plan(&self, plan: &CommitPlan, auth: &SessionAuth) -> Result<()> {
-        ensure!(
-            plan.session_id == auth.session_id,
-            "plan belongs to another session"
-        );
+    fn authorize_plan(
+        db: &rusqlite::Connection,
+        plan: &CommitPlan,
+        credentials: &PlanCredentials,
+    ) -> Result<CodingSession> {
+        let now = Utc::now().timestamp();
+        match credentials {
+            PlanCredentials::Lease(auth) => {
+                ensure!(
+                    plan.session_id == auth.session_id,
+                    "plan belongs to another session"
+                );
+                authorize(db, &auth.session_id, &auth.lease_token, now)
+            }
+            PlanCredentials::Implicit => authorize_implicit(db, &plan.session_id, now),
+        }
+    }
+
+    fn check_plan(&self, plan: &CommitPlan, credentials: &PlanCredentials) -> Result<()> {
         ensure!(
             plan.worktree == self.root,
             "use the plan's registered worktree"
         );
-        let owner = authorize(
-            &self.db()?,
-            &auth.session_id,
-            &auth.lease_token,
-            Utc::now().timestamp(),
-        )?;
+        let owner = Self::authorize_plan(&self.db()?, plan, credentials)?;
         ensure!(owner.worktree == self.root, "use the registered worktree");
         ensure!(
             self.git_optional(&["symbolic-ref", "--quiet", "--short", "HEAD"])? == plan.branch,
@@ -229,20 +254,40 @@ impl Coordinator {
         let _guard = self.lock("git-mutation.lock")?;
         let db = self.delivery_db()?;
         let plan = self.commit_plan_record(&request.plan_id)?;
-        let auth = SessionAuth {
-            session_id: request.session_id,
-            lease_token: request.lease_token,
+        let credentials = match (request.session_id, request.lease_token) {
+            (Some(session_id), Some(lease_token)) => PlanCredentials::Lease(SessionAuth {
+                session_id,
+                lease_token,
+            }),
+            (None, None) => {
+                ensure!(
+                    plan.implicit_session,
+                    "plan belongs to an explicit session; pass its session_id and lease_token"
+                );
+                PlanCredentials::Implicit
+            }
+            _ => bail!("provide both session_id and lease_token, or neither for an implicit plan"),
         };
-        self.check_plan(&plan, &auth)?;
-        let previous: Option<String> = db
+        let previous: Option<CommitExecution> = db
             .query_row(
                 "SELECT payload FROM commit_executions WHERE plan_id=?1",
                 [&plan.plan_id],
-                |row| row.get(0),
+                |row| row.get::<_, String>(0),
             )
-            .optional()?;
-        let mut execution: CommitExecution = if let Some(payload) = previous {
-            serde_json::from_str(&payload)?
+            .optional()?
+            .map(|payload| serde_json::from_str(&payload))
+            .transpose()?;
+        // Delivery closes an implicit session, so a replay of a completed
+        // implicit plan reports the recorded outcome without authorizing.
+        if let Some(execution) = &previous
+            && plan.implicit_session
+            && execution.state == ExecutionState::Completed
+        {
+            return Ok(serde_json::to_value(execution)?);
+        }
+        self.check_plan(&plan, &credentials)?;
+        let mut execution: CommitExecution = if let Some(execution) = previous {
+            execution
         } else {
             ensure!(
                 self.git(&["rev-parse", "HEAD"])?.trim() == plan.head,
@@ -292,7 +337,7 @@ impl Coordinator {
             }
             let execution = CommitExecution {
                 plan_id: plan.plan_id.clone(),
-                session_id: auth.session_id.clone(),
+                session_id: plan.session_id.clone(),
                 base_head: plan.head.clone(),
                 head: parent,
                 commits,
@@ -309,15 +354,10 @@ impl Coordinator {
         let head = self.git(&["rev-parse", "HEAD"])?.trim().to_owned();
         if head == execution.base_head {
             // Recheck files and ownership after object construction/signing.
-            self.check_plan(&plan, &auth)?;
+            self.check_plan(&plan, &credentials)?;
             let mut db = self.db()?;
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            authorize(
-                &tx,
-                &auth.session_id,
-                &auth.lease_token,
-                Utc::now().timestamp(),
-            )?;
+            Self::authorize_plan(&tx, &plan, &credentials)?;
             self.git(&[
                 "update-ref",
                 "-m",
@@ -355,6 +395,10 @@ impl Coordinator {
         ])?;
         execution.state = ExecutionState::Completed;
         self.save_execution(&execution)?;
+        if plan.implicit_session {
+            // The implicit session existed only to own this delivery.
+            close_implicit(&self.db()?, &plan.session_id)?;
+        }
         Ok(serde_json::to_value(execution)?)
     }
 
@@ -853,8 +897,8 @@ mod tests {
     fn plan(coord: &Coordinator, auth: &SessionAuth) -> Value {
         coord
             .plan_commits(CommitPlanRequest {
-                session_id: auth.session_id.clone(),
-                lease_token: auth.lease_token.clone(),
+                session_id: Some(auth.session_id.clone()),
+                lease_token: Some(auth.lease_token.clone()),
                 groups: vec![
                     CommitGroup {
                         message: "Update a".into(),
@@ -871,8 +915,8 @@ mod tests {
 
     fn execute(auth: &SessionAuth, plan: &Value) -> CommitExecuteRequest {
         CommitExecuteRequest {
-            session_id: auth.session_id.clone(),
-            lease_token: auth.lease_token.clone(),
+            session_id: Some(auth.session_id.clone()),
+            lease_token: Some(auth.lease_token.clone()),
             plan_id: plan["plan_id"].as_str().unwrap().into(),
         }
     }
@@ -913,6 +957,152 @@ mod tests {
             chunk
         );
         assert_eq!(coord.chunk_list(1, 0).unwrap()["page"]["total"], 1);
+    }
+
+    fn implicit_plan(coord: &Coordinator) -> Result<Value> {
+        coord.plan_commits(CommitPlanRequest {
+            session_id: None,
+            lease_token: None,
+            groups: vec![CommitGroup {
+                message: "Update a".into(),
+                paths: vec!["a".into()],
+            }],
+        })
+    }
+
+    fn implicit_execute(plan: &Value) -> CommitExecuteRequest {
+        CommitExecuteRequest {
+            session_id: None,
+            lease_token: None,
+            plan_id: plan["plan_id"].as_str().unwrap().into(),
+        }
+    }
+
+    #[test]
+    fn single_agent_commits_need_no_session_and_release_their_implicit_claims() {
+        let dir = fixture();
+        let coord = Coordinator::open(dir.path(), ExecutionControl::default()).unwrap();
+        fs::write(dir.path().join("a"), "single agent\n").unwrap();
+        fs::write(dir.path().join("b"), "left out\n").unwrap();
+        // An abandoned implicit plan is superseded by the next one rather
+        // than blocking it as "another active session".
+        implicit_plan(&coord).unwrap();
+        let plan = implicit_plan(&coord).unwrap();
+        assert_eq!(plan["implicit_session"], true);
+        assert_eq!(plan["groups"][0]["paths"], json!(["a"]));
+        assert_eq!(plan["unassigned_changed_paths"], json!(["b"]));
+        assert!(!plan.to_string().contains("lease_token"));
+        let active = coord.list(crate::coordination::SessionListRequest {
+            include_inactive: false,
+            limit: None,
+            offset: None,
+        });
+        let active = active.unwrap();
+        assert_eq!(active["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(active["sessions"][0]["owner"], "crusty:implicit-commit");
+        assert_eq!(active["sessions"][0]["claims"], json!(["a"]));
+
+        let result = coord.execute_commits(implicit_execute(&plan)).unwrap();
+        assert_eq!(result["state"], "completed");
+        assert_eq!(git(dir.path(), &["show", "HEAD:a"]), "single agent\n");
+        assert_eq!(git(dir.path(), &["show", "HEAD:b"]), "original\n");
+        // Delivery ends the implicit session, and a replay reports the
+        // recorded outcome instead of failing on the closed session.
+        let active = coord
+            .list(crate::coordination::SessionListRequest {
+                include_inactive: false,
+                limit: None,
+                offset: None,
+            })
+            .unwrap();
+        assert_eq!(active["sessions"], json!([]));
+        assert_eq!(
+            coord.execute_commits(implicit_execute(&plan)).unwrap(),
+            result
+        );
+        // The reserved owner cannot be registered explicitly.
+        assert!(
+            coord
+                .start(SessionStartRequest {
+                    owner: "crusty:implicit-commit".into(),
+                    intent: "impersonate".into(),
+                    work_ids: vec![],
+                    isolate: false,
+                    ttl_seconds: 600,
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn implicit_commits_are_refused_while_another_session_is_active() {
+        let dir = fixture();
+        let coord = Coordinator::open(dir.path(), ExecutionControl::default()).unwrap();
+        fs::write(dir.path().join("a"), "single agent\n").unwrap();
+        let implicit = implicit_plan(&coord).unwrap();
+        let head = git(dir.path(), &["rev-parse", "HEAD"]);
+        // A session registered after planning sees the implicit claim and
+        // blocks the implicit execution.
+        let auth = session(&coord);
+        let claimed = coord
+            .claim(ClaimRequest {
+                session_id: auth.session_id.clone(),
+                lease_token: auth.lease_token.clone(),
+                paths: vec!["a".into()],
+            })
+            .unwrap();
+        assert_eq!(claimed["acquired"], false);
+        assert_eq!(claimed["conflicts"][0]["owner"], "crusty:implicit-commit");
+        let error = coord
+            .execute_commits(implicit_execute(&implicit))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("another coding session"), "{error}");
+        assert_eq!(git(dir.path(), &["rev-parse", "HEAD"]), head);
+        // While it is active, planning without a session is refused too.
+        let error = implicit_plan(&coord).unwrap_err().to_string();
+        assert!(error.contains("explicit session"), "{error}");
+        // An explicit plan cannot be executed without its credentials, and
+        // half a credential pair is rejected.
+        fs::write(dir.path().join("new [file]"), "new\n").unwrap();
+        coord
+            .claim(ClaimRequest {
+                session_id: auth.session_id.clone(),
+                lease_token: auth.lease_token.clone(),
+                paths: vec!["new [file]".into()],
+            })
+            .unwrap();
+        let explicit = coord
+            .plan_commits(CommitPlanRequest {
+                session_id: Some(auth.session_id.clone()),
+                lease_token: Some(auth.lease_token.clone()),
+                groups: vec![CommitGroup {
+                    message: "Add new file".into(),
+                    paths: vec!["new [file]".into()],
+                }],
+            })
+            .unwrap();
+        let error = coord
+            .execute_commits(implicit_execute(&explicit))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("explicit session"), "{error}");
+        let mut partial = execute(&auth, &explicit);
+        partial.lease_token = None;
+        assert!(coord.execute_commits(partial).is_err());
+        assert!(
+            coord
+                .plan_commits(CommitPlanRequest {
+                    session_id: Some(auth.session_id.clone()),
+                    lease_token: None,
+                    groups: vec![CommitGroup {
+                        message: "Update a".into(),
+                        paths: vec!["a".into()],
+                    }],
+                })
+                .is_err()
+        );
+        assert_eq!(git(dir.path(), &["rev-parse", "HEAD"]), head);
     }
 
     #[test]

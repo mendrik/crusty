@@ -49,6 +49,11 @@ fn default_ttl() -> u64 {
     600
 }
 
+/// Owner of the ephemeral session `commit.plan` registers for single-agent
+/// work. The `crusty:` prefix is reserved, so no agent can register it.
+pub(crate) const IMPLICIT_OWNER: &str = "crusty:implicit-commit";
+const IMPLICIT_TTL_SECONDS: i64 = 600;
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SessionStartRequest {
@@ -113,8 +118,11 @@ pub struct CommitGroup {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CommitPlanRequest {
-    pub session_id: String,
-    pub lease_token: String,
+    /// Omit with lease_token for single-agent work: when no other coding
+    /// session is active in the repository, an implicit session owns exactly
+    /// the planned paths until commit.execute (or its lease) ends it.
+    pub session_id: Option<String>,
+    pub lease_token: Option<String>,
     pub groups: Vec<CommitGroup>,
 }
 
@@ -238,6 +246,10 @@ impl Coordinator {
 
     fn start_at(&self, mut request: SessionStartRequest, now: i64) -> Result<Value> {
         validate_text(&request.owner, "owner", 200)?;
+        ensure!(
+            !request.owner.starts_with("crusty:"),
+            "owner names starting with `crusty:` are reserved"
+        );
         validate_text(&request.intent, "intent", 16_000)?;
         validate_ttl(request.ttl_seconds)?;
         ensure!(request.work_ids.len() <= 100, "at most 100 work IDs");
@@ -411,13 +423,20 @@ impl Coordinator {
         let now = Utc::now().timestamp();
         let mut db = self.db()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let owner = authorize(&tx, &request.session_id, &request.lease_token, now)?;
+        let head = self.git(&["rev-parse", "--verify", "HEAD"])?;
+        let branch = self.git_optional(&["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+        let (owner, implicit) = match (&request.session_id, &request.lease_token) {
+            (Some(id), Some(token)) => (authorize(&tx, id, token, now)?, false),
+            (None, None) => (
+                self.implicit_session(&tx, head.trim(), branch.as_deref(), now)?,
+                true,
+            ),
+            _ => bail!("provide both session_id and lease_token, or neither for single-agent work"),
+        };
         ensure!(
             owner.worktree == self.root,
             "commit planning must use the registered worktree"
         );
-        let head = self.git(&["rev-parse", "--verify", "HEAD"])?;
-        let branch = self.git_optional(&["symbolic-ref", "--quiet", "--short", "HEAD"])?;
         ensure!(
             branch == owner.branch,
             "session branch changed; register the new worktree state"
@@ -436,7 +455,7 @@ impl Coordinator {
             for path in &changed {
                 if selectors.iter().any(|selector| overlaps(selector, path)) {
                     ensure!(
-                        owner.claims.iter().any(|claim| covers(claim, path)),
+                        implicit || owner.claims.iter().any(|claim| covers(claim, path)),
                         "unowned changed path `{path}`; claim it before planning commits"
                     );
                     ensure!(
@@ -461,22 +480,79 @@ impl Coordinator {
             paths.len() <= 2000,
             "commit plan exceeds 2000 changed files; split the work into cohesive plans"
         );
+        if implicit {
+            // Changed files are distinct leaves, so they already form a
+            // normalized claim set. They stay visible to sessions that start
+            // before execution.
+            for path in &paths {
+                tx.execute(
+                    "INSERT INTO path_claims(session_id,path) VALUES (?1,?2)",
+                    params![owner.id, path],
+                )?;
+            }
+        }
         let id = format!("commits_{:032x}", random::<u128>());
         let fingerprints = paths
             .iter()
             .map(|path| Ok(json!({"path":path,"content":file_fingerprint(&self.root,path)?})))
             .collect::<Result<Vec<_>>>()?;
         let payload = json!({"plan_id":id,"session_id":owner.id,"worktree":self.root,
-            "head":head.trim(),"branch":branch,"groups":groups,"fingerprints":fingerprints,
-            "unassigned_changed_paths":changed.into_iter().filter(|path|!paths.contains(path)).collect::<Vec<_>>(),
-            "created_at":now,"executed":false,
-            "note":"A plan records whole-file boundaries. It neither stages nor commits; edits after planning require a new plan."});
+        "head":head.trim(),"branch":branch,"groups":groups,"fingerprints":fingerprints,
+        "unassigned_changed_paths":changed.into_iter().filter(|path|!paths.contains(path)).collect::<Vec<_>>(),
+        "created_at":now,"executed":false,"implicit_session":implicit,
+        "note":if implicit {
+            "A plan records whole-file boundaries. It neither stages nor commits; edits after planning require a new plan. An implicit single-agent session owns the planned paths: call commit.execute with plan_id alone. It is refused once another coding session is active."
+        } else {
+            "A plan records whole-file boundaries. It neither stages nor commits; edits after planning require a new plan."
+        }});
         tx.execute(
             "INSERT INTO commit_plans(id,session_id,payload,created_at) VALUES (?1,?2,?3,?4)",
             params![id, owner.id, payload.to_string(), now],
         )?;
         tx.commit()?;
         Ok(payload)
+    }
+
+    /// Registers the ephemeral session that owns a single-agent commit plan.
+    ///
+    /// Only valid while no other coding session is active anywhere in the
+    /// shared repository: an implicit plan must never take ownership around a
+    /// participating agent. An earlier implicit session of this worktree is
+    /// superseded, so an abandoned plan cannot block the next one.
+    fn implicit_session(
+        &self,
+        tx: &Connection,
+        head: &str,
+        branch: Option<&str>,
+        now: i64,
+    ) -> Result<CodingSession> {
+        expire(tx, now)?;
+        let worktree = self.root.to_str().context("non-UTF-8 worktree path")?;
+        tx.execute(
+            "UPDATE coding_sessions SET status='closed' WHERE status='active' AND owner=?1 AND worktree=?2",
+            params![IMPLICIT_OWNER, worktree],
+        )?;
+        expire(tx, now)?;
+        let others = active_sessions(tx, now)?;
+        if !others.is_empty() {
+            let owners = others
+                .iter()
+                .take(5)
+                .map(|session| format!("{} ({})", session.owner, session.id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "{} other coding session(s) are active in this repository: {owners}. Parallel work requires an explicit session: call session.start, claim your paths, and pass session_id and lease_token",
+                others.len()
+            );
+        }
+        let id = format!("session_{:032x}", random::<u128>());
+        // The token is never returned: commit.execute authorizes an implicit
+        // plan by its owner and the continued absence of other sessions.
+        let token = format!("{:032x}{:032x}", random::<u128>(), random::<u128>());
+        tx.execute("INSERT INTO coding_sessions(id,token_hash,owner,intent,work_ids,worktree,branch,base_head,status,created_at,heartbeat_at,expires_at) VALUES (?1,?2,?3,'implicit single-agent commit plan','[]',?4,?5,?6,'active',?7,?7,?8)",
+            params![id, token_hash(&token), IMPLICIT_OWNER, worktree, branch, head, now, now + IMPLICIT_TTL_SECONDS])?;
+        session(tx, &id, now)
     }
 
     pub(crate) fn changed_paths(&self) -> Result<BTreeSet<String>> {
@@ -599,6 +675,39 @@ pub(crate) fn authorize(db: &Connection, id: &str, token: &str, now: i64) -> Res
         "session is closed or expired; register a new session"
     );
     Ok(session)
+}
+
+/// Authorizes an implicit single-agent session without a lease token. It
+/// stays valid only while it is active and no other session has started.
+pub(crate) fn authorize_implicit(db: &Connection, id: &str, now: i64) -> Result<CodingSession> {
+    let session = session(db, id, now)?;
+    ensure!(
+        session.owner == IMPLICIT_OWNER,
+        "plan belongs to an explicit session; pass its session_id and lease_token"
+    );
+    ensure!(
+        matches!(session.status, SessionStatus::Active),
+        "the implicit commit session is closed or expired; run commit.plan again"
+    );
+    let others = active_sessions(db, now)?
+        .into_iter()
+        .filter(|other| other.id != id)
+        .count();
+    ensure!(
+        others == 0,
+        "another coding session became active after planning; register with session.start, claim the paths, and plan again"
+    );
+    Ok(session)
+}
+
+/// Ends an implicit session once its plan is delivered, releasing its claims.
+pub(crate) fn close_implicit(db: &Connection, id: &str) -> Result<()> {
+    db.execute(
+        "UPDATE coding_sessions SET status='closed' WHERE id=?1 AND owner=?2",
+        params![id, IMPLICIT_OWNER],
+    )?;
+    db.execute("DELETE FROM path_claims WHERE session_id=?1", [id])?;
+    Ok(())
 }
 
 fn session(db: &Connection, id: &str, now: i64) -> Result<CodingSession> {
@@ -967,8 +1076,8 @@ mod tests {
         git(dir.path(), &["add", "src/b.rs"]);
         let staged = coord.git(&["diff", "--cached"]).unwrap();
         let make = |paths: Vec<String>| CommitPlanRequest {
-            session_id: owner.session_id.clone(),
-            lease_token: owner.lease_token.clone(),
+            session_id: Some(owner.session_id.clone()),
+            lease_token: Some(owner.lease_token.clone()),
             groups: vec![CommitGroup {
                 message: "Change a".into(),
                 paths,

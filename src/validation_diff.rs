@@ -31,8 +31,9 @@ pub enum DiffSource {
         base_ref: String,
         target: DiffTarget,
     },
-    /// Staged and unstaged tracked changes against HEAD, or against the index
-    /// when the repository has no first commit yet.
+    /// Staged and unstaged tracked changes against HEAD (or against the index
+    /// when the repository has no first commit yet), plus untracked files that
+    /// Git does not ignore, as new-file diffs.
     Pending,
 }
 
@@ -82,13 +83,14 @@ impl DiffSource {
                 // An unborn HEAD has no commit to compare against. Git still
                 // validates the repository when executing the index diff.
                 let head_commit = resolve_commit(root, "HEAD").ok();
-                let text = git_diff(root, head_commit.as_deref(), None)?;
+                let mut text = git_diff(root, head_commit.as_deref(), None)?;
+                let untracked = untracked_diff(root, &mut text)?;
                 (
                     text,
                     json!({
                         "source":"pending", "base_commit":head_commit,
                         "target":"worktree", "target_commit":null,
-                        "tracked_only":true,
+                        "tracked_only":false, "untracked":untracked,
                         "comparison":if head_commit.is_some() { "HEAD_to_worktree" } else { "index_to_worktree" }
                     }),
                 )
@@ -98,6 +100,77 @@ impl DiffSource {
         scope["hash"] = json!(format!("b3:{}", blake3::hash(text.as_bytes()).to_hex()));
         Ok(ResolvedDiff { text, scope })
     }
+}
+
+/// Untracked files beyond these bounds are listed as skipped, not diffed.
+const MAX_UNTRACKED_FILES: usize = 500;
+const MAX_UNTRACKED_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Appends a new-file diff for every untracked, non-ignored file to `text`,
+/// so files an agent created count as changed without `git add -N`.
+///
+/// Crusty's own state directory and untracked `target/` output are never
+/// part of a change, even in projects that do not ignore them yet.
+fn untracked_diff(root: &Path, text: &mut String) -> Result<Value> {
+    let listing = git_text(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    let mut included = Vec::new();
+    let mut skipped = Vec::new();
+    for path in listing.split('\0').filter(|path| !path.is_empty()) {
+        // A trailing slash marks a nested repository rather than a file.
+        if path.ends_with('/')
+            || path.starts_with(".rust-repo-intelligence/")
+            || path.starts_with("target/")
+        {
+            continue;
+        }
+        let bytes = std::fs::symlink_metadata(root.join(path))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if included.len() >= MAX_UNTRACKED_FILES {
+            skipped.push(json!({"path":path,"reason":"untracked file limit reached"}));
+        } else if bytes > MAX_UNTRACKED_FILE_BYTES {
+            skipped.push(json!({"path":path,"reason":"larger than 1 MiB","bytes":bytes}));
+        } else if let Some(diff) = new_file_diff(root, path)? {
+            text.push_str(&diff);
+            included.push(path.to_owned());
+        } else {
+            skipped.push(json!({"path":path,"reason":"diff is not UTF-8"}));
+        }
+    }
+    Ok(json!({
+        "included":included.len(), "paths":included.iter().take(50).collect::<Vec<_>>(),
+        "paths_truncated":included.len() > 50, "skipped":skipped.iter().take(50).collect::<Vec<_>>(),
+        "skipped_count":skipped.len(),
+        "rule":"untracked files that Git does not ignore are validated as new files"
+    }))
+}
+
+/// `None` when the file's text diff is not UTF-8 (binary files are encoded).
+fn new_file_diff(root: &Path, path: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args([
+            "diff",
+            "--no-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "--no-color",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--",
+            "/dev/null",
+            path,
+        ])
+        .output()
+        .context("cannot start Git for validation diff")?;
+    // `--no-index` exits 1 when the inputs differ, which they always do here.
+    ensure!(
+        matches!(output.status.code(), Some(0 | 1)),
+        "Git new-file diff for {path} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(String::from_utf8(output.stdout).ok())
 }
 
 fn git_text(root: &Path, args: &[&str]) -> Result<String> {

@@ -2,9 +2,11 @@
 
 Crusty shares coding sessions and ownership claims across all linked Git worktrees. Repository indexes and prepared-change evidence remain local to the observed worktree. Claims coordinate participating agents; editors outside Crusty's workflow are not intercepted.
 
+Sessions exist for parallel work. A single agent working alone needs no session, claims or heartbeats: it consults, prepares, edits, validates and, when it wants Crusty to commit, calls `commit.plan` and `commit.execute` without credentials (see [single-agent commits](#single-agent-commits)). Register a session as soon as another agent may work in the same repository.
+
 ## Start and isolate
 
-Call `session.start` with `owner`, `intent`, optional `work_ids`, and `isolate=true` when beginning independent branch work. The response is a task ID. Poll `task.get` until settled; a successful result contains the session and a private `lease_token`. Use its returned `worktree` as the working directory for edits and future Crusty calls.
+Call `session.start` with `owner`, `intent`, optional `work_ids`, and `isolate=true` when beginning independent branch work. The response is a task ID; pass `wait_seconds` to receive the settled task inline instead of polling `task.get`. A successful result contains the session and a private `lease_token`. Owner names starting with `crusty:` are reserved. Use its returned `worktree` as the working directory for edits and future Crusty calls.
 
 Isolation creates a fresh branch/worktree at the caller's committed HEAD. It preserves dirty files in the original worktree and does not copy them. A registered non-isolated session (`isolate=false`, the default) uses the current worktree. Isolation requires an existing Git commit; non-Git directories support registration and claims without isolation.
 
@@ -26,7 +28,15 @@ Call `commit.plan` with the session credentials and `groups`, each containing a 
 
 Plans persist the exact head, branch, groups, and content fingerprints. Planning neither stages nor commits; other agents' staged files stay untouched. Whole-file claims do not divide ownership of separate hunks inside one file. Git unmerged paths must be resolved before planning.
 
-Call `commit.execute` with the credentials and `plan_id`. It rechecks claims, branch, head and file fingerprints; stale plans fail. Execution builds all planned commits through a private Git index, persists their object IDs, and advances HEAD with an expected-old-head comparison. It updates only the selected entries in the real index and retains unrelated staged work. Commit signing follows `commit.gpgsign`; commit hooks are not run. Execute repository hook requirements as explicit checks. `commit.get` recovers the plan/execution; replaying the same plan recovers its recorded outcome rather than creating another chain.
+Both calls are task-backed and accept `wait_seconds`. Call `commit.execute` with the credentials and `plan_id`. It rechecks claims, branch, head and file fingerprints; stale plans fail. Execution builds all planned commits through a private Git index, persists their object IDs, and advances HEAD with an expected-old-head comparison. It updates only the selected entries in the real index and retains unrelated staged work. Commit signing follows `commit.gpgsign`; commit hooks are not run. Execute repository hook requirements as explicit checks. `commit.get` recovers the plan/execution; replaying the same plan recovers its recorded outcome rather than creating another chain.
+
+### Single-agent commits
+
+Omit both `session_id` and `lease_token` from `commit.plan` for single-agent work. Inside the same immediate transaction that fences claim acquisition, Crusty checks the shared ledger: if any other coding session is active in any linked worktree, planning is refused and an explicit session is required, exactly as before. Otherwise it registers an ephemeral session owned by `crusty:implicit-commit` that claims exactly the planned changed files, so an agent that registers afterwards sees those paths as owned. An earlier implicit session of the same worktree is closed first, so an abandoned plan never blocks the next one. The plan reports `implicit_session: true`; its lease token is never returned.
+
+Call `commit.execute` with `plan_id` alone. It is authorized by the implicit owner and re-checks, before building objects and again before advancing `HEAD`, that the implicit session is still active (ten-minute lease) and that no other session has started; otherwise it fails without moving `HEAD`, and the work must be claimed under an explicit session and planned again. All other plan checks (branch, `HEAD`, file fingerprints) are unchanged. Successful execution closes the implicit session and releases its claims; replaying the plan returns the recorded outcome. Chunks, integrations and GitHub delivery still require an explicit session. Supplying only one of the two credentials is an error.
+
+### Chunks
 
 After execution, `chunk.create` records the plan's immutable commit chain, title, summary and optional validation references. References alone are not proof that checks passed. `chunk.list/get` recover deliverables. Plan files are whole-file selections; the protocol does not attribute separate hunks within one file.
 
@@ -42,4 +52,4 @@ Start Crusty against the integration worktree, run `verification.plan/run`, and 
 
 Call `session.close` with the session credentials after completing or handing off the work. Claims are released and the session becomes terminal. Its branch, worktree and files are retained. Closing never discards changes.
 
-Crusty serializes claim acquisition with immediate SQLite transactions and uses a shared Git-mutation lease for managed worktree creation/planning. Raw Git and file edits from other processes still require cooperation. Agent instructions must require ownership claims, heartbeat and handoff for the protocol to be effective.
+Crusty serializes claim acquisition with immediate SQLite transactions and uses a shared Git-mutation lease for managed worktree creation/planning. Raw Git and file edits from other processes still require cooperation. For parallel work, agent instructions must require ownership claims, heartbeat and handoff for the protocol to be effective; the implicit single-agent path is refused as soon as any participating session is active.

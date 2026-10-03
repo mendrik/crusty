@@ -22,6 +22,216 @@ const PRIORITY: &[&str] = &[
     "engineering_guidance",
 ];
 
+const PACK_NOTE: &str = "Sections are packed in authority order: every matching item is first placed in compact form, then upgraded to full detail while the budget allows. `compacted` and `omitted` count reduced and missing items; `fetch_more` names how to read the rest.";
+
+/// One budgeted section: items in relevance order, each as `(full, compact)`.
+pub(crate) struct Section {
+    name: &'static str,
+    items: Vec<(Value, Value)>,
+    fetch_more: &'static str,
+}
+
+impl Section {
+    pub(crate) fn new(
+        name: &'static str,
+        items: Vec<Value>,
+        compact: impl Fn(&Value) -> Value,
+        fetch_more: &'static str,
+    ) -> Self {
+        let items = items
+            .into_iter()
+            .map(|item| {
+                let small = compact(&item);
+                (item, small)
+            })
+            .collect();
+        Self::with_forms(name, items, fetch_more)
+    }
+
+    pub(crate) fn with_forms(
+        name: &'static str,
+        items: Vec<(Value, Value)>,
+        fetch_more: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            items,
+            fetch_more,
+        }
+    }
+
+    pub(crate) fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+/// Packs `sections` into one response of at most `tokens` estimated tokens,
+/// accounting for everything else in `value` (a body, or `{freshness, result}`).
+///
+/// Every item first gets its compact form in section order, so a section is
+/// never dropped wholesale while compact forms fit; items are then upgraded to
+/// their full form in the same order. Worst-case budget metadata is reserved
+/// before filling, so writing the final counts can only shrink the response.
+/// When the envelope alone exceeds half the budget, `shed` steps replace
+/// (`Some`) or remove (`None`) envelope keys in order, and the response says so.
+pub(crate) fn pack(
+    mut value: Value,
+    sections: Vec<Section>,
+    shed: &[(&str, Option<Value>)],
+    tokens: usize,
+) -> Value {
+    let tokens = tokens.clamp(250, 20_000);
+    let maximum = tokens.saturating_mul(4);
+    let wrapped = value.get("result").is_some();
+    let path = if wrapped {
+        "/result/context_budget"
+    } else {
+        "/context_budget"
+    };
+    let counts = sections
+        .iter()
+        .map(|section| (section.name.to_owned(), json!(section.items.len())))
+        .collect::<Map<_, _>>();
+    let hints = sections
+        .iter()
+        .filter(|section| !section.is_empty())
+        .map(|section| (section.name.to_owned(), json!(section.fetch_more)))
+        .collect::<Map<_, _>>();
+    {
+        let body = body_mut(&mut value, wrapped);
+        for section in &sections {
+            body[section.name] = json!([]);
+        }
+        body["context_budget"] = json!({
+            "tokens": tokens,
+            "estimated_tokens": maximum,
+            "serialized_bytes": maximum,
+            "estimator": "serialized UTF-8 bytes / 4",
+            "truncated": true,
+            "omitted": counts,
+            "compacted": counts,
+            "fetch_more": hints,
+            "note": PACK_NOTE,
+        });
+    }
+    let mut envelope = Map::new();
+    for (key, replacement) in shed {
+        if value.to_string().len() <= maximum / 2 {
+            break;
+        }
+        let body = body_mut(&mut value, wrapped);
+        let Some(object) = body.as_object_mut() else {
+            break;
+        };
+        if !object.contains_key(*key) {
+            continue;
+        }
+        match replacement {
+            Some(compact) => {
+                object.insert((*key).to_owned(), compact.clone());
+                envelope.insert((*key).to_owned(), json!("compact"));
+            }
+            None => {
+                object.remove(*key);
+                envelope.insert((*key).to_owned(), json!("omitted"));
+            }
+        }
+        body["context_budget"]["envelope"] = json!(envelope);
+    }
+    if value.to_string().len() > maximum / 2
+        && let Some(budget) = body_mut(&mut value, wrapped)["context_budget"].as_object_mut()
+    {
+        budget.remove("note");
+    }
+
+    // Each array element costs its serialization plus at most one comma.
+    let mut used = value.to_string().len();
+    let sizes = sections
+        .iter()
+        .map(|section| {
+            section
+                .items
+                .iter()
+                .map(|(full, compact)| {
+                    let full = full.to_string().len() + 1;
+                    (full, (compact.to_string().len() + 1).min(full))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    // None: omitted; Some(false): compact; Some(true): full.
+    let mut chosen = sizes
+        .iter()
+        .map(|sizes| vec![None; sizes.len()])
+        .collect::<Vec<_>>();
+    for (section, sizes) in sizes.iter().enumerate() {
+        for (item, (_, compact)) in sizes.iter().enumerate() {
+            if used + compact <= maximum {
+                used += compact;
+                chosen[section][item] = Some(false);
+            }
+        }
+    }
+    for (section, sizes) in sizes.iter().enumerate() {
+        for (item, (full, compact)) in sizes.iter().enumerate() {
+            if chosen[section][item] == Some(false) && used + full - compact <= maximum {
+                used += full - compact;
+                chosen[section][item] = Some(true);
+            }
+        }
+    }
+
+    let mut omitted = Map::new();
+    let mut compacted = Map::new();
+    let mut fetch_more = Map::new();
+    let body = body_mut(&mut value, wrapped);
+    for ((section, choices), sizes) in sections.into_iter().zip(chosen).zip(sizes) {
+        let mut kept = Vec::new();
+        let (mut missing, mut reduced) = (0usize, 0usize);
+        for (((full, compact), choice), (full_size, compact_size)) in
+            section.items.into_iter().zip(choices).zip(sizes)
+        {
+            match choice {
+                Some(true) => kept.push(full),
+                Some(false) if compact_size < full_size => {
+                    reduced += 1;
+                    kept.push(compact);
+                }
+                Some(false) => kept.push(full),
+                None => missing += 1,
+            }
+        }
+        body[section.name] = json!(kept);
+        omitted.insert(section.name.to_owned(), json!(missing));
+        if reduced > 0 {
+            compacted.insert(section.name.to_owned(), json!(reduced));
+        }
+        if missing + reduced > 0 {
+            fetch_more.insert(section.name.to_owned(), json!(section.fetch_more));
+        }
+    }
+    let budget = &mut body["context_budget"];
+    budget["truncated"] = json!(!fetch_more.is_empty() || !envelope.is_empty());
+    budget["omitted"] = json!(omitted);
+    let object = budget.as_object_mut().expect("context_budget is an object");
+    if compacted.is_empty() {
+        object.remove("compacted");
+    } else {
+        object.insert("compacted".into(), json!(compacted));
+    }
+    if fetch_more.is_empty() {
+        object.remove("fetch_more");
+    } else {
+        object.insert("fetch_more".into(), json!(fetch_more));
+    }
+    measure(&mut value, path);
+    value
+}
+
 pub(crate) fn bound(mut value: Value, tokens: usize) -> Value {
     let tokens = tokens.clamp(250, 20_000);
     let maximum = tokens.saturating_mul(4);
@@ -38,7 +248,19 @@ pub(crate) fn bound(mut value: Value, tokens: usize) -> Value {
         &original
     };
     let previous = &body["context_budget"];
-    let budget = json!({"tokens":tokens,"estimated_tokens":0,"serialized_bytes":0,"truncated":previous["truncated"] == true,"omitted":previous["omitted"],"estimator":"serialized UTF-8 bytes / 4"});
+    // Keep what an inner packer reported (compaction, fetch hints, envelope).
+    let mut budget = previous.as_object().cloned().unwrap_or_default();
+    for (key, item) in [
+        ("tokens", json!(tokens)),
+        ("estimated_tokens", json!(0)),
+        ("serialized_bytes", json!(0)),
+        ("truncated", json!(previous["truncated"] == true)),
+        ("omitted", previous["omitted"].clone()),
+        ("estimator", json!("serialized UTF-8 bytes / 4")),
+    ] {
+        budget.insert(key.into(), item);
+    }
+    let budget = Value::Object(budget);
     body_mut(&mut value, wrapped)["context_budget"] = budget.clone();
     measure(&mut value, path);
     if value.to_string().len() <= maximum {
@@ -79,6 +301,9 @@ pub(crate) fn bound(mut value: Value, tokens: usize) -> Value {
     };
     let target = body_mut(&mut kept, wrapped);
     target["context_budget"] = budget;
+    if let Some(budget) = target["context_budget"].as_object_mut() {
+        budget.remove("note");
+    }
     target["context_budget"]["truncated"] = json!(true);
     target["context_budget"]["original_bytes"] = json!(original.to_string().len());
     if !target["context_budget"]["omitted"].is_object() {

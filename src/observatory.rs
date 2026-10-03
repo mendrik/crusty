@@ -1,12 +1,14 @@
 //! The public observatory boundary.
 //!
-//! Live source navigation never refreshes the derived index. Slow or mutating
-//! operations are explicit durable tasks, while findings and human-owned work
-//! live in a database that is independent from the rebuildable index.
+//! Live source navigation never refreshes the derived index, and no read waits
+//! for one: reads serve the last published generation with a freshness
+//! envelope. Refreshes run as durable tasks, started explicitly or by the
+//! process's background refresher, while findings and human-owned work live
+//! in a database that is independent from the rebuildable index.
 
 use crate::{
     DECISION_STATUSES, DiffSource, DiffTarget, QualityScope, RecordDecision, RecordSteering,
-    RetireDecision, Service, ValidationOutcomeInput,
+    RetireDecision, RetireSteering, Service, ValidationOutcomeInput,
 };
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{TimeZone, Utc};
@@ -59,11 +61,14 @@ impl Drop for SessionLease {
 }
 
 /// Join live project memory without opening another server or copying it into
-/// the rebuildable index. Long intents are matched by terms, not one substring.
+/// the rebuildable index. Long intents are matched by meaningful terms and
+/// path ancestry, then ranked by match strength; see `WorkQuery::score`.
+/// `open_only` keeps only work that is still open.
 pub(crate) fn relevant_work(
     root: &Path,
     query: Option<&str>,
     limit: usize,
+    open_only: bool,
 ) -> Result<Option<Value>> {
     let path = root.join(STATE_DIRECTORY).join("memory.sqlite3");
     if !path.exists() {
@@ -72,19 +77,33 @@ pub(crate) fn relevant_work(
     let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     db.busy_timeout(std::time::Duration::from_secs(2))?;
     let query = query.unwrap_or("");
+    let scorer = crate::relevance::WorkQuery::new(query);
     let mut statement = db.prepare("SELECT id,title,status,priority,kind,scope_json,evidence_json,depends_json,blocked_json,acceptance_json,verification_json,discovered_from,provenance,confidence,last_validated_snapshot,source_finding_id,human_owned,updated_at FROM work_items ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, updated_at DESC")?;
-    let mut matches = Vec::new();
+    let mut scored = Vec::new();
     for row in statement.query_map([], work_row)? {
-        let mut item = row?;
-        let text = format!("{} {} {}", item["title"], item["scope"], item["id"]);
-        if search_score(&text, query).is_none() {
-            continue;
+        let item = row?;
+        if open_only {
+            // Closed work and source-comment proposals whose evidence went stale
+            // are history, not known work for a new request.
+            let stale_proposal = item["provenance"] == "SourceDoc"
+                && item["status"] == "proposed"
+                && item["confidence"].as_f64().unwrap_or(0.0) < 0.5;
+            if stale_proposal
+                || !crate::relevance::work_status_is_open(item["status"].as_str().unwrap_or(""))
+            {
+                continue;
+            }
         }
+        if let Some(score) = scorer.score(&item) {
+            scored.push((score, item));
+        }
+    }
+    // Stable: equal scores keep the priority and recency order.
+    scored.sort_by(|left, right| right.0.total_cmp(&left.0));
+    let mut matches = Vec::new();
+    for (_, mut item) in scored.into_iter().take(limit.clamp(1, 200)) {
         decorate_work_readiness(&db, &mut item)?;
         matches.push(item);
-        if matches.len() >= limit.clamp(1, 200) {
-            break;
-        }
     }
     Ok(Some(
         json!({"query":query,"items":matches,"authority":"live human-owned project memory","source":"memory.sqlite3"}),
@@ -293,6 +312,21 @@ pub struct DecisionListRequest {
     pub limit: usize,
 }
 
+/// Lists steerings: newest first when `scope` is omitted; otherwise path
+/// scopes related to a named path first, then concept matches, then global
+/// steerings.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SteeringListRequest {
+    /// Optional symbol, path, or concept to narrow the result. Omit for the
+    /// whole ledger.
+    pub scope: Option<String>,
+    /// `active` (default: active and unexpired), `retired`, or `all`.
+    pub status: Option<String>,
+    #[serde(default = "default_list_limit")]
+    pub limit: usize,
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ArchitectureRequest {
@@ -356,7 +390,11 @@ pub struct QualityMergeRequest {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ValidateRequest {
-    pub context_id: String,
+    /// Prepared context from change.prepare. One context serves every
+    /// validation of a coherent change. Omit it to validate without one:
+    /// architecture_delta and unmodified_expected_callers are then reported
+    /// unavailable.
+    pub context_id: Option<String>,
     /// Inline patch. Mutually exclusive with diff_path and base_ref.
     pub git_diff: Option<String>,
     /// Local UTF-8 patch file, absolute or relative to the repository root.
@@ -366,7 +404,8 @@ pub struct ValidateRequest {
     /// Mutually exclusive with git_diff and diff_path.
     pub base_ref: Option<String>,
     /// Requires base_ref. Defaults to worktree (committed plus pending tracked
-    /// edits); HEAD includes only committed changes. Untracked files are excluded.
+    /// edits); HEAD includes only committed changes. Untracked files are
+    /// excluded here; only the default (no source) includes them.
     pub target: Option<DiffTarget>,
     #[serde(default)]
     pub run_checks: bool,
@@ -647,6 +686,19 @@ const MAX_RETAINED_TASKS: i64 = 200;
 /// runs fmt, check, clippy, and the test suite; a hung test previously pinned a
 /// blocking worker indefinitely with no timeout anywhere in the system.
 const TASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// The longest a task-starting tool or `task.get` holds its MCP request open.
+pub const MAX_TASK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The outcome of [`Observatory::wait_for_task`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum TaskWait {
+    /// The task completed, failed, or was cancelled; the `task.get` value.
+    Settled(Value),
+    /// The wait ended first; the latest `task.get` value.
+    Pending(Value),
+    /// The request that was waiting was cancelled by its client.
+    Abandoned,
+}
 
 /// Recovers a poisoned lock instead of aborting the server. The dashboard slot
 /// holds no invariant that a panicking thread could have broken.
@@ -708,9 +760,18 @@ fn proposed() -> String {
 #[derive(Clone)]
 pub struct Observatory {
     root: Arc<PathBuf>,
+    /// How `root` was derived from the requested path, for `index.status`.
+    root_resolution: Arc<Value>,
     memory_path: Arc<PathBuf>,
+    /// Serialises this process's refreshes: an explicit refresh waits for an
+    /// automatic one, and an automatic one skips while any refresh runs.
+    refresh_gate: Arc<Mutex<()>>,
+    auto_refresh: Arc<crate::auto_refresh::AutoRefreshState>,
     session: Arc<SessionLease>,
-    semantic_backend: Arc<Mutex<crate::SemanticBackend>>,
+    semantic_backend: Arc<crate::SemanticBackend>,
+    /// The warm-start thread of an enabled analyzer; `semantic.disable` and
+    /// server shutdown stop it together with the analyzer.
+    semantic_warmer: Arc<Mutex<Option<crate::rust_analyzer::SemanticWarmer>>>,
     execution: Option<crate::execution::ExecutionControl>,
     dashboard: Arc<Mutex<Option<crate::dashboard::DashboardHandle>>>,
 }
@@ -725,18 +786,24 @@ impl std::fmt::Debug for Observatory {
 }
 
 impl Observatory {
+    /// Opens the observatory for the workspace containing `root`; see
+    /// [`resolve_workspace_root`].
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
-        let root = fs::canonicalize(root.into()).context("resolving workspace path")?;
+        let (root, root_resolution) = resolve_workspace_root(&root.into())?;
         let state = root.join(STATE_DIRECTORY);
         fs::create_dir_all(&state)?;
         let memory_path = state.join("memory.sqlite3");
         let session = SessionLease::acquire(&state)?;
         let observatory = Self {
             root: Arc::new(root),
+            root_resolution: Arc::new(root_resolution),
             memory_path: Arc::new(memory_path),
+            refresh_gate: Arc::new(Mutex::new(())),
+            auto_refresh: Arc::default(),
             dashboard: Arc::new(Mutex::new(None)),
             session: Arc::new(session),
-            semantic_backend: Arc::new(Mutex::new(crate::SemanticBackend::default())),
+            semantic_backend: Arc::default(),
+            semantic_warmer: Arc::default(),
             execution: None,
         };
         observatory.initialize_memory()?;
@@ -745,6 +812,99 @@ impl Observatory {
 
     pub fn root(&self) -> &Path {
         self.root.as_path()
+    }
+
+    /// How the workspace root was resolved from the requested path.
+    pub fn root_resolution(&self) -> &Value {
+        &self.root_resolution
+    }
+
+    /// Starts this process's background refresher unless `CRUSTY_AUTO_REFRESH`
+    /// disables it or one is already running. The returned handle stops it
+    /// when shut down or dropped.
+    pub fn start_auto_refresh(&self) -> Option<crate::auto_refresh::AutoRefresh> {
+        self.start_auto_refresh_with(crate::auto_refresh::Timing::default())
+    }
+
+    pub(crate) fn start_auto_refresh_with(
+        &self,
+        timing: crate::auto_refresh::Timing,
+    ) -> Option<crate::auto_refresh::AutoRefresh> {
+        let (enabled, watch) = crate::auto_refresh_switches();
+        if !enabled || self.auto_refresh.enabled() {
+            return None;
+        }
+        crate::auto_refresh::AutoRefresh::start(
+            self.clone(),
+            self.auto_refresh.clone(),
+            timing,
+            watch,
+        )
+        .ok()
+    }
+
+    /// Enables the analyzer at server start when
+    /// `RUST_REPO_INTELLIGENCE_RUST_ANALYZER_AUTOSTART` asks for it; otherwise
+    /// it stays off until `semantic.enable`.
+    pub fn autostart_semantics(&self) {
+        if crate::semantic_switches().0 {
+            self.enable_semantics_with(crate::rust_analyzer::WarmTiming::default());
+        }
+    }
+
+    /// Turns the analyzer on for this server process. Unless
+    /// `RUST_REPO_INTELLIGENCE_RUST_ANALYZER_WARM_START` disables it, a
+    /// background thread loads the workspace after a short delay and keeps the
+    /// analyzer alive; otherwise it starts on first semantic use.
+    pub fn enable_semantics(&self) -> Result<Value> {
+        let already = self.semantic_backend.is_enabled();
+        self.enable_semantics_with(crate::rust_analyzer::WarmTiming::default());
+        let mut status = self.semantic_status()?;
+        status["changed"] = json!(!already);
+        Ok(status)
+    }
+
+    pub(crate) fn enable_semantics_with(&self, timing: crate::rust_analyzer::WarmTiming) {
+        self.semantic_backend.set_enabled(true);
+        if !crate::semantic_switches().1 {
+            return;
+        }
+        let mut warmer = self
+            .semantic_warmer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if warmer.is_none() {
+            *warmer = crate::rust_analyzer::SemanticWarmer::start(
+                self.root.as_ref().clone(),
+                crate::rust_analyzer::configured_program(self.root.as_ref()),
+                self.semantic_backend.clone(),
+                timing,
+            )
+            .ok();
+        }
+    }
+
+    /// Turns the analyzer off and stops its process, releasing its memory.
+    pub fn disable_semantics(&self) -> Result<Value> {
+        let already = !self.semantic_backend.is_enabled();
+        self.semantic_backend.set_enabled(false);
+        self.shutdown_semantics();
+        let mut status = self.semantic_status()?;
+        status["changed"] = json!(!already);
+        Ok(status)
+    }
+
+    /// Stops the warm-start thread and the analyzer process.
+    pub fn shutdown_semantics(&self) {
+        let warmer = self
+            .semantic_warmer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        match warmer {
+            Some(warmer) => warmer.shutdown(),
+            None => self.semantic_backend.stop(),
+        }
     }
 
     fn coordinator(&self) -> Result<crate::coordination::Coordinator> {
@@ -870,6 +1030,12 @@ impl Observatory {
 
     pub fn semantic_status(&self) -> Result<Value> {
         self.service()?.semantic_status()
+    }
+    pub fn semantic_diagnostics(
+        &self,
+        request: crate::live_semantics::DiagnosticsRequest,
+    ) -> Result<Value> {
+        self.service()?.semantic_diagnostics(request)
     }
     pub fn semantic_query(&self, request: crate::live_semantics::SemanticRequest) -> Result<Value> {
         self.spawn_blocking_task(
@@ -1270,22 +1436,13 @@ impl Observatory {
     pub fn consult(&self, topic: &str, budget: usize) -> Result<Value> {
         ensure!(!topic.trim().is_empty(), "topic is required");
         let freshness = self.freshness("published_snapshot")?;
-        let mut result = self.service()?.consult(topic, budget.clamp(250, 20_000))?;
         let models = crate::domain::approved_for_root(
             self.root(),
             &self.execution.clone().unwrap_or_default(),
         )?;
-        if !models.is_empty() {
-            result["guidance_found"] = json!(true);
-            if let Some(sections) = result["relevant_sections"].as_array_mut() {
-                sections.push(json!("approved_models"));
-            }
-        }
-        result["approved_models"] = json!(models);
-        Ok(crate::response_budget::bound(
-            json!({"freshness":freshness,"result":result}),
-            budget,
-        ))
+        // The service packs freshness and every section into one budget.
+        self.service()?
+            .consult_within(topic, budget, Some(freshness), models)
     }
 
     pub fn decision_record(&self, request: RecordDecision) -> Result<Value> {
@@ -1331,8 +1488,18 @@ impl Observatory {
         self.service()?.record_steering(request)
     }
 
-    pub fn steering_list(&self, query: Option<&str>, limit: usize) -> Result<Value> {
-        self.service()?.steering_list(query, limit.clamp(1, 200))
+    pub fn steering_list(
+        &self,
+        query: Option<&str>,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Value> {
+        self.service()?
+            .steering_list(query, status, list_limit(limit) as usize)
+    }
+
+    pub fn steering_retire(&self, request: RetireSteering) -> Result<Value> {
+        self.service()?.retire_steering(request)
     }
 
     /// Explicitly records a defect. Problems could previously only arrive
@@ -1650,7 +1817,7 @@ impl Observatory {
         let this = self.clone();
         let result = task::spawn_blocking(move || {
             this.service()?.validate_change_from_source(
-                &request.context_id,
+                request.context_id.as_deref(),
                 &source,
                 request.run_checks,
             )
@@ -1679,7 +1846,7 @@ impl Observatory {
                 let freshness = observatory.freshness("published_snapshot")?;
                 let service = observatory.service()?;
                 let result = service.validate_change_from_source(
-                    &request.context_id,
+                    request.context_id.as_deref(),
                     &source,
                     request.run_checks,
                 )?;
@@ -1692,73 +1859,154 @@ impl Observatory {
         )
     }
 
+    /// The freshness envelope attached to every read.
+    ///
+    /// `backend` names what the read served (`published_snapshot` or
+    /// `live_worktree`); a published read with nothing published reports
+    /// `no_published_snapshot`. `stale` and `reason` compare the live
+    /// workspace with the published generation (see [`crate::index_freshness`]);
+    /// a failure to read either is reported as `error` rather than as fresh.
     pub fn freshness(&self, backend: &str) -> Result<Value> {
-        let head = git_text(self.root.as_path(), &["rev-parse", "HEAD"]);
-        let dirty = Command::new("git")
-            .current_dir(self.root.as_path())
-            .args(["status", "--porcelain=v2", "--untracked-files=all"])
-            .output()
-            .ok()
-            .is_some_and(|output| !output.stdout.is_empty());
-        let index_path = self.root.join(STATE_DIRECTORY).join("index.sqlite3");
-        let mut indexed_head = None;
-        let mut indexed_digest = None;
-        let mut generation = None;
-        let mut published_at = None;
-        if index_path.exists() {
-            let db = Connection::open_with_flags(
-                index_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )?;
-            indexed_head = metadata_value(&db, "git_indexed_head").ok().flatten();
-            if let Some((id, digest, published)) = db
-                .query_row(
-                    "SELECT id,workspace_digest,published_at FROM index_generations WHERE status='published' ORDER BY id DESC LIMIT 1",
-                    [],
-                    |row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?)),
-                )
-                .optional()
-                .ok()
-                .flatten()
-            {
-                generation = Some(id);
-                indexed_digest = Some(digest);
-                published_at = published;
-            }
-        }
-        let stale = generation.is_none() || dirty || head != indexed_head;
-        Ok(json!({
+        let live = backend == "live_worktree";
+        let refresh = self.refresh_activity();
+        let (index, error) = match self.index_freshness() {
+            Ok(index) => (index, None),
+            Err(error) => (crate::IndexFreshness::default(), Some(format!("{error:#}"))),
+        };
+        let (running, last_completed_at, refresh_error) = match refresh {
+            Ok((running, last)) => (running, last, None),
+            Err(error) => (None, None, Some(format!("{error:#}"))),
+        };
+        let never_published = error.is_none() && index.generation.is_none();
+        let stale = error.is_some() || index.stale();
+        let cause = if error.is_some() {
+            "error"
+        } else {
+            index.reason()
+        };
+        let reason = if stale && running.is_some() && !never_published {
+            "refresh_running"
+        } else {
+            cause
+        };
+        let backend = if !live && never_published {
+            "no_published_snapshot"
+        } else {
+            backend
+        };
+        let automatic = self.auto_refresh.enabled();
+        let note = if live {
+            "Read directly from current source; the published index was not consulted or refreshed."
+                .to_owned()
+        } else if never_published {
+            "No generation has been published, so indexed results are empty. index.refresh builds one; reads never wait for it.".to_owned()
+        } else {
+            format!(
+                "Read from published generation {}; reads never wait for a refresh. Automatic background refresh is {}.",
+                index.generation.unwrap_or_default(),
+                if automatic { "on" } else { "off" }
+            )
+        };
+        let mut envelope = json!({
             "backend": backend,
-            "live":{"head":head,"dirty":dirty},
-            "indexed":{"head":indexed_head,"workspace_digest":indexed_digest,"generation":generation,"published_at":published_at},
-            "stale":stale,
-            "confidence": if backend == "live_worktree" { 1.0 } else if stale { 0.65 } else { 0.95 },
-            "note": if backend == "live_worktree" { "Read directly from current Rust source; no refresh was attempted." } else { "Read from the last atomically published snapshot; no implicit refresh was attempted." }
-        }))
+            "stale": stale,
+            "reason": reason,
+            "never_published": never_published,
+            "live": {"head": index.live_head, "dirty_inputs": index.dirty_inputs},
+            "indexed": {
+                "head": index.indexed_head,
+                "generation": index.generation,
+                "published_at": index.published_at,
+                "workspace_digest": index.workspace_digest,
+            },
+            "refresh": {"running": running, "last_completed_at": last_completed_at, "automatic": automatic},
+            "confidence": if live { 1.0 } else if stale { 0.65 } else { 0.95 },
+            "note": note,
+        });
+        if reason == "refresh_running" {
+            envelope["cause"] = Value::from(cause);
+        }
+        if !index.changed_inputs.is_empty() {
+            envelope["changed_inputs"] = json!({
+                "count": index.changed_inputs.len(),
+                "sample": index.changed_inputs.iter().take(3).collect::<Vec<_>>(),
+            });
+        }
+        if let Some(error) = error.or(refresh_error) {
+            envelope["error"] = Value::from(bounded(&error, 500));
+        }
+        Ok(envelope)
     }
 
+    /// Compares the live workspace with the published generation without
+    /// opening the index for writing.
+    fn index_freshness(&self) -> Result<crate::IndexFreshness> {
+        let index_path = self.root.join(STATE_DIRECTORY).join("index.sqlite3");
+        if !index_path.exists() {
+            return Ok(crate::IndexFreshness::default());
+        }
+        let db = Connection::open_with_flags(index_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .context("opening the published index")?;
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
+        let initialized: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='index_generations')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !initialized {
+            return Ok(crate::IndexFreshness::default());
+        }
+        crate::index_freshness(self.root.as_path(), &db)
+    }
+
+    /// The running refresh task, from any process, and when one last completed.
+    fn refresh_activity(&self) -> Result<(Option<String>, Option<String>)> {
+        let db = self.db()?;
+        let running = db
+            .query_row(
+                "SELECT id FROM tasks WHERE kind='index.refresh' AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let completed = db.query_row(
+            "SELECT MAX(updated_at) FROM tasks WHERE kind='index.refresh' AND status='completed'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )?;
+        Ok((running, completed))
+    }
+
+    /// One backend/index block plus freshness, root resolution, the latest
+    /// refresh task, and the background refresher.
     pub fn index_status(&self) -> Result<Value> {
         let db = self.db()?;
-        let task = latest_task(&db, "index.refresh")?;
+        let task = latest_task(&db, "index.refresh")?.map(compact_refresh_task);
+        let freshness = self.freshness("published_snapshot")?;
         // Counts and backend health explain *why* a context came back empty:
         // a never-published index and "no relevant symbols" were previously
         // indistinguishable from the outside.
         let service = self.service()?;
-        let counts = service.status()?;
-        let never_published = counts["counts"]["nodes"].as_i64().unwrap_or(0) == 0;
+        let mut index = service.index_summary()?;
+        index["backend"] = service.index_status();
+        let never_published = freshness["never_published"].as_bool().unwrap_or(false);
+        let automatic = self.auto_refresh.enabled();
         Ok(json!({
-            "freshness": self.freshness("published_snapshot")?,
-            "latest_refresh_task": task,
-            "publisher_lock": self.root.join(STATE_DIRECTORY).join("index.lock"),
-            "index": counts,
-            "backend": service.index_status(),
+            "root": *self.root_resolution,
+            "freshness": freshness,
             "never_published": never_published,
-            "next": if never_published {
-                "This repository has no published index. Call index.refresh with scope=workspace and poll task.get before relying on repo.context, symbol.relations, or broad search."
+            "next": if never_published && automatic {
+                "No index is published yet. The background refresher is building one; poll index.status or task.get with freshness.refresh.running before relying on repo.context, symbol.relations, or broad search."
+            } else if never_published {
+                "This repository has no published index. Call index.refresh and poll task.get before relying on repo.context, symbol.relations, or broad search."
             } else {
                 "Use repo.search mode=exact for live navigation; broad reads serve the published generation."
             },
-            "policy": {"implicit_refresh":false,"single_writer":true,"reads_during_refresh":"last published generation"}
+            "index": index,
+            "latest_refresh_task": task,
+            "auto_refresh": self.auto_refresh.status(),
+            "publisher_lock": self.root.join(STATE_DIRECTORY).join("index.lock"),
+            "policy": {"implicit_refresh":automatic,"single_writer":true,"reads_during_refresh":"last published generation"}
         }))
     }
 
@@ -1775,12 +2023,96 @@ impl Observatory {
             !self.task_cancelled(task_id)?,
             "task cancelled before start"
         );
+        let gate = match self.refresh_gate.try_lock() {
+            Ok(gate) => gate,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.update_task(task_id, "running", 2, "waiting for the running refresh")?;
+                self.refresh_gate.lock().unwrap_or_else(poisoned)
+            }
+        };
+        let result = self.run_refresh_locked(task_id, scope);
+        drop(gate);
+        result
+    }
+
+    fn run_refresh_locked(&self, task_id: &str, scope: Option<&str>) -> Result<Value> {
         self.update_task(task_id, "running", 5, "acquiring publisher lease")?;
         let mut service = self.service()?;
         self.update_task(task_id, "running", 20, "refreshing derived index")?;
         let value = service.refresh(scope)?;
         self.update_task(task_id, "running", 95, "publishing generation")?;
         Ok(json!({"refresh":value,"freshness":self.freshness("published_snapshot")?}))
+    }
+
+    /// One background refresh attempt: a cheap freshness check and, only when
+    /// the published generation is stale and no other refresh runs here or in
+    /// another process, the incremental refresh as a durable task.
+    pub(crate) fn auto_refresh_tick(&self, trigger: &str) -> crate::auto_refresh::TickOutcome {
+        let (outcome, task_id, error) = match self.try_auto_refresh(trigger) {
+            Ok(result) => result,
+            Err(error) => (
+                crate::auto_refresh::TickOutcome::Failed,
+                None,
+                Some(format!("{error:#}")),
+            ),
+        };
+        self.auto_refresh
+            .record(trigger, outcome, task_id.as_deref(), error.as_deref());
+        outcome
+    }
+
+    fn try_auto_refresh(
+        &self,
+        trigger: &str,
+    ) -> Result<(
+        crate::auto_refresh::TickOutcome,
+        Option<String>,
+        Option<String>,
+    )> {
+        use crate::auto_refresh::TickOutcome;
+        if !self.index_freshness()?.stale() {
+            return Ok((TickOutcome::Fresh, None, None));
+        }
+        if self.refresh_activity()?.0.is_some() {
+            return Ok((TickOutcome::Busy, None, None));
+        }
+        let gate = match self.refresh_gate.try_lock() {
+            Ok(gate) => gate,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Ok((TickOutcome::Busy, None, None));
+            }
+        };
+        // Probe the cross-process publisher lease so a refresh owned by
+        // another server is skipped rather than recorded as a failed task.
+        let lease_path = self.root.join(STATE_DIRECTORY).join("index.lock");
+        let lease = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lease_path)?;
+        if FileExt::try_lock_exclusive(&lease).is_err() {
+            return Ok((TickOutcome::Busy, None, None));
+        }
+        FileExt::unlock(&lease)?;
+        drop(lease);
+        let task_id =
+            self.create_task("index.refresh", &format!("automatic refresh ({trigger})"))?;
+        let outcome = match self.run_refresh_locked(&task_id, None) {
+            Ok(value) => {
+                self.finish_task(&task_id, value)?;
+                (TickOutcome::Refreshed, Some(task_id), None)
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                self.fail_task(&task_id, &message)?;
+                (TickOutcome::Failed, Some(task_id), Some(message))
+            }
+        };
+        drop(gate);
+        Ok(outcome)
     }
 
     pub fn research_start(&self, request: ResearchStartRequest) -> Result<Value> {
@@ -2263,6 +2595,9 @@ impl Observatory {
         const FILTER: &str = "?1='' OR lower(id)=?1 OR lower(title) LIKE '%'||?1||'%' OR lower(scope_json) LIKE '%'||?1||'%' OR lower(evidence_json) LIKE '%'||?1||'%'";
         let db = self.db()?;
         let query = query.unwrap_or("").to_lowercase();
+        if !query.trim().is_empty() {
+            return self.work_search_page(&db, &query, limit, offset);
+        }
         let total: i64 = db.query_row(
             &format!("SELECT COUNT(*) FROM work_items WHERE {FILTER}"),
             params![query],
@@ -2275,6 +2610,54 @@ impl Observatory {
         drop(statement);
         for item in &mut items {
             decorate_work_readiness(&db, item)?;
+        }
+        let page = page_info(total, offset, items.len());
+        Ok(
+            json!({"query":query,"items":items,"page":page,"authority":"human-owned project memory; this is not a GitHub issue tracker"}),
+        )
+    }
+
+    /// A queried `work.list` page ranked by the consultation relevance rules
+    /// (`WorkQuery::score`). An item containing the whole query phrase in its
+    /// id, title, scope, or evidence still matches, after every scored match.
+    fn work_search_page(
+        &self,
+        db: &Connection,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Value> {
+        let scorer = crate::relevance::WorkQuery::new(query);
+        let mut statement = db.prepare("SELECT id,title,status,priority,kind,scope_json,evidence_json,depends_json,blocked_json,acceptance_json,verification_json,discovered_from,provenance,confidence,last_validated_snapshot,source_finding_id,human_owned,updated_at FROM work_items ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, updated_at DESC")?;
+        let mut scored = Vec::new();
+        for row in statement.query_map([], work_row)? {
+            let item = row?;
+            let phrase = item["id"]
+                .as_str()
+                .is_some_and(|id| id.to_lowercase() == query)
+                || ["title", "scope", "evidence"].iter().any(|field| {
+                    let text = match &item[*field] {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    text.to_lowercase().contains(query)
+                });
+            if let Some(score) = scorer.score(&item).or(phrase.then_some(-1.0)) {
+                scored.push((score, item));
+            }
+        }
+        drop(statement);
+        // Stable: equal scores keep the priority and recency order.
+        scored.sort_by(|left, right| right.0.total_cmp(&left.0));
+        let total = scored.len() as i64;
+        let mut items = scored
+            .into_iter()
+            .skip(offset)
+            .take(list_limit(limit) as usize)
+            .map(|(_, item)| item)
+            .collect::<Vec<_>>();
+        for item in &mut items {
+            decorate_work_readiness(db, item)?;
         }
         let page = page_info(total, offset, items.len());
         Ok(
@@ -2498,21 +2881,42 @@ impl Observatory {
         );
         self.sync_legacy_memory()?;
         let records = self.search_legacy_memory(&request.query, request.limit)?;
-        let (prompts, history) = search_codex_prompt_history(
+        let (mut prompts, codex) = search_codex_prompt_history(
             self.root.as_path(),
             &request.query,
             request.limit,
             request.max_prompt_chars,
             codex_home(),
         )?;
+        let (claude_prompts, claude_code) = search_claude_code_transcripts(
+            self.root.as_path(),
+            &request.query,
+            request.limit,
+            request.max_prompt_chars,
+            claude_projects_dir(),
+        );
+        prompts.extend(claude_prompts);
+        // Both sources rank by the same relevance score, then recency; ISO
+        // timestamps from either source compare chronologically as text.
+        prompts.sort_by(|left, right| {
+            right["relevance"]
+                .as_u64()
+                .cmp(&left["relevance"].as_u64())
+                .then_with(|| {
+                    right["created_at"]
+                        .as_str()
+                        .cmp(&left["created_at"].as_str())
+                })
+        });
+        prompts.truncate(request.limit);
         Ok(json!({
             "query": request.query,
             "repository": self.root,
             "prompts": prompts,
             "records": records,
-            "history": history,
+            "history": {"codex": codex, "claude_code": claude_code},
             "authority": {
-                "prompts": "verbatim user-authored Codex session history scoped to this repository",
+                "prompts": "verbatim user-authored Codex and Claude Code session history scoped to this repository; each prompt names its source",
                 "records": "preserved legacy decisions, steerings, problems, and quality constraints",
                 "work": "recovered prompts and records do not become project work until a human explicitly creates or confirms work"
             }
@@ -2592,6 +2996,40 @@ impl Observatory {
         Ok(
             json!({"task_id":id,"cancellation_requested":changed == 1,"note":"Cooperative cancellation takes effect at the next safe boundary; an index transaction is never interrupted during publication."}),
         )
+    }
+
+    /// Waits up to `wait` for a durable task to settle, so a caller can get a
+    /// short task's result in the call that started it instead of polling.
+    ///
+    /// The task row is the only source of truth: it is polled with a capped
+    /// backoff, which also observes tasks settled by another server process.
+    /// Cancelling `cancellation` (the MCP request) ends the wait promptly; the
+    /// caller decides whether the task itself should be cancelled.
+    pub async fn wait_for_task(
+        &self,
+        id: &str,
+        wait: std::time::Duration,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<TaskWait> {
+        let deadline = tokio::time::Instant::now() + wait.min(MAX_TASK_WAIT);
+        let mut interval = std::time::Duration::from_millis(25);
+        loop {
+            let task = self.task_get(id)?;
+            if matches!(
+                task["task"]["status"].as_str(),
+                Some("completed" | "failed" | "cancelled")
+            ) {
+                return Ok(TaskWait::Settled(task));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(TaskWait::Pending(task));
+            }
+            tokio::select! {
+                () = cancellation.cancelled() => return Ok(TaskWait::Abandoned),
+                () = tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + interval)) => {}
+            }
+            interval = (interval * 2).min(std::time::Duration::from_millis(250));
+        }
     }
 
     pub async fn dashboard_open(&self) -> Result<Value> {
@@ -2879,6 +3317,246 @@ fn codex_home() -> Option<PathBuf> {
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
 }
 
+/// Claude Code keeps transcripts under `$CLAUDE_CONFIG_DIR/projects`
+/// (default `~/.claude/projects`).
+fn claude_projects_dir() -> Option<PathBuf> {
+    env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
+        .map(|config| config.join("projects"))
+}
+
+/// Claude Code names a project's transcript directory after its absolute
+/// path with every non-alphanumeric character replaced by `-`.
+fn claude_project_slug(path: &Path) -> String {
+    path.to_string_lossy()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Only the most recently modified transcripts are read, each up to a byte
+/// budget, so a long history cannot make one search unbounded.
+const MAX_CLAUDE_TRANSCRIPTS: usize = 200;
+const MAX_CLAUDE_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Searches genuine user prompts in this repository's Claude Code
+/// transcripts. Tool results, meta and sidechain (subagent) messages, system
+/// reminders, slash-command and shell echoes, and compaction summaries are
+/// not user-authored and are skipped. Unreadable files are skipped.
+fn search_claude_code_transcripts(
+    repository: &Path,
+    query: &str,
+    limit: usize,
+    max_prompt_chars: usize,
+    projects: Option<PathBuf>,
+) -> (Vec<Value>, Value) {
+    let Some(projects) = projects else {
+        return (
+            Vec::new(),
+            json!({"available":false,"reason":"Claude Code configuration directory could not be resolved"}),
+        );
+    };
+    let canonical_repository =
+        fs::canonicalize(repository).unwrap_or_else(|_| repository.to_path_buf());
+    let mut directories = vec![projects.join(claude_project_slug(&canonical_repository))];
+    let given = projects.join(claude_project_slug(repository));
+    if !directories.contains(&given) {
+        directories.push(given);
+    }
+    let mut files = directories
+        .iter()
+        .filter_map(|directory| fs::read_dir(directory).ok())
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|value| value == "jsonl")
+        })
+        .map(|entry| {
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            (modified, entry.path())
+        })
+        .collect::<Vec<_>>();
+    if files.is_empty() {
+        return (
+            Vec::new(),
+            json!({
+                "available": false,
+                "reason": "No Claude Code transcripts matched this repository",
+                "project_directories": directories,
+            }),
+        );
+    }
+    files.sort_by_key(|file| std::cmp::Reverse(file.0));
+    let transcripts = files.len();
+    files.truncate(MAX_CLAUDE_TRANSCRIPTS);
+    let mut matches = Vec::new();
+    let mut scanned = 0;
+    for (_, path) in &files {
+        let Ok(file) = fs::File::open(path) else {
+            continue;
+        };
+        let session = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("unknown")
+            .to_owned();
+        let mut seen = HashSet::new();
+        let mut reader = BufReader::new(file.take(MAX_CLAUDE_TRANSCRIPT_BYTES));
+        let mut line = String::new();
+        loop {
+            line.clear();
+            // Bounded so one enormous line cannot be read wholly into memory.
+            match (&mut reader)
+                .take(MAX_SESSION_LINE_BYTES)
+                .read_line(&mut line)
+            {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let Some((text, images)) = claude_user_prompt(&value, &canonical_repository) else {
+                continue;
+            };
+            scanned += 1;
+            let Some(score) = search_score(&text, query) else {
+                continue;
+            };
+            if !seen.insert(text.clone()) {
+                continue;
+            }
+            let uuid = value["uuid"].as_str().unwrap_or_default();
+            let created_at = value["timestamp"].as_str().unwrap_or_default().to_owned();
+            matches.push(json!({
+                "session": session,
+                "uuid": uuid,
+                "created_at": created_at,
+                "text": bounded(&text, max_prompt_chars),
+                "original_chars": text.chars().count(),
+                "truncated": text.len() > max_prompt_chars,
+                "images": images,
+                "provenance": format!("claude-code://{session}/{uuid}"),
+                "source": "claude_code",
+                "relevance": score,
+            }));
+        }
+    }
+    matches.sort_by(|left, right| {
+        right["relevance"]
+            .as_u64()
+            .cmp(&left["relevance"].as_u64())
+            .then_with(|| {
+                right["created_at"]
+                    .as_str()
+                    .cmp(&left["created_at"].as_str())
+            })
+    });
+    matches.truncate(limit);
+    (
+        matches,
+        json!({
+            "available": true,
+            "source": "claude_code_jsonl",
+            "project_directories": directories,
+            "transcripts": transcripts,
+            "transcripts_read": files.len(),
+            "messages_scanned": scanned,
+            "scope": "transcripts of the project directory named after this repository whose recorded cwd matches it",
+            "privacy": "only user-authored prompt text is returned; tool results, assistant content and injected context are excluded",
+        }),
+    )
+}
+
+/// The user-authored text and image count of one Claude Code transcript
+/// record, or `None` when it is not a genuine prompt made in `repository`.
+fn claude_user_prompt(value: &Value, repository: &Path) -> Option<(String, usize)> {
+    if value["type"] != "user"
+        || value["isMeta"] == true
+        || value["isSidechain"] == true
+        || value["isCompactSummary"] == true
+    {
+        return None;
+    }
+    // Different paths can share a slug; the record's own cwd decides.
+    if let Some(cwd) = value["cwd"].as_str()
+        && fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd)) != repository
+    {
+        return None;
+    }
+    let content = &value["message"]["content"];
+    let (text, images) = if let Some(text) = content.as_str() {
+        (text.to_owned(), 0)
+    } else {
+        let blocks = content.as_array()?;
+        if blocks.iter().any(|block| block["type"] == "tool_result") {
+            return None;
+        }
+        let text = blocks
+            .iter()
+            .filter(|block| block["type"] == "text")
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let images = blocks
+            .iter()
+            .filter(|block| block["type"] == "image")
+            .count();
+        (text, images)
+    };
+    let text = strip_system_reminders(&text);
+    let trimmed = text.trim();
+    let injected = [
+        "<command-name>",
+        "<command-message>",
+        "<command-args>",
+        "<local-command-stdout>",
+        "<local-command-stderr>",
+        "<local-command-caveat>",
+        "<bash-input>",
+        "<bash-stdout>",
+        "<bash-stderr>",
+        "<task-notification>",
+        "[Request interrupted by user",
+        "This session is being continued from a previous conversation",
+    ];
+    (!trimmed.is_empty() && !injected.iter().any(|prefix| trimmed.starts_with(prefix)))
+        .then(|| (trimmed.to_owned(), images))
+}
+
+/// Removes `<system-reminder>` blocks the client injects into user turns.
+fn strip_system_reminders(text: &str) -> String {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        output.push_str(&rest[..start]);
+        match rest[start..].find(CLOSE) {
+            Some(end) => rest = &rest[start + end + CLOSE.len()..],
+            None => {
+                rest = "";
+            }
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
 fn search_codex_prompt_history(
     repository: &Path,
     query: &str,
@@ -3084,6 +3762,8 @@ fn search_thread_history_db(
                 "truncated": text.len() > max_prompt_chars,
                 "images": images,
                 "provenance": provenance,
+                "source": "codex",
+                "relevance": score,
             }),
         ));
     }
@@ -3159,6 +3839,8 @@ fn search_rollout_logs(
                     "original_chars": original_chars,
                     "truncated": text.len() > max_prompt_chars,
                     "provenance": provenance,
+                    "source": "codex",
+                    "relevance": score,
                 }),
             ));
         }
@@ -3581,16 +4263,88 @@ fn task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     )
 }
 
-fn latest_task(db: &Connection, kind: &str) -> Result<Option<Value>> {
-    Ok(db.query_row("SELECT id,kind,status,progress,message,result_json,error,cancel_requested,created_at,updated_at FROM tasks WHERE kind=?1 ORDER BY updated_at DESC LIMIT 1", [kind], task_row).optional()?)
+/// A refresh task row for `index.status`: the stored compact refresh summary
+/// only, since current freshness is reported separately. Results stored by
+/// older servers held the whole store status and are omitted.
+fn compact_refresh_task(mut task: Value) -> Value {
+    let summary = task
+        .pointer("/result/refresh")
+        .filter(|refresh| refresh.get("mode").is_some())
+        .cloned();
+    if let Some(object) = task.as_object_mut() {
+        object.remove("progress");
+        object.remove("cancel_requested");
+        let had_result = object.get("result").is_some_and(|result| !result.is_null());
+        object.insert(
+            "result".into(),
+            match summary {
+                Some(summary) => summary,
+                None if had_result => json!({"omitted": "result recorded by an older server"}),
+                None => Value::Null,
+            },
+        );
+    }
+    task
 }
 
-fn metadata_value(db: &Connection, key: &str) -> Result<Option<String>> {
-    Ok(db
-        .query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
-            row.get(0)
-        })
-        .optional()?)
+/// Resolves the root a server owns from the path it was started in.
+///
+/// The path is canonicalised. Inside a Git work tree, the nearest ancestor
+/// whose `Cargo.toml` declares a `[workspace]` becomes the root, or else the
+/// nearest package manifest's directory, so a server started in `src/` or a
+/// member crate shares the workspace's store instead of creating its own.
+/// The walk never leaves the Git top level, so a linked worktree keeps its
+/// own root even when it is checked out inside another repository. Outside
+/// Git the canonical path is used as given.
+pub fn resolve_workspace_root(requested: &Path) -> Result<(PathBuf, Value)> {
+    let start = fs::canonicalize(requested).context("resolving workspace path")?;
+    let top = git_text(&start, &["rev-parse", "--show-toplevel"])
+        .and_then(|top| fs::canonicalize(top).ok());
+    let (root, resolution) = match &top {
+        None => (start.clone(), "as_given"),
+        Some(top) => {
+            let mut package = None;
+            let mut workspace = None;
+            for directory in start.ancestors() {
+                if !directory.starts_with(top) {
+                    break;
+                }
+                if let Ok(manifest) = fs::read_to_string(directory.join("Cargo.toml")) {
+                    package.get_or_insert(directory);
+                    if declares_workspace(&manifest) {
+                        workspace = Some(directory);
+                        break;
+                    }
+                }
+                if directory == top {
+                    break;
+                }
+            }
+            match (workspace, package) {
+                (Some(workspace), _) => (workspace.to_path_buf(), "cargo_workspace"),
+                (None, Some(package)) => (package.to_path_buf(), "cargo_package"),
+                (None, None) => (start.clone(), "as_given"),
+            }
+        }
+    };
+    let detail = json!({
+        "path": root,
+        "requested": requested,
+        "resolution": resolution,
+        "git_top_level": top,
+    });
+    Ok((root, detail))
+}
+
+fn declares_workspace(manifest: &str) -> bool {
+    manifest.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("[workspace]") || line.starts_with("[workspace.")
+    })
+}
+
+fn latest_task(db: &Connection, kind: &str) -> Result<Option<Value>> {
+    Ok(db.query_row("SELECT id,kind,status,progress,message,result_json,error,cancel_requested,created_at,updated_at FROM tasks WHERE kind=?1 ORDER BY updated_at DESC LIMIT 1", [kind], task_row).optional()?)
 }
 
 fn git_text(root: &Path, args: &[&str]) -> Option<String> {
@@ -3691,6 +4445,54 @@ mod tests {
     }
 
     #[test]
+    fn consultation_joins_only_relevant_open_project_work() -> Result<()> {
+        let (_repository, observatory) = workspace()?;
+        let create = |title: &str, status: &str, scope: &[&str]| -> Result<String> {
+            let mut request = work_request(title, status);
+            request.scope = scope.iter().map(|entry| (*entry).to_owned()).collect();
+            request.evidence = vec!["e".repeat(500)];
+            Ok(observatory.work_create(request)?["work_id"]
+                .as_str()
+                .context("work id")?
+                .to_owned())
+        };
+        let open = create("Session lease renewal", "active", &["src/coordination.rs"])?;
+        let completed = create("Session lease renewal audit", "completed", &[])?;
+        let unrelated = create("Refresh the marketing logo", "accepted", &["web/site"])?;
+        let elsewhere = create("Session lease renewal", "accepted", &["crates/other"])?;
+        let topic = "Fix the session lease renewal race in src/coordination.rs and add tests";
+        let value = observatory.consult(topic, 4_000)?;
+        let work = value["result"]["known_work"]
+            .as_array()
+            .context("known work")?
+            .iter()
+            .filter_map(|item| item["id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(work, [open.as_str()], "{completed} {unrelated} {elsewhere}");
+        let brief = &value["result"]["known_work"][0];
+        assert_eq!(brief["detail"], "work.get");
+        assert!(brief.get("evidence").is_none());
+        assert_eq!(brief["ready"], true);
+        assert!(value["freshness"].is_object());
+        let bytes = value.to_string().len();
+        assert_eq!(value["result"]["context_budget"]["serialized_bytes"], bytes);
+        assert!(bytes <= 16_000);
+        // work.list ranks a queried page by the same rules but keeps every
+        // status and the full rows.
+        let listed = observatory.work_list(Some(topic), 10)?;
+        let listed_ids = listed["items"]
+            .as_array()
+            .context("work items")?
+            .iter()
+            .filter_map(|item| item["id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(listed_ids, [open.as_str(), completed.as_str()]);
+        assert_eq!(listed["page"]["total"], 2);
+        assert!(listed["items"][0]["evidence"].is_array());
+        Ok(())
+    }
+
+    #[test]
     fn prompt_recovery_is_project_scoped_and_includes_side_session_history() -> Result<()> {
         let (repository, _observatory) = workspace()?;
         let codex = tempdir()?;
@@ -3763,6 +4565,126 @@ mod tests {
         assert_eq!(prompts[0]["images"][0], "/tmp/reference.png");
         assert_eq!(provenance["source"], "thread_history_1.sqlite");
         assert_eq!(provenance["side_session_files"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn claude_code_project_slugs_replace_every_non_alphanumeric_character() {
+        // Directory names as Claude Code writes them under ~/.claude/projects.
+        assert_eq!(
+            claude_project_slug(Path::new("/home/mendrik/desk/mendrik/crusty")),
+            "-home-mendrik-desk-mendrik-crusty"
+        );
+        assert_eq!(
+            claude_project_slug(Path::new(
+                "/home/mendrik/desk/mendrik/asset-scaler/.claude/worktrees/release-0.2.0"
+            )),
+            "-home-mendrik-desk-mendrik-asset-scaler--claude-worktrees-release-0-2-0"
+        );
+        assert_eq!(claude_project_slug(Path::new("/a_b/c d")), "-a-b-c-d");
+    }
+
+    #[test]
+    fn claude_code_prompt_recovery_returns_only_genuine_user_prompts() -> Result<()> {
+        let (repository, _observatory) = workspace()?;
+        let projects = tempdir()?;
+        let canonical = fs::canonicalize(repository.path())?;
+        let directory = projects.path().join(claude_project_slug(&canonical));
+        fs::create_dir_all(directory.join("session-a/subagents"))?;
+        let cwd = canonical.to_string_lossy().into_owned();
+        let user = |uuid: &str, content: Value| {
+            json!({"type":"user","uuid":uuid,"cwd":cwd,"timestamp":"2026-10-02T10:00:00.000Z",
+                "sessionId":"session-a","message":{"role":"user","content":content}})
+        };
+        let mut meta = user("meta", json!("Toggle the evidence panel (skill text)"));
+        meta["isMeta"] = json!(true);
+        let mut sidechain = user("side", json!("Toggle the evidence panel for the subagent"));
+        sidechain["isSidechain"] = json!(true);
+        let mut elsewhere = user("other", json!("Toggle the evidence panel elsewhere"));
+        elsewhere["cwd"] = json!("/somewhere/else");
+        let records = [
+            user(
+                "u1",
+                json!(
+                    "Toggle the evidence panel\n<system-reminder>toggle injected evidence</system-reminder>"
+                ),
+            ),
+            user(
+                "u2",
+                json!([{"type":"text","text":"[Image #1] the evidence toggle is misaligned"},{"type":"image","source":{}}]),
+            ),
+            user(
+                "tool",
+                json!([{"type":"tool_result","tool_use_id":"t","content":"evidence toggle output"}]),
+            ),
+            user(
+                "cmd",
+                json!("<command-name>/model</command-name> evidence toggle"),
+            ),
+            user(
+                "note",
+                json!("<task-notification>evidence toggle finished</task-notification>"),
+            ),
+            user(
+                "reminder",
+                json!("<system-reminder>evidence toggle</system-reminder>"),
+            ),
+            json!({"type":"assistant","uuid":"a1","cwd":cwd,"message":{"role":"assistant","content":[{"type":"text","text":"evidence toggle done"}]}}),
+            meta,
+            sidechain,
+            elsewhere,
+        ];
+        let lines = records
+            .iter()
+            .map(|record| serde_json::to_string(record).map(|line| line + "\n"))
+            .collect::<serde_json::Result<String>>()?;
+        fs::write(
+            directory.join("session-a.jsonl"),
+            format!("{lines}not json\n"),
+        )?;
+        // Subagent transcripts are not user prompts.
+        fs::write(
+            directory.join("session-a/subagents/agent.jsonl"),
+            serde_json::to_string(&user("sub", json!("evidence toggle from a subagent")))?,
+        )?;
+
+        let (prompts, history) = search_claude_code_transcripts(
+            repository.path(),
+            "evidence toggle",
+            10,
+            2_000,
+            Some(projects.path().to_path_buf()),
+        );
+        let texts = prompts
+            .iter()
+            .map(|prompt| prompt["text"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            [
+                "[Image #1] the evidence toggle is misaligned",
+                "Toggle the evidence panel"
+            ]
+        );
+        assert!(
+            prompts
+                .iter()
+                .all(|prompt| prompt["source"] == "claude_code")
+        );
+        assert_eq!(prompts[0]["images"], 1);
+        assert_eq!(prompts[0]["provenance"], "claude-code://session-a/u2");
+        assert_eq!(history["available"], true);
+        assert_eq!(history["transcripts"], 1);
+
+        let (none, missing) = search_claude_code_transcripts(
+            repository.path(),
+            "evidence",
+            10,
+            2_000,
+            Some(projects.path().join("absent")),
+        );
+        assert!(none.is_empty());
+        assert_eq!(missing["available"], false);
         Ok(())
     }
 
@@ -4502,7 +5424,7 @@ mod tests {
 
         let started_at = std::time::Instant::now();
         let validation = observatory.start_validate_change(ValidateRequest {
-            context_id: context_id.clone(),
+            context_id: Some(context_id.clone()),
             git_diff: Some(String::new()),
             diff_path: None,
             base_ref: None,
@@ -4806,7 +5728,7 @@ mod tests {
         );
         assert!(after["index"]["counts"]["nodes"].as_i64().unwrap_or(0) > 0);
         assert!(
-            after["backend"].is_object(),
+            after["index"]["backend"].is_object(),
             "backend health explains why retrieval is degraded"
         );
         Ok(())
@@ -5044,6 +5966,279 @@ mod tests {
             .finding_page(Some("bogus"), None, 10, 0)
             .expect_err("an unknown status must not read as an empty inbox");
         assert!(format!("{error:#}").contains("unsupported finding status"));
+        Ok(())
+    }
+
+    fn git(root: &Path, args: &[&str]) -> Result<()> {
+        let output = Command::new("git").current_dir(root).args(args).output()?;
+        ensure!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    /// A committed crate whose Crusty state directory is deliberately not
+    /// ignored, as in repositories that never added it to `.gitignore`.
+    fn git_workspace() -> Result<(tempfile::TempDir, Observatory)> {
+        let (directory, _) = workspace()?;
+        git(directory.path(), &["init", "-q"])?;
+        git(directory.path(), &["config", "user.name", "Fixture"])?;
+        git(
+            directory.path(),
+            &["config", "user.email", "fixture@example.invalid"],
+        )?;
+        git(directory.path(), &["add", "Cargo.toml", "src/lib.rs"])?;
+        git(directory.path(), &["commit", "-qm", "fixture"])?;
+        let observatory = Observatory::open(directory.path())?;
+        Ok((directory, observatory))
+    }
+
+    #[test]
+    fn freshness_compares_the_live_worktree_with_the_published_inputs() -> Result<()> {
+        let (repository, observatory) = git_workspace()?;
+        let unbuilt = observatory.freshness("published_snapshot")?;
+        assert_eq!(unbuilt["reason"], "never_published");
+        assert_eq!(unbuilt["never_published"], true);
+        assert_eq!(unbuilt["stale"], true);
+        assert_eq!(
+            unbuilt["backend"], "no_published_snapshot",
+            "nothing published must not be labelled a published snapshot"
+        );
+
+        Service::open(repository.path())?.refresh(None)?;
+        let fresh = observatory.freshness("published_snapshot")?;
+        assert_eq!(fresh["reason"], "ok", "{fresh}");
+        assert_eq!(fresh["stale"], false);
+        assert_eq!(fresh["backend"], "published_snapshot");
+        assert!(fresh.get("error").is_none());
+        // The untracked, unignored state directory and a build directory are
+        // not inputs, so they never make the index stale.
+        assert!(repository.path().join(STATE_DIRECTORY).exists());
+        fs::create_dir_all(repository.path().join("target/debug"))?;
+        fs::write(repository.path().join("target/debug/out.json"), "{}")?;
+        fs::write(repository.path().join("notes.png"), "binary")?;
+        assert_eq!(observatory.freshness("published_snapshot")?["reason"], "ok");
+
+        fs::write(
+            repository.path().join("src/lib.rs"),
+            "pub fn edited() {}
+",
+        )?;
+        let edited = observatory.freshness("published_snapshot")?;
+        assert_eq!(edited["reason"], "worktree_changed");
+        assert_eq!(edited["changed_inputs"]["sample"][0], "src/lib.rs");
+        // Cargo materialises an untracked Cargo.lock during the first refresh.
+        let dirty = fresh["live"]["dirty_inputs"].as_u64().unwrap_or_default();
+        assert_eq!(edited["live"]["dirty_inputs"], dirty + 1);
+
+        // Refreshing the dirty tree makes it fresh while it stays dirty.
+        Service::open(repository.path())?.refresh(None)?;
+        let refreshed = observatory.freshness("published_snapshot")?;
+        assert_eq!(refreshed["reason"], "ok", "{refreshed}");
+        assert_eq!(refreshed["live"]["dirty_inputs"], dirty + 1);
+
+        // Reverting an indexed edit is a change even though the tree is clean.
+        git(repository.path(), &["checkout", "--", "src/lib.rs"])?;
+        let reverted = observatory.freshness("published_snapshot")?;
+        assert_eq!(reverted["reason"], "worktree_changed", "{reverted}");
+        Service::open(repository.path())?.refresh(None)?;
+
+        fs::write(
+            repository.path().join("src/lib.rs"),
+            "pub fn committed() {}
+",
+        )?;
+        git(repository.path(), &["commit", "-qam", "move head"])?;
+        let moved = observatory.freshness("published_snapshot")?;
+        assert_eq!(moved["reason"], "head_moved");
+        let live = observatory.freshness("live_worktree")?;
+        assert_eq!(live["backend"], "live_worktree");
+        assert_eq!(live["confidence"], 1.0);
+        Ok(())
+    }
+
+    #[test]
+    fn freshness_reports_a_running_refresh_and_read_errors() -> Result<()> {
+        let (repository, observatory) = git_workspace()?;
+        Service::open(repository.path())?.refresh(None)?;
+        fs::write(
+            repository.path().join("src/lib.rs"),
+            "pub fn edited() {}
+",
+        )?;
+        let task = observatory.create_task("index.refresh", "fixture")?;
+        let running = observatory.freshness("published_snapshot")?;
+        assert_eq!(running["reason"], "refresh_running");
+        assert_eq!(running["cause"], "worktree_changed");
+        assert_eq!(running["refresh"]["running"], task.as_str());
+        observatory.finish_task(&task, json!({}))?;
+        let settled = observatory.freshness("published_snapshot")?;
+        assert_eq!(settled["reason"], "worktree_changed");
+        assert!(settled["refresh"]["last_completed_at"].is_string());
+
+        fs::write(
+            repository
+                .path()
+                .join(STATE_DIRECTORY)
+                .join("index.sqlite3"),
+            "not a database",
+        )?;
+        let broken = observatory.freshness("published_snapshot")?;
+        assert_eq!(broken["reason"], "error");
+        assert_eq!(broken["stale"], true);
+        assert!(broken["error"].is_string(), "{broken}");
+        Ok(())
+    }
+
+    #[test]
+    fn index_status_reports_one_index_block_and_a_compact_refresh() -> Result<()> {
+        let (_repository, observatory) = git_workspace()?;
+        let refresh =
+            observatory.run_refresh(&observatory.create_task("index.refresh", "fixture")?, None)?;
+        assert_eq!(refresh["refresh"]["mode"], "full");
+        assert_eq!(refresh["refresh"]["published"], true);
+        assert!(refresh["refresh"]["counts"]["nodes"].as_i64().unwrap_or(0) > 0);
+        assert!(refresh["refresh"].get("snapshot").is_none());
+        let status = observatory.index_status()?;
+        let serialized = status.to_string();
+        assert_eq!(serialized.matches("\"semantic_engine\"").count(), 1);
+        assert_eq!(serialized.matches("\"embedding_card_version\"").count(), 1);
+        assert!(status["index"]["snapshot"].get("index").is_none());
+        assert_eq!(status["root"]["resolution"], "cargo_package");
+        assert_eq!(status["policy"]["implicit_refresh"], false);
+        assert_eq!(status["auto_refresh"]["enabled"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn a_subdirectory_resolves_to_its_cargo_workspace_within_git() -> Result<()> {
+        let directory = tempdir()?;
+        let root = directory.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/member\"]\n",
+        )?;
+        fs::create_dir_all(root.join("crates/member/src"))?;
+        fs::write(
+            root.join("crates/member/Cargo.toml"),
+            "[package]\nname='member'\nversion='0.1.0'\nedition='2024'\n",
+        )?;
+        fs::write(
+            root.join("crates/member/src/lib.rs"),
+            "pub fn member() {}\n",
+        )?;
+        fs::create_dir_all(root.join("docs"))?;
+        // Outside Git nothing climbs.
+        let (unversioned, detail) = resolve_workspace_root(&root.join("crates/member/src"))?;
+        assert_eq!(
+            unversioned,
+            fs::canonicalize(root.join("crates/member/src"))?
+        );
+        assert_eq!(detail["resolution"], "as_given");
+
+        git(root, &["init", "-q"])?;
+        let canonical = fs::canonicalize(root)?;
+        for start in ["crates/member/src", "crates/member", "docs", "."] {
+            let (resolved, detail) = resolve_workspace_root(&root.join(start))?;
+            assert_eq!(resolved, canonical, "{start}");
+            assert_eq!(detail["resolution"], "cargo_workspace");
+        }
+        let observatory = Observatory::open(root.join("crates/member/src"))?;
+        assert_eq!(observatory.root(), canonical.as_path());
+        assert!(
+            !root
+                .join("crates/member/src")
+                .join(STATE_DIRECTORY)
+                .exists()
+        );
+
+        // A nested repository (or linked worktree) never resolves above its
+        // own top level, even inside an outer workspace.
+        let nested = root.join("vendor/nested");
+        fs::create_dir_all(nested.join("src"))?;
+        fs::write(
+            nested.join("Cargo.toml"),
+            "[package]\nname='nested'\nversion='0.1.0'\nedition='2024'\n",
+        )?;
+        git(&nested, &["init", "-q"])?;
+        let (resolved, detail) = resolve_workspace_root(&nested.join("src"))?;
+        assert_eq!(resolved, fs::canonicalize(&nested)?);
+        assert_eq!(detail["resolution"], "cargo_package");
+        Ok(())
+    }
+
+    #[test]
+    fn the_background_refresher_publishes_after_startup_and_after_edits() -> Result<()> {
+        let (repository, observatory) = git_workspace()?;
+        let timing = crate::auto_refresh::Timing {
+            startup_delay: std::time::Duration::from_millis(10),
+            quiet: std::time::Duration::from_millis(150),
+            max_delay: std::time::Duration::from_secs(2),
+            head_poll: std::time::Duration::from_millis(100),
+            unwatched_poll: std::time::Duration::from_secs(60),
+            retry: std::time::Duration::from_millis(100),
+        };
+        let refresher = crate::auto_refresh::AutoRefresh::start(
+            observatory.clone(),
+            observatory.auto_refresh.clone(),
+            timing,
+            true,
+        )?;
+        let wait_for = |predicate: &dyn Fn(&Value) -> bool| -> Result<Value> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let freshness = observatory.freshness("published_snapshot")?;
+                // A generation is visible before its task is marked complete.
+                if predicate(&freshness) && freshness["refresh"]["running"].is_null() {
+                    return Ok(freshness);
+                }
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "background refresh did not settle: {freshness}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+        let first = wait_for(&|value| value["reason"] == "ok")?;
+        assert_eq!(first["refresh"]["automatic"], true);
+        let generation = first["indexed"]["generation"].as_i64().unwrap_or_default();
+        assert_eq!(
+            observatory.index_status()?["policy"]["implicit_refresh"],
+            true
+        );
+
+        // A worktree edit is picked up through the filesystem watcher.
+        fs::write(
+            repository.path().join("src/lib.rs"),
+            "pub fn watched_edit() {}\n",
+        )?;
+        let edited = wait_for(&|value| {
+            value["reason"] == "ok"
+                && value["indexed"]["generation"].as_i64().unwrap_or_default() > generation
+        })?;
+        let generation = edited["indexed"]["generation"].as_i64().unwrap_or_default();
+        // A commit moves HEAD, which the refresher also republishes.
+        git(repository.path(), &["commit", "-qam", "commit the edit"])?;
+        wait_for(&|value| {
+            value["reason"] == "ok"
+                && value["indexed"]["generation"].as_i64().unwrap_or_default() > generation
+        })?;
+        let status = observatory.auto_refresh.status();
+        assert_eq!(status["watcher"], "active", "{status}");
+        // Later triggers may find the index fresh, so check the durable task
+        // rather than the last outcome.
+        let task = latest_task(&observatory.db()?, "index.refresh")?.unwrap_or_default();
+        assert_eq!(task["status"], "completed", "{task}");
+        assert_eq!(task["result"]["refresh"]["mode"], "incremental", "{task}");
+        refresher.shutdown();
+        assert!(!observatory.auto_refresh.enabled());
+        assert_eq!(
+            observatory.index_status()?["policy"]["implicit_refresh"],
+            false
+        );
         Ok(())
     }
 }

@@ -19,37 +19,60 @@ use rust_repo_intelligence::github::{
     GithubPublishRequest, GithubReadyRequest, GithubRepositoryRequest, GithubReviewRequest,
 };
 use rust_repo_intelligence::guidance::GuidanceRequest;
-use rust_repo_intelligence::live_semantics::SemanticRequest;
+use rust_repo_intelligence::live_semantics::{DiagnosticsRequest, SemanticRequest};
 use rust_repo_intelligence::observatory::{
     ArchitectureFindingRequest, ArchitectureRequest, CheckpointCreateRequest,
     CheckpointDiffRequest, CheckpointRestoreRequest, ConsultRequest, ContextRequest,
-    DecisionListRequest, FindingEvidenceRequest, MemorySearchRequest, Observatory, PrepareRequest,
-    ProblemUpdateRequest, PromoteFindingRequest, QualityMergeRequest, QualityReviewRequest,
-    ResearchListRequest, ResearchStartRequest, ResearchSubmitRequest, ReviewFindingRequest,
-    ScopeRequest, SearchRequest, SymbolRelationRequest, TargetRequest, TaskListRequest,
-    ValidateRequest, WorkCreateRequest, WorkUpdateRequest,
+    DecisionListRequest, FindingEvidenceRequest, MAX_TASK_WAIT, MemorySearchRequest, Observatory,
+    PrepareRequest, ProblemUpdateRequest, PromoteFindingRequest, QualityMergeRequest,
+    QualityReviewRequest, ResearchListRequest, ResearchStartRequest, ResearchSubmitRequest,
+    ReviewFindingRequest, ScopeRequest, SearchRequest, SteeringListRequest, SymbolRelationRequest,
+    TargetRequest, TaskListRequest, TaskWait, ValidateRequest, WorkCreateRequest,
+    WorkUpdateRequest,
 };
 use rust_repo_intelligence::performance::{PerformanceContractRequest, PerformanceMeasureRequest};
 use rust_repo_intelligence::verification::VerificationPlanRequest;
 use rust_repo_intelligence::{
-    RecordDecision, RecordSteering, RetireDecision, ValidationOutcomeInput,
+    RecordDecision, RecordSteering, RetireDecision, RetireSteering, ValidationOutcomeInput,
 };
-use schemars::JsonSchema;
-use serde::Deserialize;
+use schemars::{JsonSchema, Schema, SchemaGenerator};
+use serde::{Deserialize, Deserializer, de::DeserializeOwned, de::Error as _};
 use serde_json::{Value, json};
-use std::{env, path::PathBuf};
+use std::{borrow::Cow, env, path::PathBuf, time::Duration};
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let observatory = Observatory::open(workspace_arg()?)?;
-    let running = CrustyServer::new(observatory)
-        .serve(rmcp::transport::stdio())
-        .await?;
-    match running.waiting().await {
-        Ok(_) => Ok(()),
-        Err(error) if error.to_string().contains("connection closed") => Ok(()),
-        Err(error) => Err(error.into()),
+    let resolution = observatory.root_resolution();
+    eprintln!(
+        "crusty: workspace root {} ({})",
+        observatory.root().display(),
+        resolution["resolution"].as_str().unwrap_or("as_given")
+    );
+    // The refresher's first check runs on its own thread after a short delay,
+    // so MCP initialisation never waits for indexing.
+    let auto_refresh = observatory.start_auto_refresh();
+    // rust-analyzer stays off until semantic.enable unless autostart is set;
+    // an enabled analyzer loads the workspace on its own thread after a short
+    // delay, never during MCP initialisation.
+    observatory.autostart_semantics();
+    let outcome = async {
+        let running = CrustyServer::new(observatory.clone())
+            .serve(rmcp::transport::stdio())
+            .await?;
+        match running.waiting().await {
+            Ok(_) => Ok(()),
+            Err(error) if error.to_string().contains("connection closed") => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
+    .await;
+    if let Some(auto_refresh) = auto_refresh {
+        auto_refresh.shutdown();
+    }
+    observatory.shutdown_semantics();
+    outcome
 }
 
 fn workspace_arg() -> Result<PathBuf> {
@@ -82,6 +105,7 @@ struct ContextIdRequest {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct IndexRefreshRequest {
+    /// `incremental` (default), `workspace` (alias `full`), or `git`.
     scope: Option<String>,
 }
 
@@ -109,6 +133,55 @@ struct WorkListRequest {
     limit: Option<usize>,
     /// Rows to skip. Use the `page.next_offset` from a previous call.
     offset: Option<usize>,
+}
+
+/// A task-starting (or `task.get`) request plus an optional bounded wait.
+///
+/// `wait_seconds` is peeled off before the inner request is deserialized, so
+/// the inner type keeps rejecting unknown fields; `#[serde(flatten)]` would
+/// silently accept them and drop `additionalProperties: false`.
+#[derive(Debug, Clone)]
+struct Waitable<T> {
+    request: T,
+    wait_seconds: u64,
+}
+
+impl<'de, T: DeserializeOwned> Deserialize<'de> for Waitable<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut object = serde_json::Map::<String, Value>::deserialize(deserializer)?;
+        let wait_seconds = match object.remove("wait_seconds") {
+            None | Some(Value::Null) => 0,
+            Some(value) => u64::deserialize(value).map_err(D::Error::custom)?,
+        };
+        let request = T::deserialize(Value::Object(object)).map_err(D::Error::custom)?;
+        Ok(Self {
+            request,
+            wait_seconds,
+        })
+    }
+}
+
+impl<T: JsonSchema> JsonSchema for Waitable<T> {
+    fn schema_name() -> Cow<'static, str> {
+        T::schema_name()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let mut schema = T::json_schema(generator);
+        if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+            properties.insert(
+                "wait_seconds".into(),
+                json!({
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "maximum": MAX_TASK_WAIT.as_secs(),
+                    "default": 0,
+                    "description": "Hold the call open up to this many seconds (capped at 120). If the task settles in time the completed task is returned inline in task.get shape; otherwise the task id is returned as without a wait. Cancelling the request stops the wait."
+                }),
+            );
+        }
+        schema
+    }
 }
 
 #[derive(Clone)]
@@ -144,6 +217,45 @@ impl CrustyServer {
             .map_err(|error| format!("tool task failed: {error}"))?;
         Self::value(result)
     }
+
+    /// Returns a just-started task, waiting up to `wait_seconds` for it to
+    /// settle. A settled task comes back in `task.get` shape; otherwise the
+    /// start response is returned with the task's latest status. When the
+    /// client cancels the request while waiting, nobody holds the task id any
+    /// more, so the started task is cancelled cooperatively too.
+    async fn started(
+        &self,
+        started: anyhow::Result<Value>,
+        wait_seconds: u64,
+        cancellation: CancellationToken,
+    ) -> Result<Json<Value>, String> {
+        let started = started.map_err(|error| format!("{error:#}"))?;
+        let Some(id) = started["task_id"].as_str().filter(|_| wait_seconds > 0) else {
+            return Ok(Json(started));
+        };
+        let wait = self
+            .observatory
+            .wait_for_task(id, Duration::from_secs(wait_seconds), &cancellation)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        match wait {
+            TaskWait::Settled(task) => Ok(Json(task)),
+            TaskWait::Pending(task) => {
+                let mut pending = started;
+                pending["status"] = task["task"]["status"].clone();
+                pending["progress"] = task["task"]["progress"].clone();
+                pending["message"] = task["task"]["message"].clone();
+                pending["waited_seconds"] = json!(wait_seconds.min(MAX_TASK_WAIT.as_secs()));
+                Ok(Json(pending))
+            }
+            TaskWait::Abandoned => {
+                let _ = self.observatory.task_cancel(id);
+                Err(format!(
+                    "request cancelled while waiting; cancellation of task {id} was requested"
+                ))
+            }
+        }
+    }
 }
 
 #[tool_router(router = tool_router)]
@@ -154,9 +266,18 @@ impl CrustyServer {
     )]
     async fn cleanup_plan(
         &self,
-        Parameters(request): Parameters<CleanupPlanRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<CleanupPlanRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.cleanup_plan(request))
+        self.started(
+            self.observatory.cleanup_plan(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
     #[tool(
         name = "cleanup.get",
@@ -186,9 +307,18 @@ impl CrustyServer {
     )]
     async fn performance_measure(
         &self,
-        Parameters(request): Parameters<PerformanceMeasureRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<PerformanceMeasureRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.performance_measure(request))
+        self.started(
+            self.observatory.performance_measure(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
     #[tool(
         name = "performance.get",
@@ -260,11 +390,38 @@ impl CrustyServer {
     }
     #[tool(
         name = "semantic.status",
-        description = "Inspect current rust-analyzer companion health, enabled/running state, capabilities and profile without starting it or refreshing the index."
+        description = "Inspect the rust-analyzer companion without starting it: enabled state (with how to enable it), binary found, readiness (starting/warming/ready), restarts and last error, profile, capabilities, and diagnostic capture."
     )]
     async fn semantic_status(&self) -> Result<Json<Value>, String> {
         let observatory = self.observatory.clone();
         Self::offload(move || observatory.semantic_status()).await
+    }
+    #[tool(
+        name = "semantic.enable",
+        description = "Turn the rust-analyzer companion on for this server process; it is off by default. It loads the workspace in the background (unless RUST_REPO_INTELLIGENCE_RUST_ANALYZER_WARM_START=0) and then serves semantic.query, semantic.diagnostics, compiler-backed relations and validation diagnostics. Costs one analyzer process, often several GB for large workspaces. Returns semantic.status; poll it until state is ready. Idempotent."
+    )]
+    async fn semantic_enable(&self) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.enable_semantics()).await
+    }
+    #[tool(
+        name = "semantic.disable",
+        description = "Turn the rust-analyzer companion off for this server process and stop its process, releasing its memory. Exact search, the index and validation keep working without it. Idempotent."
+    )]
+    async fn semantic_disable(&self) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.disable_semantics()).await
+    }
+    #[tool(
+        name = "semantic.diagnostics",
+        description = "Read live rust-analyzer diagnostics captured by Crusty, optionally for named files (opened so the analyzer publishes theirs) and a minimum severity. Each file is labelled fresh/stale/pending against its content on disk; output is bounded. Advisory: cargo/rustc checks remain authoritative. Requires the opt-in companion."
+    )]
+    async fn semantic_diagnostics(
+        &self,
+        Parameters(request): Parameters<DiagnosticsRequest>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.semantic_diagnostics(request)).await
     }
     #[tool(
         name = "semantic.query",
@@ -272,9 +429,18 @@ impl CrustyServer {
     )]
     async fn semantic_query(
         &self,
-        Parameters(request): Parameters<SemanticRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<SemanticRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.semantic_query(request))
+        self.started(
+            self.observatory.semantic_query(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
     #[tool(
         name = "github.status",
@@ -282,9 +448,18 @@ impl CrustyServer {
     )]
     async fn github_status(
         &self,
-        Parameters(request): Parameters<GithubRepositoryRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<GithubRepositoryRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.github_status(request))
+        self.started(
+            self.observatory.github_status(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
     #[tool(
         name = "github.pr.list",
@@ -292,9 +467,18 @@ impl CrustyServer {
     )]
     async fn github_list(
         &self,
-        Parameters(request): Parameters<GithubListRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<GithubListRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.github_list(request))
+        self.started(
+            self.observatory.github_list(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
     #[tool(
         name = "github.pr.get",
@@ -302,9 +486,18 @@ impl CrustyServer {
     )]
     async fn github_get(
         &self,
-        Parameters(request): Parameters<GithubPrRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<GithubPrRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.github_get(request))
+        self.started(
+            self.observatory.github_get(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
     #[tool(
         name = "delivery.policy.grant",
@@ -325,9 +518,18 @@ impl CrustyServer {
     )]
     async fn github_review_packet(
         &self,
-        Parameters(request): Parameters<GithubPrRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<GithubPrRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.github_review_packet(request))
+        self.started(
+            self.observatory.github_review_packet(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
     #[tool(
         name = "github.review.submit",
@@ -335,9 +537,18 @@ impl CrustyServer {
     )]
     async fn github_review(
         &self,
-        Parameters(request): Parameters<GithubReviewRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<GithubReviewRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.github_review(request))
+        self.started(
+            self.observatory.github_review(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
     #[tool(
         name = "github.pr.merge",
@@ -345,9 +556,18 @@ impl CrustyServer {
     )]
     async fn github_merge(
         &self,
-        Parameters(request): Parameters<GithubMergeRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<GithubMergeRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.github_merge(request))
+        self.started(
+            self.observatory.github_merge(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
     #[tool(
         name = "github.pr.publish",
@@ -355,9 +575,18 @@ impl CrustyServer {
     )]
     async fn github_publish(
         &self,
-        Parameters(request): Parameters<GithubPublishRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<GithubPublishRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.github_publish(request))
+        self.started(
+            self.observatory.github_publish(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
     #[tool(
         name = "github.pr.ready",
@@ -365,9 +594,18 @@ impl CrustyServer {
     )]
     async fn github_ready(
         &self,
-        Parameters(request): Parameters<GithubReadyRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<GithubReadyRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.github_ready(request))
+        self.started(
+            self.observatory.github_ready(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
     #[tool(
         name = "github.action.get",
@@ -386,9 +624,18 @@ impl CrustyServer {
     )]
     async fn github_reconcile(
         &self,
-        Parameters(request): Parameters<IdRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<IdRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.github_reconcile(request.id))
+        self.started(
+            self.observatory.github_reconcile(request.id),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
     #[tool(
         name = "delivery.policy.get",
@@ -440,9 +687,18 @@ impl CrustyServer {
     )]
     async fn verification_plan(
         &self,
-        Parameters(request): Parameters<VerificationPlanRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<VerificationPlanRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.verification_plan(request))
+        self.started(
+            self.observatory.verification_plan(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
     #[tool(
         name = "verification.run",
@@ -450,9 +706,18 @@ impl CrustyServer {
     )]
     async fn verification_run(
         &self,
-        Parameters(request): Parameters<IdRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<IdRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.verification_run(request.id))
+        self.started(
+            self.observatory.verification_run(request.id),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
     #[tool(
         name = "verification.get",
@@ -482,9 +747,18 @@ impl CrustyServer {
     )]
     async fn integration_start(
         &self,
-        Parameters(request): Parameters<IntegrationStartRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<IntegrationStartRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.integration_start(request))
+        self.started(
+            self.observatory.integration_start(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
     #[tool(
         name = "integration.resolve",
@@ -492,9 +766,18 @@ impl CrustyServer {
     )]
     async fn integration_resolve(
         &self,
-        Parameters(request): Parameters<IntegrationResolveRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<IntegrationResolveRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.integration_resolve(request))
+        self.started(
+            self.observatory.integration_resolve(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
     #[tool(
         name = "integration.complete",
@@ -502,19 +785,37 @@ impl CrustyServer {
     )]
     async fn integration_complete(
         &self,
-        Parameters(request): Parameters<IntegrationCompleteRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<IntegrationCompleteRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.integration_complete(request))
+        self.started(
+            self.observatory.integration_complete(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
     #[tool(
         name = "commit.execute",
-        description = "Execute an immutable owned commit plan using a private index and compare-and-swap HEAD. Preserves unrelated staged work and worktree files; honors commit signing, but does not run Git hooks. Run project verification first. Returns a durable task; retry the same plan to reconcile interrupted execution."
+        description = "Execute an immutable owned commit plan using a private index and compare-and-swap HEAD. Preserves unrelated staged work and worktree files; honors commit signing, but does not run Git hooks. Run project verification first. Omit session credentials for a plan made without a session; it is refused once another session is active. Returns a durable task (inline with wait_seconds); retry the same plan to reconcile interrupted execution."
     )]
     async fn commit_execute(
         &self,
-        Parameters(request): Parameters<CommitExecuteRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<CommitExecuteRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.commit_execute(request))
+        self.started(
+            self.observatory.commit_execute(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
 
     #[tool(
@@ -574,20 +875,38 @@ impl CrustyServer {
     )]
     async fn integration_preview(
         &self,
-        Parameters(request): Parameters<IntegrationPreviewRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<IntegrationPreviewRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.integration_preview(request))
+        self.started(
+            self.observatory.integration_preview(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
 
     #[tool(
         name = "session.start",
-        description = "Register a leased coding session shared across Git worktrees; optionally create an isolated branch/worktree without copying dirty files. Returns a durable task; poll task.get for its session and private lease token."
+        description = "Register a leased coding session shared across Git worktrees, for work alongside other agents; a single agent needs no session. Optionally create an isolated branch/worktree without copying dirty files. Returns a durable task whose result holds the session and private lease token (inline with wait_seconds)."
     )]
     async fn session_start(
         &self,
-        Parameters(request): Parameters<SessionStartRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<SessionStartRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.session_start(request))
+        self.started(
+            self.observatory.session_start(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
 
     #[tool(
@@ -652,18 +971,27 @@ impl CrustyServer {
 
     #[tool(
         name = "commit.plan",
-        description = "Prepare cohesive whole-file commit groups from live changes owned by the coding session. Records HEAD and content fingerprints, reports unassigned paths, and never stages another session's files. Returns a durable task."
+        description = "Prepare cohesive whole-file commit groups from live changes owned by the coding session. Records HEAD and content fingerprints, reports unassigned paths, and never stages another session's files. For single-agent work omit session_id and lease_token: while no other session is active, an implicit session owns exactly the planned paths until commit.execute. Returns a durable task (inline with wait_seconds)."
     )]
     async fn commit_plan(
         &self,
-        Parameters(request): Parameters<CommitPlanRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<CommitPlanRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.commit_plan(request))
+        self.started(
+            self.observatory.commit_plan(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
 
     #[tool(
         name = "repo.consult",
-        description = "Mandatory first-call preflight for every repository-scoped user request. Returns global and topical decisions, steering, design and quality constraints, restrictions, governing documentation, workflows, lifecycle risks, runtime contracts, and known work before planning, answering, or acting."
+        description = "Mandatory preflight before planning, answering, or acting on any repository-scoped user request; for an edit task change.prepare returns the same guidance and may be the first call instead. Returns global and topical decisions, steering, design and quality constraints, restrictions, governing documentation, workflows, lifecycle risks, runtime contracts, and open known work before planning, answering, or acting. Items that do not fit the budget are compacted before being omitted; context_budget.fetch_more names how to read the rest."
     )]
     async fn repo_consult(
         &self,
@@ -675,7 +1003,7 @@ impl CrustyServer {
 
     #[tool(
         name = "repo.search",
-        description = "Search Rust source. exact reads the live worktree without refreshing; broad reads the published snapshot and labels freshness."
+        description = "Search Rust source. exact reads the live worktree; broad reads the last published generation without waiting for a refresh and labels freshness."
     )]
     async fn repo_search(
         &self,
@@ -686,7 +1014,7 @@ impl CrustyServer {
 
     #[tool(
         name = "repo.context",
-        description = "Build a bounded evidence context from the last published snapshot without implicit refresh."
+        description = "Build a bounded evidence context from the last published generation; never waits for a refresh. The freshness envelope reports whether it is stale and why."
     )]
     async fn repo_context(
         &self,
@@ -717,13 +1045,22 @@ impl CrustyServer {
 
     #[tool(
         name = "audit.start",
-        description = "Start a durable contextual Rust architecture audit against the live worktree; returns immediately with a task id and persists the completed report."
+        description = "Start a durable contextual Rust architecture audit against the live worktree; returns a task id (or the completed task with wait_seconds) and persists the completed report."
     )]
     async fn audit_start(
         &self,
-        Parameters(request): Parameters<ArchitectureRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<ArchitectureRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.start_architecture_audit(request))
+        self.started(
+            self.observatory.start_architecture_audit(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
 
     #[tool(
@@ -883,7 +1220,7 @@ impl CrustyServer {
 
     #[tool(
         name = "steering.record",
-        description = "Record a durable human steering instruction that should shape later changes."
+        description = "Record a durable human steering instruction that should shape later changes. It may supersede active steerings by ID, which retires them atomically and requires recorded_by; supersede only on a human's explicit instruction. The response warns when the instruction names repository paths that do not exist."
     )]
     async fn steering_record(
         &self,
@@ -895,15 +1232,33 @@ impl CrustyServer {
 
     #[tool(
         name = "steering.list",
-        description = "List durable human steering instructions, optionally filtered by symbol, path, or concept."
+        description = "List durable human steering instructions, by default only active and unexpired ones; status `retired` or `all` returns history. With a scope, steerings scoped to an ancestor or descendant of a named path rank first, then symbol/concept matches, then global steerings. Each steering reports supersession, history, and stale_references to missing paths."
     )]
     async fn steering_list(
         &self,
-        Parameters(request): Parameters<ScopeRequest>,
+        Parameters(request): Parameters<SteeringListRequest>,
     ) -> Result<Json<Value>, String> {
         let observatory = self.observatory.clone();
-        Self::offload(move || observatory.steering_list(request.scope.as_deref(), request.limit))
-            .await
+        Self::offload(move || {
+            observatory.steering_list(
+                request.scope.as_deref(),
+                request.status.as_deref(),
+                request.limit,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        name = "steering.retire",
+        description = "Retire an active human steering without replacing it. Requires the retiring human's identity and a reason; the record stays in the ledger as history. Retire only on a human's explicit instruction."
+    )]
+    async fn steering_retire(
+        &self,
+        Parameters(request): Parameters<RetireSteering>,
+    ) -> Result<Json<Value>, String> {
+        let observatory = self.observatory.clone();
+        Self::offload(move || observatory.steering_retire(request)).await
     }
 
     #[tool(
@@ -1005,13 +1360,22 @@ impl CrustyServer {
 
     #[tool(
         name = "change.prepare",
-        description = "Start snapshot-labelled change preparation without implicit refresh; returns immediately with a task id."
+        description = "Prepare one coherent change before its first edit, against the last published generation without waiting for a refresh. Returns the consultation guidance for the change (decisions, steering, live instructions, engineering route) plus change evidence and an architecture baseline. Reuse its context_id for every validation of the change, however long. Returns a task id, or the completed task with wait_seconds."
     )]
     async fn change_prepare(
         &self,
-        Parameters(request): Parameters<PrepareRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<PrepareRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.start_prepare_change(request))
+        self.started(
+            self.observatory.start_prepare_change(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
 
     #[tool(
@@ -1027,18 +1391,27 @@ impl CrustyServer {
 
     #[tool(
         name = "change.validate",
-        description = "Start diff validation against prepared evidence using one of git_diff, local diff_path, or base_ref with target HEAD/worktree (default worktree). With no source, validate pending tracked edits against HEAD. Returns a task id and never waits for index refresh."
+        description = "Validate a change at milestones and at the end. With no diff source it reads pending tracked edits plus untracked, non-ignored files against HEAD, so no diff argument is needed; git_diff, local diff_path, or base_ref with target HEAD/worktree (tracked files only) select another diff. One prepared context_id serves any number of validations; without one, architecture_delta and unmodified_expected_callers are unavailable. Never waits for an index refresh. Returns a task id, or the completed task with wait_seconds."
     )]
     async fn change_validate(
         &self,
-        Parameters(request): Parameters<ValidateRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<ValidateRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.start_validate_change(request))
+        self.started(
+            self.observatory.start_validate_change(request),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
 
     #[tool(
         name = "index.status",
-        description = "Show live versus indexed freshness, the published generation, and current refresh task."
+        description = "Show the resolved workspace root, live versus indexed freshness (reason, never_published), one index and backend block, the latest refresh task, and the background refresher."
     )]
     async fn index_status(&self) -> Result<Json<Value>, String> {
         Self::value(self.observatory.index_status())
@@ -1046,13 +1419,22 @@ impl CrustyServer {
 
     #[tool(
         name = "index.refresh",
-        description = "Start an explicit background index refresh under the single-writer publisher lease; returns immediately with a task id."
+        description = "Start an explicit background index refresh under the single-writer publisher lease; returns a task id, or the completed task with wait_seconds. scope defaults to incremental (changed files and the symbols they affect; a never-indexed or other-indexer-version store is rebuilt in full); workspace or full forces a complete rebuild; git refreshes commit history only and publishes no generation, so freshness stays stale. Unless CRUSTY_AUTO_REFRESH=0, the server also runs the incremental refresh in the background after file changes and commits."
     )]
     async fn index_refresh(
         &self,
-        Parameters(request): Parameters<IndexRefreshRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<IndexRefreshRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.start_index_refresh(request.scope))
+        self.started(
+            self.observatory.start_index_refresh(request.scope),
+            wait_seconds,
+            cancellation,
+        )
+        .await
     }
 
     #[tool(
@@ -1072,13 +1454,34 @@ impl CrustyServer {
 
     #[tool(
         name = "task.get",
-        description = "Poll a durable change, refresh, architecture-audit, or research task for progress, result, or failure."
+        description = "Read a durable change, refresh, audit, session, commit, verification, or research task's progress, result, or failure. wait_seconds holds the call until the task settles (at most 120 s) instead of polling; cancelling the request stops only the wait."
     )]
     async fn task_get(
         &self,
-        Parameters(request): Parameters<IdRequest>,
+        Parameters(Waitable {
+            request,
+            wait_seconds,
+        }): Parameters<Waitable<IdRequest>>,
+        cancellation: CancellationToken,
     ) -> Result<Json<Value>, String> {
-        Self::value(self.observatory.task_get(&request.id))
+        if wait_seconds == 0 {
+            return Self::value(self.observatory.task_get(&request.id));
+        }
+        // The caller already holds the task id, so a cancelled wait leaves the
+        // task itself running.
+        match self
+            .observatory
+            .wait_for_task(
+                &request.id,
+                Duration::from_secs(wait_seconds),
+                &cancellation,
+            )
+            .await
+            .map_err(|error| format!("{error:#}"))?
+        {
+            TaskWait::Settled(task) | TaskWait::Pending(task) => Ok(Json(task)),
+            TaskWait::Abandoned => Err("request cancelled while waiting".into()),
+        }
     }
 
     #[tool(
@@ -1291,7 +1694,7 @@ impl CrustyServer {
 
     #[tool(
         name = "memory.search",
-        description = "Recover repository-scoped user prompts from Codex primary and side-session history and search preserved legacy decisions, steerings, problems, and quality constraints. Read-only results never become work without explicit human creation."
+        description = "Recover repository-scoped user prompts from Codex primary and side-session history and Claude Code transcripts, each labelled with its source, and search preserved legacy decisions, steerings, problems, and quality constraints. Read-only results never become work without explicit human creation."
     )]
     async fn memory_search(
         &self,
@@ -1425,7 +1828,7 @@ impl CrustyServer {
 #[tool_handler(
     name = "Crusty",
     version = "0.3.0",
-    instructions = "Crusty is a Rust repository observatory. For every repository-scoped user prompt, call repo.consult first with the user's complete intent before planning, answering, or acting; do not skip consultation for design, review, questions, documentation, configuration, or non-code work. Apply relevant human decisions, steering, design and quality constraints, restrictions, governing documents, and workflows returned by the consultation. Consultation is read-only and does not replace change preparation: use change.prepare before edits and change.validate afterwards, polling both with task.get; task.list and change.get recover interrupted workflows. Use repo.architecture for a bounded live architecture map and audit.start for a durable contextual audit. Change preparation captures an architecture baseline; validation reports advisory new, worsened, and resolved findings without blocking on inferred debt. Use repo.search exact for live call-site work and symbol.relations for callers, references, implementations, and definitions; neither refreshes. When a broad read is empty, check index.status: never_published distinguishes an unbuilt index from no matches. Change preparation, validation, refresh, audit, and research are explicit durable tasks. Research uses local repository evidence plus primary-first web_search by the attached agent. GitHub delivery uses the installed gh CLI only under explicit bounded human delivery policy; never infer remote mutation consent from research or implementation requests. Findings are proposals and only a human may review or promote them into work. Quality proposal never activates a constraint: activation, merging, finding promotion, and work writes require explicit human confirmation. For parallel coding, register owner/intent with session.start, prefer an isolated worktree, claim paths before edits, heartbeat before expiry, and close after handoff. Claim conflicts require narrowing scope or owner handoff. Use commit.plan and commit.execute for cohesive owned whole-file changes; execution preserves unrelated staging and uses exact trees without running hooks. Consult project.contract, obtain engineering guidance, and run revision-bound verification before publishing chunks or completed integrations. Reviews pin head/base evidence; queued merge requests remain pending until actual merge is observed. Source, compiler/runtime behavior, and human ownership remain authoritative."
+    instructions = "Crusty is a Rust repository observatory. Consult before acting on every repository-scoped user prompt: call repo.consult first with the user's complete intent before planning, answering, or acting, including design, review, questions, documentation, configuration, and non-code work. For an edit task, change.prepare may be that first call instead, because it returns the same decisions, steering, live instructions, and engineering route together with change evidence. Apply the human decisions, steering, design and quality constraints, restrictions, governing documents, and workflows either returns. Keep the workflow proportionate: one change.prepare per coherent change, before its first edit, and change.validate at milestones and at the end, reusing the same context_id however long the change runs. Validation needs no diff argument: by default it reads pending tracked edits plus untracked, non-ignored files against HEAD. It also runs without a context_id, minus the architecture delta and expected change surface. Task-starting tools and task.get accept wait_seconds (at most 120): a task that settles in time returns inline, so poll task.get only for long work; task.list and change.get recover interrupted workflows. Use repo.architecture for a bounded live architecture map and audit.start for a durable contextual audit. Change preparation captures an architecture baseline; validation reports advisory new, worsened, and resolved findings without blocking on inferred debt. Use repo.search exact for live call-site work and symbol.relations for callers, references, implementations, and definitions; neither refreshes. The rust-analyzer companion is off until semantic.enable; call it when live semantics or compiler diagnostics would help and semantic.disable when done. Once enabled, semantic.query answers live position queries, semantic.diagnostics returns its captured diagnostics, and change.validate adds advisory diagnostics for changed Rust files. When a broad read is empty, check index.status: never_published distinguishes an unbuilt index from no matches. Index refreshes are durable tasks: the server runs them in the background after edits and commits unless CRUSTY_AUTO_REFRESH=0, and index.refresh starts one explicitly. Reads never wait for a refresh; they serve the last published generation with a freshness envelope whose reason says why it is stale. Research uses local repository evidence plus primary-first web_search by the attached agent. GitHub delivery uses the installed gh CLI only under explicit bounded human delivery policy; never infer remote mutation consent from research or implementation requests. Findings are proposals and only a human may review or promote them into work. Quality proposal never activates a constraint: activation, merging, finding promotion, and work writes require explicit human confirmation. Sessions and path claims are for parallel work only: when other agents work in the same repository, register owner/intent with session.start, prefer an isolated worktree, claim paths before edits, heartbeat before expiry, and close after handoff; claim conflicts require narrowing scope or owner handoff. Use commit.plan and commit.execute for cohesive whole-file commits; a single agent may omit session credentials while no other session is active. Execution preserves unrelated staging and uses exact trees without running hooks. Consult project.contract, obtain engineering guidance, and run revision-bound verification before publishing chunks or completed integrations. Reviews pin head/base evidence; queued merge requests remain pending until actual merge is observed. Source, compiler/runtime behavior, and human ownership remain authoritative."
 )]
 impl ServerHandler for CrustyServer {}
 
@@ -1541,6 +1944,9 @@ mod tests {
                 "research.packet",
                 "research.start",
                 "research.submit",
+                "semantic.diagnostics",
+                "semantic.disable",
+                "semantic.enable",
                 "semantic.query",
                 "semantic.status",
                 "session.claim",
@@ -1551,6 +1957,7 @@ mod tests {
                 "session.start",
                 "steering.list",
                 "steering.record",
+                "steering.retire",
                 "symbol.relations",
                 "task.cancel",
                 "task.get",
@@ -1631,18 +2038,52 @@ mod tests {
         assert!(required("repo.search").contains(&"query".to_owned()));
         assert!(required("repo.consult").contains(&"topic".to_owned()));
         assert!(required("symbol.relations").contains(&"symbol".to_owned()));
-        for name in [
-            "session.claim",
-            "session.close",
-            "session.heartbeat",
-            "commit.plan",
-        ] {
+        for name in ["session.claim", "session.close", "session.heartbeat"] {
             assert!(required(name).contains(&"session_id".to_owned()));
             assert!(required(name).contains(&"lease_token".to_owned()));
         }
+        // Single-agent commits may omit the session; the server refuses them
+        // while another session is active.
+        for name in ["commit.plan", "commit.execute"] {
+            assert!(!required(name).contains(&"session_id".to_owned()));
+            assert!(!required(name).contains(&"lease_token".to_owned()));
+        }
+        assert!(required("commit.execute").contains(&"plan_id".to_owned()));
         assert!(required("session.claim").contains(&"paths".to_owned()));
         assert!(required("commit.plan").contains(&"groups".to_owned()));
-        assert!(required("change.validate").contains(&"context_id".to_owned()));
+        // One prepared context serves many validations, and none is required.
+        assert!(!required("change.validate").contains(&"context_id".to_owned()));
+        assert!(required("change.prepare").contains(&"intent".to_owned()));
+        assert!(required("task.get").contains(&"id".to_owned()));
+        // Every task-starting tool and task.get can wait inline, and the wait
+        // wrapper keeps the inner request strict.
+        for name in [
+            "change.prepare",
+            "change.validate",
+            "session.start",
+            "index.refresh",
+            "audit.start",
+            "task.get",
+            "commit.plan",
+            "commit.execute",
+            "verification.run",
+        ] {
+            let schema = &tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap()
+                .input_schema;
+            assert_eq!(
+                schema["properties"]["wait_seconds"]["maximum"], 120,
+                "{name} needs wait_seconds"
+            );
+            assert!(!required(name).contains(&"wait_seconds".to_owned()));
+            assert_eq!(
+                schema.get("additionalProperties"),
+                Some(&Value::Bool(false)),
+                "{name} must still refuse unknown fields"
+            );
+        }
         let validation_schema = &tools
             .iter()
             .find(|tool| tool.name == "change.validate")
@@ -1676,6 +2117,78 @@ mod tests {
     }
 
     #[test]
+    fn waitable_requests_peel_wait_seconds_and_keep_the_inner_request_strict() {
+        let parsed: Waitable<IdRequest> =
+            serde_json::from_value(json!({"id":"task_1","wait_seconds":5})).unwrap();
+        assert_eq!(
+            (parsed.request.id.as_str(), parsed.wait_seconds),
+            ("task_1", 5)
+        );
+        let defaulted: Waitable<IdRequest> =
+            serde_json::from_value(json!({"id":"task_1","wait_seconds":null})).unwrap();
+        assert_eq!(defaulted.wait_seconds, 0);
+        assert!(
+            serde_json::from_value::<Waitable<IdRequest>>(json!({"id":"task_1","wait":5})).is_err()
+        );
+        assert!(
+            serde_json::from_value::<Waitable<IdRequest>>(json!({"id":"t","wait_seconds":-1}))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_returns_a_settled_task_inline_and_cancels_an_abandoned_one() -> Result<()> {
+        let directory = tempdir()?;
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname='fixture'\nversion='0.1.0'\nedition='2024'\n",
+        )?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn waited() {}\n")?;
+        let server = CrustyServer::new(Observatory::open(directory.path())?);
+        let started = server.observatory.start_index_refresh(None);
+        let settled = server
+            .started(started, 60, CancellationToken::new())
+            .await
+            .map_err(anyhow::Error::msg)?
+            .0;
+        assert_eq!(settled["task"]["status"], "completed", "{settled}");
+        assert_eq!(settled["task"]["kind"], "index.refresh");
+        assert!(settled["task"]["result"].is_object());
+
+        // Without a wait the start response is returned unchanged.
+        let started = server.observatory.start_index_refresh(None);
+        let immediate = server
+            .started(started, 0, CancellationToken::new())
+            .await
+            .map_err(anyhow::Error::msg)?
+            .0;
+        assert_eq!(immediate["poll_with"], "task.get");
+
+        // A client that abandons the request cannot hold the task id, so the
+        // started task is cancelled with it.
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let started = server.observatory.start_index_refresh(None);
+        let id = started.as_ref().unwrap()["task_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let Err(abandoned) = server.started(started, 60, cancelled).await else {
+            panic!("an abandoned wait must not report success");
+        };
+        assert!(abandoned.contains("cancellation of task"), "{abandoned}");
+        let after = server.observatory.task_get(&id)?;
+        // Only a task that settled between the last poll and the cancellation
+        // escapes the cancellation request.
+        assert!(
+            after["task"]["cancel_requested"] == true || after["task"]["status"] == "completed",
+            "{after}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn server_instructions_require_consultation_before_all_repository_work() -> Result<()> {
         let directory = tempdir()?;
         fs::write(
@@ -1688,7 +2201,16 @@ mod tests {
         let instructions = server.get_info().instructions.unwrap_or_default();
         assert!(instructions.contains("every repository-scoped user prompt"));
         assert!(instructions.contains("call repo.consult first"));
-        assert!(instructions.contains("does not replace change preparation"));
+        // Edit tasks may start with change.prepare, which carries the same
+        // guidance; the workflow stays proportionate for long refactors.
+        assert!(instructions.contains("change.prepare may be that first call"));
+        assert!(instructions.contains("one change.prepare per coherent change"));
+        assert!(instructions.contains("Validation needs no diff argument"));
+        assert!(instructions.contains("wait_seconds"));
+        assert!(instructions.contains("Sessions and path claims are for parallel work only"));
+        // Human authority boundaries stay mandatory.
+        assert!(instructions.contains("explicit bounded human delivery policy"));
+        assert!(instructions.contains("only a human may review or promote"));
         Ok(())
     }
 }

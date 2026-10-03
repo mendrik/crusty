@@ -5,3 +5,7 @@ Crusty reads exact Rust navigation from the live worktree, serves broader intell
 ## Consequences
 
 Every indexed answer carries a freshness envelope. The index is disposable, project memory is preserved during rebuilds, and validation may use stale labelled evidence but never waits for refresh.
+
+## Amendment: background refresh
+
+Explicit-only refresh left long-running servers answering from weeks-old generations. Each server process now owns one background refresher that runs the same incremental refresh as a durable task under the publisher lease after debounced file changes and `HEAD` moves (opt out with `CRUSTY_AUTO_REFRESH=0`). Refresh stays asynchronous and off the interactive path: reads still serve the last published generation and never wait.

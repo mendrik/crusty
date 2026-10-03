@@ -29,7 +29,7 @@ fn main() -> Result<()> {
     let refresh_started = Instant::now();
     service.refresh_if_stale()?;
     let refresh_us = refresh_started.elapsed().as_micros();
-    let embedding_index = service.status()?["index"]["embedding"].clone();
+    let embedding_index = service.index_status()["embedding"].clone();
 
     let mut samples = Vec::new();
     let mut context_samples = Vec::new();

@@ -2,6 +2,7 @@
 //! Semantic facts returned by a static scan are explicitly marked as such.
 
 pub mod analysis;
+mod auto_refresh;
 pub mod cleanup;
 pub mod coordination;
 pub mod dashboard;
@@ -10,14 +11,26 @@ pub mod domain;
 mod execution;
 pub mod github;
 pub mod guidance;
+mod index_build;
 pub mod live_semantics;
+mod memory_write;
 pub mod observatory;
 pub mod performance;
 mod quality;
+mod relevance;
 mod response_budget;
+mod rust_analyzer;
+mod steering;
 mod validation_diff;
+
+use response_budget::Section;
 pub mod verification;
 
+pub use auto_refresh::AutoRefresh;
+pub(crate) use rust_analyzer::SemanticBackend;
+pub use rust_analyzer::SemanticWarmer;
+use rust_analyzer::{AUTOSTART_ENV, autostart_enabled, rust_analyzer_version};
+pub use steering::{RecordSteering, RetireSteering, STEERING_LIST_STATUSES, STEERING_STATUSES};
 pub use validation_diff::{DiffSource, DiffTarget};
 
 pub use quality::{
@@ -27,7 +40,6 @@ pub use quality::{
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use fs2::FileExt;
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
@@ -35,17 +47,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Read, Write},
+    io::Read,
     path::{Path, PathBuf},
-    process::{ChildStdin, Command, Stdio},
-    sync::{
-        Arc, Mutex,
-        mpsc::{self, Receiver},
-    },
-    thread,
+    process::{Command, Stdio},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use syn::spanned::Spanned;
@@ -65,10 +73,9 @@ const MAX_RETAINED_GENERATIONS: i64 = 20;
 /// matches the largest list limit a caller can request.
 const MAX_DECISION_HITS: usize = 200;
 const SCHEMA_VERSION: &str = "8";
-const INDEXER_VERSION: &str = "8";
-const RUST_ANALYZER_THREADS: u64 = 1;
-const RUST_ANALYZER_ENV: &str = "RUST_REPO_INTELLIGENCE_ENABLE_RUST_ANALYZER";
-const RUST_ANALYZER_PATH_ENV: &str = "RUST_REPO_INTELLIGENCE_RUST_ANALYZER_PATH";
+/// Version 9 records every file contributing an IMPLEMENTS edge; bumping it
+/// rebuilds older stores once so incremental refreshes can rely on that.
+const INDEXER_VERSION: &str = "9";
 const WATCHER_ENV: &str = "RUST_REPO_INTELLIGENCE_ENABLE_WATCHER";
 const FEATURES_ENV: &str = "RUST_REPO_INTELLIGENCE_FEATURES";
 const CHECKPOINT_REF_PREFIX: &str = "refs/codex/checkpoints";
@@ -76,14 +83,34 @@ const EMBEDDING_MODEL: &str = "subword-hash-v1";
 const EMBEDDING_DIMENSIONS: usize = 192;
 const SYMBOL_CARD_VERSION: &str = "symbol-card-v1";
 const RRF_K: f64 = 60.0;
-const WATCH_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
-const WATCH_DEBOUNCE: Duration = Duration::from_millis(20);
+/// Upper bound on ids bound into one `IN (...)` list.
+const SQL_CHUNK: usize = 500;
+/// Full-text entity types owned by human and project memory rather than by
+/// the source index.
+const MEMORY_SEARCH_ENTITIES: [&str; 5] = [
+    "decision",
+    "steering",
+    "work",
+    "problem",
+    "quality_constraint",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Revision {
     pub head: Option<String>,
     pub dirty: bool,
     pub workspace_digest: String,
+}
+
+/// What one refresh did, before it is summarised for the refresh task result.
+#[derive(Debug, Clone, Copy)]
+pub struct RefreshOutcome {
+    /// `full`, `incremental`, `unchanged`, or `git_history`.
+    pub mode: &'static str,
+    /// Whether a new generation was published.
+    pub published: bool,
+    /// Inputs re-indexed: every input for a full rebuild, the changed ones otherwise.
+    pub changed_inputs: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -177,8 +204,58 @@ struct SymbolCard {
 
 #[derive(Default)]
 struct EmbeddingBuildStats {
+    /// Vectors computed from scratch.
     embedded: usize,
+    /// Vectors kept or copied from an identical card.
     reused: usize,
+    /// Symbol cards built; incremental refreshes build them only for nodes an
+    /// edit can affect.
+    cards: usize,
+}
+
+/// A parsed symbol ready to be stored as a node.
+struct IndexedSymbol {
+    kind: String,
+    canonical_name: String,
+    crate_name: Option<String>,
+    file: String,
+    start_line: usize,
+    end_line: usize,
+    visibility: String,
+    content_hash: String,
+    parser: &'static str,
+}
+
+/// Source files read at most once during one indexing pass. Bulk passes used
+/// to re-read a file for every symbol it defines.
+#[derive(Default)]
+struct SourceCache {
+    files: HashMap<String, Option<Vec<String>>>,
+}
+
+impl SourceCache {
+    fn lines(&mut self, root: &Path, file: &str) -> Option<&[String]> {
+        self.files
+            .entry(file.to_owned())
+            .or_insert_with(|| {
+                read_source_text(&root.join(file))
+                    .map(|text| text.lines().map(str::to_owned).collect())
+            })
+            .as_deref()
+    }
+
+    /// The node's indexed line range as `source_slice` reads it.
+    fn slice(&mut self, root: &Path, node: &Node) -> Option<String> {
+        let lines = self.lines(root, &node.file)?;
+        let end = node.end_line.min(lines.len());
+        let start = node.start_line.saturating_sub(1).min(end);
+        let source = lines[start..end].join("\n");
+        Some(if source.len() > MAX_SLICE_BYTES {
+            trim_text(&source, MAX_SLICE_BYTES)
+        } else {
+            source
+        })
+    }
 }
 
 struct EdgeRecord<'a> {
@@ -230,8 +307,6 @@ type LifecycleRecord = (
 /// validation. `superseded` and `retired` are terminal: the record stays in the
 /// ledger with its review trail, and only a new decision can take its place.
 pub const DECISION_STATUSES: &[&str] = &["accepted", "superseded", "retired"];
-/// Lifecycle states of a human steering instruction.
-pub const STEERING_STATUSES: &[&str] = &["active", "retired"];
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -286,20 +361,6 @@ fn one_or_many<'de, D: serde::Deserializer<'de>>(
     })
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct RecordSteering {
-    pub title: String,
-    pub instruction: String,
-    #[serde(default)]
-    pub scope: Vec<String>,
-    #[serde(default = "normal")]
-    pub priority: String,
-    #[serde(default = "active")]
-    pub status: String,
-    pub expires_at: Option<String>,
-}
-
 /// Editable, evidence-backed repository work. Automatically discovered work is
 /// always `proposed`; callers must explicitly accept it before it becomes a plan.
 #[derive(Debug, Deserialize)]
@@ -343,292 +404,32 @@ fn active() -> String {
     "active".into()
 }
 
-pub struct RustAnalyzerClient {
-    _child: execution::OwnedChild,
-    stdin: ChildStdin,
-    responses: Receiver<Value>,
-    next_id: u64,
-    opened_versions: HashMap<String, (i64, blake3::Hash)>,
-    capabilities: Value,
-    server_status: Value,
-    configuration: Value,
-}
-
-impl RustAnalyzerClient {
-    fn start(workspace: &Path, program: &Path) -> Result<Self> {
-        Self::start_configured(
-            workspace,
-            program,
-            rust_analyzer_initialization_options(),
-            None,
-        )
-    }
-
-    fn start_configured(
-        workspace: &Path,
-        program: &Path,
-        options: Value,
-        toolchain: Option<&str>,
-    ) -> Result<Self> {
-        let mut command = Command::new(program);
-        if let Some(toolchain) = toolchain {
-            command.env("RUSTUP_TOOLCHAIN", toolchain);
-        }
-        let mut child = execution::OwnedChild::spawn(
-            command
-                .current_dir(workspace)
-                // Keep the analyzer's Cargo subprocesses from multiplying the
-                // worker limit below.  This is intentionally a conservative
-                // default for a background MCP service.
-                .env("CARGO_BUILD_JOBS", RUST_ANALYZER_THREADS.to_string())
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null()),
-        )
-        .with_context(|| format!("starting rust-analyzer at {}", program.display()))?;
-        let stdout = child
-            .child
-            .stdout
-            .take()
-            .context("opening rust-analyzer stdout")?;
-        let (sender, responses) = mpsc::sync_channel(128);
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            while let Some(message) = read_lsp(&mut reader) {
-                if (message.get("id").is_some() || message["method"] == "experimental/serverStatus")
-                    && sender.send(message).is_err()
-                {
-                    break;
-                }
-            }
-        });
-        let mut stdin = child
-            .child
-            .stdin
-            .take()
-            .context("opening rust-analyzer stdin")?;
-        let request = json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"processId": std::process::id(), "rootUri": live_semantics::file_uri(workspace),
-                "capabilities": {"general":{"positionEncodings":["utf-16"]},"experimental":{"serverStatusNotification":true},
-                    "workspace":{"configuration":true},"textDocument":{"codeAction":{"codeActionLiteralSupport":{"codeActionKind":{"valueSet":["quickfix","refactor"]}}}}},
-                "initializationOptions": options,
-                "workspaceFolders": [{"uri": live_semantics::file_uri(workspace), "name": "workspace"}]}
-        });
-        write_lsp(&mut stdin, &request)?;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let capabilities = loop {
-            let wait = deadline
-                .checked_duration_since(Instant::now())
-                .context("rust-analyzer initialization timed out")?;
-            let response = responses
-                .recv_timeout(wait)
-                .context("waiting for rust-analyzer initialization")?;
-            if answer_lsp_request_configured(&mut stdin, &response, &options)? {
-                continue;
-            }
-            if response.get("id").and_then(Value::as_u64) == Some(1) {
-                ensure!(
-                    response.get("error").is_none(),
-                    "rust-analyzer initialization failed: {}",
-                    response["error"]
-                );
-                break response["result"]["capabilities"].clone();
-            }
-        };
-        write_lsp(
-            &mut stdin,
-            &json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
-        )?;
-        Ok(Self {
-            _child: child,
-            stdin,
-            responses,
-            next_id: 2,
-            opened_versions: HashMap::new(),
-            capabilities,
-            server_status: Value::Null,
-            configuration: options,
-        })
-    }
-
-    fn did_change(&mut self, uri: &str, text: &str) {
-        let hash = blake3::hash(text.as_bytes());
-        if let Some((version, previous)) = self.opened_versions.get_mut(uri) {
-            if *previous == hash {
-                return;
-            }
-            *previous = hash;
-            *version += 1;
-            let _ = write_lsp(
-                &mut self.stdin,
-                &json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":uri,"version":*version},"contentChanges":[{"text":text}]}}),
-            );
-        } else {
-            self.opened_versions.insert(uri.to_owned(), (1, hash));
-            let _ = write_lsp(
-                &mut self.stdin,
-                &json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"rust","version":1,"text":text}}}),
-            );
-        }
-    }
-
-    fn locations(
-        &mut self,
-        method: &str,
-        uri: &str,
-        line: usize,
-        character: usize,
-    ) -> Option<Vec<Value>> {
-        let id = self.next_id;
-        self.next_id += 1;
-        write_lsp(&mut self.stdin, &json!({
-            "jsonrpc":"2.0", "id":id, "method":method,
-            "params":{"textDocument":{"uri":uri},"position":{"line":line,"character":character},"context":{"includeDeclaration":true}}
-        })).ok()?;
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while let Some(wait) = deadline.checked_duration_since(Instant::now()) {
-            let response = self.responses.recv_timeout(wait).ok()?;
-            if answer_lsp_request(&mut self.stdin, &response).ok()? {
-                continue;
-            }
-            if response.get("id").and_then(Value::as_u64) == Some(id) {
-                return response.get("result").and_then(Value::as_array).cloned();
-            }
-        }
-        None
-    }
-
-    fn references(&mut self, uri: &str, line: usize, character: usize) -> Option<Vec<Value>> {
-        self.locations("textDocument/references", uri, line, character)
-    }
-
-    fn implementations(&mut self, uri: &str, line: usize, character: usize) -> Option<Vec<Value>> {
-        self.locations("textDocument/implementation", uri, line, character)
-    }
-}
-
-fn answer_lsp_request(stdin: &mut ChildStdin, message: &Value) -> Result<bool> {
-    answer_lsp_request_configured(stdin, message, &rust_analyzer_initialization_options())
-}
-
-fn answer_lsp_request_configured(
-    stdin: &mut ChildStdin,
-    message: &Value,
-    configuration: &Value,
-) -> Result<bool> {
-    let (Some(id), Some(method)) = (message.get("id"), message["method"].as_str()) else {
-        return Ok(false);
-    };
-    let result = match method {
-        "workspace/configuration" => json!(
-            message["params"]["items"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|item| {
-                    let section = item["section"].as_str().unwrap_or("");
-                    if section.is_empty() || section == "rust-analyzer" {
-                        configuration.clone()
-                    } else if let Some(path) = section.strip_prefix("rust-analyzer.") {
-                        path.split('.')
-                            .fold(configuration, |value, key| &value[key])
-                            .clone()
-                    } else {
-                        Value::Null
-                    }
-                })
-                .collect::<Vec<_>>()
+/// The background refresher's environment switches: whether it runs
+/// (`CRUSTY_AUTO_REFRESH`) and whether it may watch the filesystem.
+pub(crate) fn auto_refresh_switches() -> (bool, bool) {
+    (
+        auto_refresh::auto_refresh_enabled(
+            std::env::var(auto_refresh::AUTO_REFRESH_ENV)
+                .ok()
+                .as_deref(),
         ),
-        "client/registerCapability"
-        | "client/unregisterCapability"
-        | "window/workDoneProgress/create"
-        | "workspace/semanticTokens/refresh" => Value::Null,
-        "workspace/applyEdit" => {
-            json!({"applied":false,"failureReason":"Crusty's semantic companion is read-only"})
-        }
-        _ => {
-            write_lsp(
-                stdin,
-                &json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Unsupported client method"}}),
-            )?;
-            return Ok(true);
-        }
-    };
-    write_lsp(stdin, &json!({"jsonrpc":"2.0","id":id,"result":result}))?;
-    Ok(true)
+        watcher_enabled(std::env::var(WATCHER_ENV).ok().as_deref()),
+    )
 }
 
-fn rust_analyzer_initialization_options() -> Value {
-    let mut options = json!({
-        // This process is not an editor and does not need diagnostics after
-        // every didOpen notification.  Semantic reference requests still work.
-        "checkOnSave": false,
-        "cachePriming": {
-            "enable": false,
-            "numThreads": RUST_ANALYZER_THREADS,
-        },
-        "numThreads": RUST_ANALYZER_THREADS,
-        "cargo": {
-            "extraEnv": {
-                "CARGO_BUILD_JOBS": RUST_ANALYZER_THREADS.to_string(),
-            },
-        },
-        "check": {
-            "extraEnv": {
-                "CARGO_BUILD_JOBS": RUST_ANALYZER_THREADS.to_string(),
-            },
-        },
-    });
-    if let Ok(features) = std::env::var("RUST_REPO_INTELLIGENCE_FEATURES")
-        && features != "cargo-default"
-    {
-        options["cargo"]["features"] = if features == "all" {
-            json!("all")
-        } else {
-            json!(
-                features
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-            )
-        };
-    }
-    if let Ok(target) = std::env::var("CARGO_BUILD_TARGET")
-        && !target.is_empty()
-    {
-        options["cargo"]["target"] = json!(target);
-    }
-    options
+/// The rust-analyzer environment switches: whether the companion is enabled
+/// at server start and whether an enabled companion starts loading right away.
+pub(crate) fn semantic_switches() -> (bool, bool) {
+    (
+        autostart_enabled(std::env::var(AUTOSTART_ENV).ok().as_deref()),
+        rust_analyzer::warm_start_enabled(
+            std::env::var(rust_analyzer::WARM_START_ENV).ok().as_deref(),
+        ),
+    )
 }
 
-fn rust_analyzer_enabled(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
-}
-
-fn rust_analyzer_program(explicit: Option<OsString>) -> PathBuf {
-    if let Some(explicit) = explicit {
-        return PathBuf::from(explicit);
-    }
-    let from_rustup = Command::new("rustup")
-        .args(["which", "rust-analyzer"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .filter(|path| !path.is_empty());
-    from_rustup
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("rust-analyzer"))
-}
-
-fn watcher_enabled(value: Option<&str>) -> bool {
+/// Whether the Observatory's background refresher may watch the filesystem.
+pub(crate) fn watcher_enabled(value: Option<&str>) -> bool {
     if cfg!(test) && value.is_none() {
         return false;
     }
@@ -640,79 +441,15 @@ fn watcher_enabled(value: Option<&str>) -> bool {
     })
 }
 
-fn start_watcher(
-    root: &Path,
-) -> (
-    Option<RecommendedWatcher>,
-    Option<Receiver<notify::Result<Event>>>,
-) {
-    if !watcher_enabled(std::env::var(WATCHER_ENV).ok().as_deref()) {
-        return (None, None);
-    }
-    let (sender, receiver) = mpsc::sync_channel(1_024);
-    let Ok(mut watcher) = notify::recommended_watcher(move |event| {
-        let _ = sender.try_send(event);
-    }) else {
-        return (None, None);
-    };
-    if watcher.watch(root, RecursiveMode::Recursive).is_err() {
-        return (None, None);
-    }
-    (Some(watcher), Some(receiver))
-}
-
-fn write_lsp(out: &mut ChildStdin, value: &Value) -> Result<()> {
-    let body = serde_json::to_vec(value)?;
-    write!(out, "Content-Length: {}\r\n\r\n", body.len())?;
-    out.write_all(&body)?;
-    out.flush()?;
-    Ok(())
-}
-
-fn read_lsp(reader: &mut impl BufRead) -> Option<Value> {
-    let mut content_length = None;
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).ok()? == 0 {
-            return None;
-        }
-        let trimmed = line.trim_end();
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
-            content_length = value.trim().parse::<usize>().ok();
-        }
-    }
-    let length = content_length?;
-    if length > execution::MAX_CAPTURE_BYTES {
-        return None;
-    }
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body).ok()?;
-    serde_json::from_slice(&body).ok()
-}
-
 pub struct Service {
     root: PathBuf,
     db: Connection,
-    ra: Arc<Mutex<SemanticBackend>>,
+    ra: Arc<SemanticBackend>,
     execution: execution::ExecutionControl,
     ra_enabled: bool,
     ra_program: PathBuf,
-    watcher: Option<RecommendedWatcher>,
-    watch_events: Option<Receiver<notify::Result<Event>>>,
-    watcher_trusted: bool,
-    last_reconcile: Instant,
     embedding_cache: RefCell<Option<EmbeddingCache>>,
-}
-
-#[derive(Default)]
-pub(crate) struct SemanticBackend {
-    client: Option<RustAnalyzerClient>,
-    start_attempted: bool,
-    start_error: Option<String>,
-    live_profile: Option<String>,
+    last_refresh_timings: Value,
 }
 
 struct PublisherLease(File);
@@ -729,31 +466,25 @@ impl Service {
         let index_dir = root.join(INDEX_DIRECTORY);
         fs::create_dir_all(&index_dir)?;
         let db = Connection::open(index_dir.join("index.sqlite3"))?;
-        // A refresh holds one write transaction for its whole duration. Without
-        // a busy timeout every concurrent reader failed outright with
-        // SQLITE_BUSY instead of waiting, contradicting the contract
-        // `index.status` advertises about reads during a refresh.
+        // Builds use a private snapshot; only publication and memory mutations
+        // acquire this writer. Bound contention between those short transactions.
         db.busy_timeout(std::time::Duration::from_secs(15))?;
         initialize_schema(&db)?;
-        let (watcher, watch_events) = start_watcher(&root);
-        let ra_program = rust_analyzer_program(
-            std::env::var_os(RUST_ANALYZER_PATH_ENV).filter(|value| !value.is_empty()),
-        );
+        let ra_program = rust_analyzer::configured_program(&root);
         // MCP clients impose a short initialization deadline.  Indexing a large
-        // workspace here makes the server appear unavailable. Cache creation and
-        // the optional rust-analyzer companion are therefore both lazy.
+        // workspace here makes the server appear unavailable. Cache creation is
+        // lazy, and the optional rust-analyzer companion is shared per process
+        // and warmed in the background (see `rust_analyzer::SemanticWarmer`).
         Ok(Self {
             root,
             db,
-            ra: Arc::new(Mutex::new(SemanticBackend::default())),
+            ra: Arc::default(),
             execution: execution::ExecutionControl::default(),
-            ra_enabled: rust_analyzer_enabled(std::env::var(RUST_ANALYZER_ENV).ok().as_deref()),
+            // Off until `semantic.enable`; `with_backend` adopts the shared state.
+            ra_enabled: false,
             ra_program,
-            watcher,
-            watch_events,
-            watcher_trusted: false,
-            last_reconcile: Instant::now(),
             embedding_cache: RefCell::new(None),
+            last_refresh_timings: Value::Null,
         })
     }
 
@@ -761,7 +492,8 @@ impl Service {
         &self.root
     }
 
-    pub(crate) fn with_backend(mut self, backend: Arc<Mutex<SemanticBackend>>) -> Self {
+    pub(crate) fn with_backend(mut self, backend: Arc<SemanticBackend>) -> Self {
+        self.ra_enabled = backend.is_enabled();
         self.ra = backend;
         self
     }
@@ -769,39 +501,6 @@ impl Service {
     pub(crate) fn with_execution(mut self, execution: execution::ExecutionControl) -> Self {
         self.execution = execution;
         self
-    }
-
-    fn start_rust_analyzer_if_enabled(&self) {
-        if !self.ra_enabled {
-            return;
-        }
-        let Ok(mut backend) = self.ra.lock() else {
-            return;
-        };
-        let profile = format!(
-            "index:{}",
-            blake3::hash(
-                rust_analyzer_initialization_options()
-                    .to_string()
-                    .as_bytes()
-            )
-            .to_hex()
-        );
-        if backend.start_attempted && backend.live_profile.as_deref() == Some(&profile) {
-            return;
-        }
-        backend.client = None;
-        backend.live_profile = Some(profile);
-        backend.start_attempted = true;
-        match RustAnalyzerClient::start(&self.root, &self.ra_program) {
-            Ok(client) => {
-                backend.client = Some(client);
-                backend.start_error = None;
-            }
-            Err(error) => {
-                backend.start_error = Some(format!("{error:#}"));
-            }
-        }
     }
 
     pub fn revision(&self) -> Revision {
@@ -968,278 +667,361 @@ impl Service {
 
     pub fn reindex(&mut self) -> Result<()> {
         let _publisher_lease = self.acquire_publisher_lease()?;
-        self.reindex_unlocked()
+        self.reindex_unlocked().map(|_| ())
     }
 
-    fn reindex_unlocked(&mut self) -> Result<()> {
-        self.with_savepoint("full_reindex", |service| service.reindex_inner())?;
-        self.watcher_trusted = self.watcher.is_some();
-        self.last_reconcile = Instant::now();
-        Ok(())
+    fn reindex_unlocked(&mut self) -> Result<RefreshOutcome> {
+        let inputs = self.with_index_build(|service| service.reindex_inner())?;
+        Ok(RefreshOutcome {
+            mode: "full",
+            published: true,
+            changed_inputs: inputs,
+        })
     }
 
-    fn reindex_inner(&mut self) -> Result<()> {
+    /// Rebuilds every index table and returns the number of indexed inputs.
+    fn reindex_inner(&mut self) -> Result<usize> {
         // Cargo may materialize Cargo.lock on first metadata resolution. Establish
         // the indexed snapshot only after that deterministic side effect.
         let cargo = cargo_metadata(&self.root)?;
-        let inputs = index_inputs(&self.root);
+        let (inputs, worktree) = index_inputs_with_worktree(&self.root);
         let revision = self.revision_from_inputs(&inputs);
         let semantic = self.semantic_snapshot(&inputs);
+        let digest = revision.workspace_digest.as_str();
+        // Node ids are reassigned below. Vectors are content-addressed by their
+        // symbol card, so every unchanged card keeps its vector.
+        let reusable = self.reusable_embeddings(None)?;
         self.db
             .execute("DELETE FROM edges WHERE provenance = 'StaticIndex'", [])?;
         self.db
             .execute("DELETE FROM edges WHERE provenance = 'RustAnalyzer'", [])?;
         self.db.execute("DELETE FROM nodes", [])?;
-        self.db.execute("DELETE FROM packages", [])?;
-        self.db.execute("DELETE FROM package_dependencies", [])?;
-        self.db.execute("DELETE FROM package_targets", [])?;
-        self.db.execute("DELETE FROM package_features", [])?;
         self.db.execute("DELETE FROM commits", [])?;
         self.db.execute("DELETE FROM commit_files", [])?;
         self.db.execute("DELETE FROM co_changes", [])?;
         self.db.execute("DELETE FROM documents", [])?;
         self.db.execute("DELETE FROM symbol_embeddings", [])?;
+        self.db.execute("DELETE FROM lifecycle_edges", [])?;
+        self.db.execute("DELETE FROM unresolved_references", [])?;
         self.db.execute("DELETE FROM use_case_nodes", [])?;
         self.db.execute("DELETE FROM use_cases", [])?;
+        self.replace_cargo_tables(&cargo, digest)?;
         let packages = cargo_packages_from_metadata(&cargo);
-        for package in &packages {
-            self.db.execute("INSERT OR REPLACE INTO packages(name, manifest_path, metadata, revision) VALUES (?1, ?2, ?3, ?4)", params![package.0, package.1, package.2, revision.workspace_digest])?;
-        }
-        for (source, target, context) in cargo_dependency_edges_from_metadata(&cargo) {
-            self.db.execute(
-                "INSERT OR REPLACE INTO package_dependencies(source, target, context_json, revision) VALUES (?1, ?2, ?3, ?4)",
-                params![source, target, context, revision.workspace_digest],
-            )?;
-        }
-        self.index_cargo_matrix(&cargo, &revision.workspace_digest)?;
         let nodes = self.index_source_files(&rust_files(&self.root), &packages)?;
-        self.index_static_references(&nodes, &revision.workspace_digest)?;
-        self.index_structural_edges(&nodes, &revision.workspace_digest)?;
-        self.index_lifecycle_evidence(&nodes, &revision.workspace_digest)?;
-        self.relink_decision_targets()?;
-        self.index_documents_and_use_cases(&nodes, &revision.workspace_digest)?;
-        self.index_proposed_work(&revision.workspace_digest)?;
-        self.index_git(&revision.workspace_digest)?;
-        self.rebuild_symbol_embeddings(&nodes, &semantic.id)?;
+        self.index_static_references(&nodes, None, digest)?;
+        self.index_structural_edges(&nodes, None, digest)?;
+        self.index_lifecycle_evidence(&nodes, &nodes, digest)?;
+        self.index_documents(&all_text_files(&self.root), digest)?;
+        self.index_use_cases(&nodes, digest)?;
+        self.index_proposed_work(None, digest)?;
+        self.index_git(digest, revision.head.as_deref())?;
+        let stats = self.rebuild_symbol_embeddings(&nodes, &semantic.id, &reusable)?;
+        self.record_embedding_stats(&stats)?;
         self.rebuild_search_index()?;
+        // Decision targets resolve through the full-text index, so they are
+        // relinked only once it describes the new nodes.
+        self.relink_decision_targets()?;
         ensure!(
             index_inputs(&self.root) == inputs,
             "workspace changed during full indexing; retry against a stable snapshot"
         );
         self.record_index_state(&revision, &inputs)?;
-        Ok(())
+        self.record_worktree_inputs(&worktree)?;
+        Ok(inputs.len())
     }
 
-    fn with_savepoint<T>(
-        &mut self,
-        name: &str,
-        operation: impl FnOnce(&mut Self) -> Result<T>,
-    ) -> Result<T> {
-        self.db.execute_batch(&format!("SAVEPOINT {name}"))?;
-        match operation(self) {
-            Ok(value) => {
-                self.db.execute_batch(&format!("RELEASE {name}"))?;
-                Ok(value)
-            }
-            Err(error) => {
-                let _ = self
-                    .db
-                    .execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name}"));
-                Err(error)
+    /// Replaces the Cargo package, dependency, target, and feature tables.
+    fn replace_cargo_tables(&self, cargo: &Value, revision: &str) -> Result<()> {
+        self.db.execute("DELETE FROM packages", [])?;
+        self.db.execute("DELETE FROM package_dependencies", [])?;
+        self.db.execute("DELETE FROM package_targets", [])?;
+        self.db.execute("DELETE FROM package_features", [])?;
+        for package in cargo_packages_from_metadata(cargo) {
+            self.db.execute("INSERT OR REPLACE INTO packages(name, manifest_path, metadata, revision) VALUES (?1, ?2, ?3, ?4)", params![package.0, package.1, package.2, revision])?;
+        }
+        for (source, target, context) in cargo_dependency_edges_from_metadata(cargo) {
+            self.db.execute(
+                "INSERT OR REPLACE INTO package_dependencies(source, target, context_json, revision) VALUES (?1, ?2, ?3, ?4)",
+                params![source, target, context, revision],
+            )?;
+        }
+        self.index_cargo_matrix(cargo, revision)
+    }
+
+    /// Workspace packages as last indexed, in Cargo metadata order. Incremental
+    /// refreshes read them here instead of re-running `cargo metadata`.
+    fn stored_packages(&self) -> Result<Vec<(String, String, String)>> {
+        Ok(self
+            .db
+            .prepare("SELECT name,COALESCE(manifest_path,''),COALESCE(metadata,'') FROM packages ORDER BY rowid")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Re-attributes indexed files to crates after a Cargo change and returns
+    /// the nodes whose crate changed.
+    fn reassign_crates(&self) -> Result<BTreeSet<i64>> {
+        let packages = self.stored_packages()?;
+        let mut changed = BTreeSet::new();
+        for node in self.all_nodes()? {
+            let crate_name = crate_for_file(&packages, &self.root.join(&node.file));
+            if crate_name != node.crate_name {
+                self.db.execute(
+                    "UPDATE nodes SET crate_name=?1 WHERE id=?2",
+                    params![crate_name, node.id],
+                )?;
+                changed.insert(node.id);
             }
         }
+        Ok(changed)
     }
 
-    /// Refresh only the portions invalidated by changed inputs. Cargo and toolchain
-    /// inputs deliberately trigger a complete semantic refresh; documentation alone
-    /// never invalidates source symbols or graph edges.
-    pub fn refresh_if_stale(&mut self) -> Result<()> {
+    /// Refresh only the portions invalidated by changed inputs.
+    ///
+    /// Only an empty input state or an indexer-version change rebuilds
+    /// everything. Source edits re-index the changed files and re-resolve the
+    /// files whose references they can affect; Cargo edits replace the package
+    /// tables and re-attribute crates; a changed semantic profile (target,
+    /// features, build environment, rust-analyzer version) drops only the
+    /// rust-analyzer evidence recorded under the old profile, since the
+    /// syntactic index does not depend on it. Documentation alone never
+    /// invalidates source symbols or graph edges.
+    pub fn refresh_if_stale(&mut self) -> Result<RefreshOutcome> {
         let _publisher_lease = self.acquire_publisher_lease()?;
-        let previous: BTreeMap<String, (String, String)> = self
-            .db
-            .prepare("SELECT path, kind, content_hash FROM input_state")?
-            .query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?
-            .collect::<rusqlite::Result<_>>()?;
+        let previous = self.stored_inputs()?;
         if previous.is_empty() {
             return self.reindex_unlocked();
         }
-        let indexed_version: Option<String> = self
-            .db
-            .query_row(
-                "SELECT value FROM metadata WHERE key='indexer_version'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if indexed_version.as_deref() != Some(INDEXER_VERSION) {
+        if self.metadata_value("indexer_version")?.as_deref() != Some(INDEXER_VERSION) {
             return self.reindex_unlocked();
         }
-        let (watch_paths, watcher_overflowed) = self.drain_watch_events();
-        let reconcile = !self.watcher_trusted
-            || self.watcher.is_none()
-            || watcher_overflowed
-            || self.last_reconcile.elapsed() >= WATCH_RECONCILE_INTERVAL;
-        let inputs = if reconcile {
-            index_inputs(&self.root)
-        } else {
-            inputs_from_watch_paths(&self.root, &previous, &watch_paths)
-        };
-        let indexed_head: Option<String> = self
-            .db
-            .query_row(
-                "SELECT value FROM metadata WHERE key='git_indexed_head'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
+        // Every refresh reconciles against the whole workspace; the Git index
+        // makes that cheap, since only dirty and untracked inputs are read.
+        let (mut inputs, mut worktree) = index_inputs_with_worktree(&self.root);
+        let published_head = self
+            .metadata_value("git_indexed_head")?
             .filter(|head| !head.is_empty());
         let current_head = command_text(&self.root, &["rev-parse", "HEAD"]);
-        if !reconcile && watch_paths.is_empty() && indexed_head == current_head {
-            return Ok(());
-        }
+        let mut changed = changed_inputs(&previous, &inputs);
+        // Cargo may rewrite Cargo.lock while resolving metadata; take the
+        // snapshot afterwards, exactly as a full reindex does.
+        let cargo = if changed.iter().any(|(_, kind)| kind == "cargo") {
+            let cargo = cargo_metadata(&self.root)?;
+            (inputs, worktree) = index_inputs_with_worktree(&self.root);
+            changed = changed_inputs(&previous, &inputs);
+            Some(cargo)
+        } else {
+            None
+        };
         let revision = self.revision_from_inputs_and_head(&inputs, current_head);
-        let head_changed = indexed_head != revision.head;
         let semantic = self.semantic_snapshot(&inputs);
-        if !self.active_semantic_profile_matches(&semantic)? {
-            return self.reindex_unlocked();
+        let profile_changed = !self.active_semantic_profile_matches(&semantic)?;
+        let history_head = self
+            .metadata_value("git_history_head")?
+            .filter(|head| !head.is_empty())
+            .or(published_head);
+        let history_stale = history_head != revision.head;
+        let republish = self.indexed_revision().as_ref() != Some(&revision);
+        if !changed.is_empty() || profile_changed || history_stale || republish {
+            self.with_index_build(|service| {
+                service.refresh_changed(
+                    &changed,
+                    &revision,
+                    &inputs,
+                    cargo.as_ref(),
+                    history_stale,
+                    profile_changed,
+                )?;
+                service.record_worktree_inputs(&worktree)
+            })?;
+            return Ok(RefreshOutcome {
+                mode: "incremental",
+                published: true,
+                changed_inputs: changed.len(),
+            });
         }
-        let changed: Vec<(String, String)> = inputs
-            .iter()
-            .filter(|(path, (kind, hash))| {
-                previous.get(*path) != Some(&(kind.clone(), hash.clone()))
-            })
-            .map(|(path, (kind, _))| (path.clone(), kind.clone()))
-            .chain(
-                previous
-                    .iter()
-                    .filter(|(path, _)| !inputs.contains_key(*path))
-                    .map(|(path, (kind, _))| (path.clone(), kind.clone())),
-            )
-            .collect();
-        if changed.is_empty() {
-            if head_changed {
-                self.with_savepoint("git_refresh", |service| {
-                    service.refresh_git(&revision.workspace_digest)?;
-                    service.rebuild_search_index()?;
-                    service.record_index_state(&revision, &inputs)
-                })?;
-            }
-            self.watcher_trusted = self.watcher.is_some();
-            if reconcile {
-                self.last_reconcile = Instant::now();
-            }
-            return Ok(());
+        // Nothing to publish, but a store written before the worktree set was
+        // recorded still needs it for cheap freshness checks.
+        if self.stored_worktree_inputs()?.as_ref() != Some(&worktree) {
+            self.record_worktree_inputs(&worktree)?;
         }
-        if changed.iter().any(|(_, kind)| kind == "cargo") {
-            return self.reindex_unlocked();
-        }
-        self.with_savepoint("incremental_refresh", |service| {
-            service.refresh_changed(&changed, &revision, &inputs, head_changed)
-        })?;
-        self.watcher_trusted = self.watcher.is_some();
-        if reconcile {
-            self.last_reconcile = Instant::now();
-        }
+        Ok(RefreshOutcome {
+            mode: "unchanged",
+            published: false,
+            changed_inputs: 0,
+        })
+    }
+
+    /// The per-input content identities recorded with the published generation.
+    fn stored_inputs(&self) -> Result<BTreeMap<String, (String, String)>> {
+        Ok(self
+            .db
+            .prepare("SELECT path, kind, content_hash FROM input_state")?
+            .query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Inputs that differed from `HEAD` when the published generation was
+    /// indexed, or `None` for a store that never recorded them.
+    fn stored_worktree_inputs(&self) -> Result<Option<BTreeSet<String>>> {
+        stored_worktree_inputs(&self.db)
+    }
+
+    fn record_worktree_inputs(&self, worktree: &BTreeSet<String>) -> Result<()> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES ('indexed_worktree_inputs', ?1)",
+            [serde_json::to_string(worktree)?],
+        )?;
         Ok(())
     }
 
-    fn drain_watch_events(&self) -> (BTreeSet<PathBuf>, bool) {
-        let Some(events) = &self.watch_events else {
-            return (BTreeSet::new(), false);
-        };
-        let mut paths = BTreeSet::new();
-        let mut overflowed = false;
-        match events.recv_timeout(Duration::from_millis(2)) {
-            Ok(Ok(event)) => paths.extend(event.paths),
-            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => overflowed = true,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-        }
-        for event in events.try_iter() {
-            match event {
-                Ok(event) => paths.extend(event.paths),
-                Err(_) => overflowed = true,
-            }
-        }
-        if !paths.is_empty() {
-            thread::sleep(WATCH_DEBOUNCE);
-            for event in events.try_iter() {
-                match event {
-                    Ok(event) => paths.extend(event.paths),
-                    Err(_) => overflowed = true,
-                }
-            }
-        }
-        paths.retain(|path| watch_path_relevant(&self.root, path));
-        (paths, overflowed)
+    fn metadata_value(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()?)
     }
 
+    /// Applies `changed` inputs to the published index and publishes a new
+    /// generation.
+    ///
+    /// Work is bounded by the change: changed files are re-parsed with node ids
+    /// kept for symbols that still exist, syntax edges are re-derived only for
+    /// the affected files, and symbol cards, lifecycle evidence, use cases,
+    /// documents, TODO markers, and full-text rows are rewritten only for what
+    /// those files touch. Two steps still visit the workspace without parsing
+    /// it: a word scan of Rust files when the set of defined symbol names
+    /// changes (a new or removed name can change how any file's references
+    /// resolve), and database-only bulk statements such as re-stamping vectors
+    /// with the new semantic snapshot.
     fn refresh_changed(
         &mut self,
         changed: &[(String, String)],
         revision: &Revision,
         inputs: &BTreeMap<String, (String, String)>,
-        head_changed: bool,
+        cargo: Option<&Value>,
+        history_stale: bool,
+        semantic_profile_changed: bool,
     ) -> Result<()> {
+        let digest = revision.workspace_digest.as_str();
         let semantic = self.semantic_snapshot(inputs);
-        let source_paths: Vec<PathBuf> = changed
+        let mut touched = BTreeSet::new();
+        let mut semantic_invalidated = semantic_profile_changed;
+        if let Some(cargo) = cargo {
+            self.replace_cargo_tables(cargo, digest)?;
+            touched.extend(self.reassign_crates()?);
+            semantic_invalidated = true;
+        }
+        // build.rs is a Cargo input and Rust source at once.
+        let source_files: BTreeSet<String> = changed
             .iter()
-            .filter(|(_, kind)| kind == "source")
-            .map(|(path, _)| self.root.join(path))
+            .filter(|(path, kind)| kind == "source" || path.ends_with(".rs"))
+            .map(|(path, _)| path.clone())
             .collect();
-        if !source_paths.is_empty() {
-            let broad_semantic_invalidation = source_paths.iter().any(|path| {
-                let file = relative(&self.root, path);
-                self.db
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM nodes WHERE file=?1 AND (visibility='public' OR kind IN ('trait','impl','macro_rules!')))",
-                        [&file],
-                        |row| row.get::<_, bool>(0),
-                    )
-                    .unwrap_or(true)
-            });
-            if broad_semantic_invalidation {
-                self.db
-                    .execute("DELETE FROM edges WHERE provenance='RustAnalyzer'", [])?;
-            }
-            for path in &source_paths {
+        let previous_ids = self.node_ids_in_files(&source_files)?;
+        let reusable = self.reusable_embeddings(Some(&previous_ids))?;
+        if !semantic_invalidated && !source_files.is_empty() {
+            semantic_invalidated = self.exposes_shared_api(&source_files)?;
+        }
+        if semantic_invalidated {
+            touched.extend(self.edge_endpoints("provenance='RustAnalyzer'", &[] as &[i64])?);
+            self.db
+                .execute("DELETE FROM edges WHERE provenance='RustAnalyzer'", [])?;
+        } else {
+            // Private, non-trait edits keep compiler evidence for the rest of
+            // the workspace; only evidence about the edited symbols is dropped.
+            for chunk in previous_ids.chunks(SQL_CHUNK) {
+                let filter = format!(
+                    "provenance='RustAnalyzer' AND (src IN ({0}) OR dst IN ({0}))",
+                    placeholders(chunk.len())
+                );
+                touched.extend(self.edge_endpoints(&filter, chunk)?);
                 self.db.execute(
-                    "DELETE FROM nodes WHERE file = ?1",
-                    [relative(&self.root, path)],
+                    &format!("DELETE FROM edges WHERE {filter}"),
+                    rusqlite::params_from_iter(chunk),
                 )?;
             }
-            let packages = cargo_packages(&self.root);
-            let existing: Vec<PathBuf> = source_paths
-                .into_iter()
-                .filter(|path| path.exists())
-                .collect();
-            self.index_source_files(&existing, &packages)?;
             self.db.execute(
-                "DELETE FROM edges WHERE provenance IN ('StaticIndex','Syntax')",
+                "UPDATE edges SET revision=?1 WHERE provenance='RustAnalyzer'",
+                [&semantic.id],
+            )?;
+        }
+        if !source_files.is_empty() {
+            let affected_files = self.apply_source_changes(&source_files, inputs, &mut touched)?;
+            touched.extend(self.reindex_file_edges(&affected_files, digest)?);
+            let affected_nodes = self.nodes_in_files(&affected_files)?;
+            touched.extend(affected_nodes.iter().map(|node| node.id));
+            let affected_ids = affected_nodes
+                .iter()
+                .map(|node| node.id)
+                .collect::<Vec<_>>();
+            for chunk in affected_ids.chunks(SQL_CHUNK) {
+                self.db.execute(
+                    &format!(
+                        "DELETE FROM lifecycle_edges WHERE legacy_node IN ({})",
+                        placeholders(chunk.len())
+                    ),
+                    rusqlite::params_from_iter(chunk),
+                )?;
+            }
+            let all_nodes = self.all_nodes()?;
+            self.index_lifecycle_evidence(&affected_nodes, &all_nodes, digest)?;
+            let changed_nodes = affected_nodes
+                .into_iter()
+                .filter(|node| source_files.contains(&node.file))
+                .collect::<Vec<_>>();
+            self.index_use_cases(&changed_nodes, digest)?;
+            self.db.execute(
+                "DELETE FROM use_cases WHERE provenance='AgentInference' AND id NOT IN (SELECT use_case_id FROM use_case_nodes)",
                 [],
             )?;
-            let nodes = self.all_nodes()?;
-            self.index_static_references(&nodes, &revision.workspace_digest)?;
-            self.index_structural_edges(&nodes, &revision.workspace_digest)?;
-            if !broad_semantic_invalidation {
-                self.db.execute(
-                    "UPDATE edges SET revision=?1 WHERE provenance='RustAnalyzer'",
-                    [&semantic.id],
-                )?;
-            }
-            self.index_lifecycle_evidence(&nodes, &revision.workspace_digest)?;
-            self.relink_decision_targets()?;
-            self.refresh_documents_and_use_cases(&nodes, &revision.workspace_digest)?;
-            self.index_proposed_work(&revision.workspace_digest)?;
-            self.rebuild_symbol_embeddings(&nodes, &semantic.id)?;
-        } else {
-            let nodes = self.all_nodes()?;
-            self.refresh_documents_and_use_cases(&nodes, &revision.workspace_digest)?;
-            self.index_proposed_work(&revision.workspace_digest)?;
+            self.delete_search_rows("node", &previous_ids.iter().map(i64::to_string).collect())?;
+            self.insert_node_search_rows(&changed_nodes)?;
         }
-        if head_changed {
-            self.refresh_git(&revision.workspace_digest)?;
+        let document_paths = changed
+            .iter()
+            .filter(|(_, kind)| kind != "source")
+            .map(|(path, _)| path.clone())
+            .collect::<BTreeSet<_>>();
+        if !document_paths.is_empty() {
+            self.refresh_documents(&document_paths, digest)?;
         }
-        self.rebuild_search_index()?;
+        self.db
+            .execute("UPDATE documents SET revision=?1", [digest])?;
+        let changed_paths = changed
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<BTreeSet<_>>();
+        self.index_proposed_work(Some(&changed_paths), digest)?;
+        if history_stale {
+            self.refresh_git(digest, revision.head.as_deref())?;
+        }
+        let missing: Vec<i64> = self
+            .db
+            .prepare(
+                "SELECT id FROM nodes WHERE id NOT IN (SELECT node_id FROM symbol_embeddings)",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        touched.extend(missing);
+        let touched_nodes = self.nodes_by_ids(&touched)?;
+        let mut stats = self.rebuild_symbol_embeddings(&touched_nodes, &semantic.id, &reusable)?;
+        self.db.execute(
+            "UPDATE symbol_embeddings SET semantic_snapshot=?1",
+            [&semantic.id],
+        )?;
+        let total: usize =
+            self.db
+                .query_row("SELECT COUNT(*) FROM symbol_embeddings", [], |row| {
+                    row.get(0)
+                })?;
+        // Vectors outside the touched set are carried forward unchanged.
+        stats.reused += total.saturating_sub(touched_nodes.len());
+        self.record_embedding_stats(&stats)?;
+        self.refresh_memory_search_rows()?;
+        self.relink_decision_targets()?;
         ensure!(
             changed_inputs_still_match(&self.root, inputs, changed),
             "workspace changed during incremental indexing; retry against a stable snapshot"
@@ -1247,6 +1029,10 @@ impl Service {
         self.record_index_state(revision, inputs)
     }
 
+    /// Publishes a generation for `inputs`. The caller records, in the same
+    /// savepoint, which inputs differed from `HEAD` when they were read
+    /// (`record_worktree_inputs`); freshness checks re-hash only those and the
+    /// currently dirty inputs instead of the whole workspace.
     fn record_index_state(
         &self,
         revision: &Revision,
@@ -1323,65 +1109,427 @@ impl Service {
             .collect())
     }
 
-    fn refresh_documents_and_use_cases(&self, nodes: &[Node], revision: &str) -> Result<()> {
-        self.db.execute("DELETE FROM documents", [])?;
-        self.db.execute("DELETE FROM use_case_nodes", [])?;
-        self.db.execute("DELETE FROM use_cases", [])?;
-        self.index_documents_and_use_cases(nodes, revision)
+    fn nodes_in_files(&self, files: &BTreeSet<String>) -> Result<Vec<Node>> {
+        let files = files.iter().collect::<Vec<_>>();
+        let mut nodes = Vec::new();
+        for chunk in files.chunks(SQL_CHUNK) {
+            let mut statement = self.db.prepare(&format!(
+                "SELECT id,kind,canonical_name,crate_name,file,start_line,end_line,visibility,content_hash FROM nodes WHERE file IN ({}) ORDER BY file,start_line,id",
+                placeholders(chunk.len())
+            ))?;
+            nodes.extend(
+                statement
+                    .query_map(rusqlite::params_from_iter(chunk), node_from_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+        Ok(nodes)
+    }
+
+    fn node_ids_in_files(&self, files: &BTreeSet<String>) -> Result<Vec<i64>> {
+        Ok(self
+            .nodes_in_files(files)?
+            .into_iter()
+            .map(|node| node.id)
+            .collect())
+    }
+
+    fn nodes_by_ids(&self, ids: &BTreeSet<i64>) -> Result<Vec<Node>> {
+        let ids = ids.iter().collect::<Vec<_>>();
+        let mut nodes = Vec::new();
+        for chunk in ids.chunks(SQL_CHUNK) {
+            let mut statement = self.db.prepare(&format!(
+                "SELECT id,kind,canonical_name,crate_name,file,start_line,end_line,visibility,content_hash FROM nodes WHERE id IN ({}) ORDER BY id",
+                placeholders(chunk.len())
+            ))?;
+            nodes.extend(
+                statement
+                    .query_map(rusqlite::params_from_iter(chunk), node_from_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+        Ok(nodes)
+    }
+
+    /// Both endpoints of every edge matching `filter`, whose numbered
+    /// parameters are bound to `values`.
+    fn edge_endpoints<T: rusqlite::ToSql>(
+        &self,
+        filter: &str,
+        values: &[T],
+    ) -> Result<BTreeSet<i64>> {
+        let mut endpoints = BTreeSet::new();
+        let mut statement = self
+            .db
+            .prepare(&format!("SELECT src,dst FROM edges WHERE {filter}"))?;
+        let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (source, target) = row?;
+            endpoints.insert(source);
+            endpoints.insert(target);
+        }
+        Ok(endpoints)
+    }
+
+    /// Whether a changed file defines public items, traits, impls, or macros,
+    /// whose edits can change compiler-resolved relationships anywhere.
+    fn exposes_shared_api(&self, files: &BTreeSet<String>) -> Result<bool> {
+        for file in files {
+            let exposed = self
+                .db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM nodes WHERE file=?1 AND (visibility='public' OR kind IN ('trait','impl','macro_rules!')))",
+                    [file],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap_or(true);
+            if exposed {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Re-parses changed source files into the node table and returns every
+    /// file whose syntax evidence must be re-derived.
+    ///
+    /// A symbol that still exists keeps its node id (matched by kind and
+    /// canonical name, in source order), so edges from unchanged files, use
+    /// cases, decision links, and vectors attached to it survive. Removed
+    /// symbols are deleted with their dependent rows. Because static references
+    /// resolve by short name, a name that appears or disappears can change how
+    /// any file's references resolve; files mentioning such a name are added to
+    /// the result, as are files whose edges pointed at a removed symbol.
+    fn apply_source_changes(
+        &self,
+        files: &BTreeSet<String>,
+        inputs: &BTreeMap<String, (String, String)>,
+        touched: &mut BTreeSet<i64>,
+    ) -> Result<BTreeSet<String>> {
+        let packages = self.stored_packages()?;
+        let mut affected = files.clone();
+        let mut changed_names = BTreeSet::new();
+        let mut removed = Vec::new();
+        let mut unreadable: BTreeSet<String> = self
+            .metadata_value("unreadable_inputs")?
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default();
+        for file in files {
+            unreadable.remove(file);
+            let mut previous: HashMap<(String, String), VecDeque<Node>> = HashMap::new();
+            for node in self.nodes_in_files(&BTreeSet::from([file.clone()]))? {
+                previous
+                    .entry((node.kind.clone(), node.canonical_name.clone()))
+                    .or_default()
+                    .push_back(node);
+            }
+            let path = self.root.join(file);
+            let parsed = if path.is_file() {
+                self.parse_source_file(&path, &packages).unwrap_or_else(|| {
+                    unreadable.insert(file.clone());
+                    Vec::new()
+                })
+            } else {
+                Vec::new()
+            };
+            for symbol in parsed {
+                let key = (symbol.kind.clone(), symbol.canonical_name.clone());
+                match previous.get_mut(&key).and_then(VecDeque::pop_front) {
+                    Some(existing) => self.update_node(existing.id, &symbol)?,
+                    None => {
+                        changed_names.insert(short_name(&symbol.canonical_name).to_owned());
+                        self.insert_node(symbol)?;
+                    }
+                }
+            }
+            for node in previous.into_values().flatten() {
+                changed_names.insert(short_name(&node.canonical_name).to_owned());
+                removed.push(node.id);
+            }
+        }
+        for chunk in removed.chunks(SQL_CHUNK) {
+            let marks = placeholders(chunk.len());
+            let filter = format!("src IN ({marks}) OR dst IN ({marks})");
+            touched.extend(self.edge_endpoints(&filter, chunk)?);
+            let mut statement = self.db.prepare(&format!(
+                "SELECT metadata FROM edges WHERE provenance='Syntax' AND ({filter})"
+            ))?;
+            let metadata = statement
+                .query_map(rusqlite::params_from_iter(chunk), |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            affected.extend(metadata.iter().flat_map(|value| edge_contributors(value)));
+            self.db.execute(
+                &format!("DELETE FROM nodes WHERE id IN ({marks})"),
+                rusqlite::params_from_iter(chunk),
+            )?;
+        }
+        affected.extend(self.rust_files_mentioning(&changed_names, inputs)?);
+        self.db.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES ('unreadable_inputs', ?1)",
+            [serde_json::to_string(&unreadable)?],
+        )?;
+        Ok(affected)
+    }
+
+    /// Indexed Rust files containing any of `names` as a whole word. This is a
+    /// text scan without parsing, and runs only when the set of defined symbol
+    /// names changes.
+    fn rust_files_mentioning(
+        &self,
+        names: &BTreeSet<String>,
+        inputs: &BTreeMap<String, (String, String)>,
+    ) -> Result<BTreeSet<String>> {
+        let identifiers = names
+            .iter()
+            .filter(|name| {
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|character| character.is_alphanumeric() || character == '_')
+            })
+            .map(|name| regex::escape(name))
+            .collect::<Vec<_>>();
+        if identifiers.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let pattern = Regex::new(&format!(r"\b(?:{})\b", identifiers.join("|")))?;
+        Ok(inputs
+            .keys()
+            .filter(|path| path.ends_with(".rs"))
+            .filter(|path| {
+                read_source_text(&self.root.join(path)).is_some_and(|text| pattern.is_match(&text))
+            })
+            .cloned()
+            .collect())
+    }
+
+    /// Replaces the syntax edges and unresolved references derived from
+    /// `files` and returns the endpoints of every edge removed or added.
+    fn reindex_file_edges(
+        &self,
+        files: &BTreeSet<String>,
+        revision: &str,
+    ) -> Result<BTreeSet<i64>> {
+        let mut touched = self.withdraw_implements_contributors(files)?;
+        let files = files.iter().collect::<Vec<_>>();
+        for chunk in files.chunks(SQL_CHUNK) {
+            let marks = placeholders(chunk.len());
+            let filter = format!(
+                "provenance IN ('Syntax','StaticIndex') AND kind!='IMPLEMENTS' AND json_extract(metadata,'$.file') IN ({marks})"
+            );
+            touched.extend(self.edge_endpoints(&filter, chunk)?);
+            self.db.execute(
+                &format!("DELETE FROM edges WHERE {filter}"),
+                rusqlite::params_from_iter(chunk),
+            )?;
+            self.db.execute(
+                &format!("DELETE FROM unresolved_references WHERE file IN ({marks})"),
+                rusqlite::params_from_iter(chunk),
+            )?;
+        }
+        let selected = files
+            .iter()
+            .map(|file| (*file).clone())
+            .collect::<BTreeSet<_>>();
+        let nodes = self.all_nodes()?;
+        self.index_static_references(&nodes, Some(&selected), revision)?;
+        self.index_structural_edges(&nodes, Some(&selected), revision)?;
+        for chunk in files.chunks(SQL_CHUNK) {
+            let marks = placeholders(chunk.len());
+            touched.extend(self.edge_endpoints(
+                &format!(
+                    "provenance='Syntax' AND (json_extract(metadata,'$.file') IN ({marks}) \
+                     OR EXISTS(SELECT 1 FROM json_each(edges.metadata,'$.files') WHERE value IN ({marks})))"
+                ),
+                chunk,
+            )?);
+        }
+        Ok(touched)
+    }
+
+    /// Removes `files` from the contributors of IMPLEMENTS edges, deleting
+    /// the edges no remaining contributor yields, and returns their endpoints.
+    /// Remaining contributors are unaffected files whose impl headers and name
+    /// resolution are unchanged, so their evidence still stands.
+    fn withdraw_implements_contributors(&self, files: &BTreeSet<String>) -> Result<BTreeSet<i64>> {
+        let edges: Vec<(i64, i64, i64, String)> = self
+            .db
+            .prepare("SELECT id,src,dst,metadata FROM edges WHERE provenance='Syntax' AND kind='IMPLEMENTS'")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut touched = BTreeSet::new();
+        for (id, source, target, metadata) in edges {
+            let contributors = edge_contributors(&metadata);
+            if contributors.is_disjoint(files) {
+                continue;
+            }
+            touched.extend([source, target]);
+            let remaining = contributors
+                .difference(files)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if remaining.is_empty() {
+                self.db.execute("DELETE FROM edges WHERE id=?1", [id])?;
+            } else {
+                self.db.execute(
+                    "UPDATE edges SET metadata=?1 WHERE id=?2",
+                    params![contributors_metadata(&remaining).to_string(), id],
+                )?;
+            }
+        }
+        Ok(touched)
+    }
+
+    /// Replaces the stored documents for changed non-source inputs.
+    fn refresh_documents(&self, paths: &BTreeSet<String>, revision: &str) -> Result<()> {
+        let mut stale = BTreeSet::new();
+        for path in paths {
+            let ids: Vec<i64> = self
+                .db
+                .prepare("SELECT id FROM documents WHERE path=?1")?
+                .query_map([path], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            stale.extend(ids.iter().map(i64::to_string));
+            self.db
+                .execute("DELETE FROM documents WHERE path=?1", [path])?;
+        }
+        self.delete_search_rows("document", &stale)?;
+        let existing = paths
+            .iter()
+            .map(|path| self.root.join(path))
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+        let inserted = self.index_documents(&existing, revision)?;
+        self.insert_document_search_rows(&inserted)
     }
 
     /// Rebuilds the full-text index atomically.
     ///
-    /// The body runs `DELETE` followed by one insert per node. Outside a
+    /// The body runs `DELETE` followed by one insert per row. Outside a
     /// transaction, a failure part-way through — a busy writer, an I/O error,
     /// a killed process — committed the delete and left the published search
     /// index empty, so every search, locate, and decision lookup silently
-    /// returned nothing until the next full reindex.
+    /// returned nothing until the next full reindex. Only a full reindex
+    /// rebuilds everything; incremental refreshes and memory writes replace
+    /// their own rows.
     fn rebuild_search_index(&self) -> Result<()> {
-        self.db.execute_batch("SAVEPOINT rebuild_search_index")?;
-        match self.rebuild_search_index_inner() {
-            Ok(value) => {
-                self.db.execute_batch("RELEASE rebuild_search_index")?;
-                Ok(value)
+        self.with_search_savepoint("rebuild_search_index", |service| {
+            service.db.execute("DELETE FROM search_index", [])?;
+            service.insert_node_search_rows(&service.all_nodes()?)?;
+            let documents: Vec<i64> = service
+                .db
+                .prepare("SELECT id FROM documents ORDER BY id")?
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            service.insert_document_search_rows(&documents)?;
+            service.insert_commit_search_rows()?;
+            service.insert_memory_search_rows()
+        })
+    }
+
+    /// Replaces the full-text rows of human and project memory — decisions,
+    /// steerings, work items, problem records, and quality constraints — after
+    /// one of them is written. Database-only: unlike a full rebuild it never
+    /// re-reads source files, so recording a decision costs the same in a large
+    /// workspace as in a small one.
+    pub(crate) fn refresh_memory_search_rows(&self) -> Result<()> {
+        self.with_search_savepoint("refresh_memory_search", |service| {
+            for entity_type in MEMORY_SEARCH_ENTITIES {
+                service.db.execute(
+                    "DELETE FROM search_index WHERE entity_type=?1",
+                    [entity_type],
+                )?;
+            }
+            service.insert_memory_search_rows()
+        })
+    }
+
+    fn with_search_savepoint(
+        &self,
+        name: &str,
+        operation: impl FnOnce(&Self) -> Result<()>,
+    ) -> Result<()> {
+        self.db.execute_batch(&format!("SAVEPOINT {name}"))?;
+        match operation(self) {
+            Ok(()) => {
+                self.db.execute_batch(&format!("RELEASE {name}"))?;
+                Ok(())
             }
             Err(error) => {
-                let _ = self.db.execute_batch(
-                    "ROLLBACK TO rebuild_search_index; RELEASE rebuild_search_index",
-                );
+                let _ = self
+                    .db
+                    .execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name}"));
                 Err(error)
             }
         }
     }
 
-    fn rebuild_search_index_inner(&self) -> Result<()> {
-        self.db.execute("DELETE FROM search_index", [])?;
-        for node in self.all_nodes()? {
-            let body = self
-                .source_slice(&node, "full-text index", "INDEXES")
-                .map(|slice| trim_text(&slice.source, MAX_SEARCH_BODY_BYTES))
+    /// Deletes the full-text rows of the given entities. The entity columns are
+    /// unindexed, so their row ids are collected in one pass and deleted by id.
+    fn delete_search_rows(&self, entity_type: &str, ids: &BTreeSet<String>) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let rows: Vec<i64> = self
+            .db
+            .prepare("SELECT rowid,entity_id FROM search_index WHERE entity_type=?1")?
+            .query_map([entity_type], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(Result::ok)
+            .filter(|(_, id)| ids.contains(id))
+            .map(|(rowid, _)| rowid)
+            .collect();
+        for rowid in rows {
+            self.db
+                .execute("DELETE FROM search_index WHERE rowid=?1", [rowid])?;
+        }
+        Ok(())
+    }
+
+    fn insert_node_search_rows(&self, nodes: &[Node]) -> Result<()> {
+        let mut sources = SourceCache::default();
+        for node in nodes {
+            let body = sources
+                .slice(&self.root, node)
+                .map(|source| trim_text(&source, MAX_SEARCH_BODY_BYTES))
                 .unwrap_or_default();
             self.db.execute(
                 "INSERT INTO search_index(entity_type,entity_id,title,path,body) VALUES ('node',?1,?2,?3,?4)",
                 params![node.id.to_string(), node.canonical_name, node.file, body],
             )?;
         }
-        {
-            let mut statement = self.db.prepare("SELECT id,path,text FROM documents")?;
-            let rows = statement.query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?;
-            for row in rows {
-                let (id, path, text) = row?;
-                self.db.execute(
-                    "INSERT INTO search_index(entity_type,entity_id,title,path,body) VALUES ('document',?1,?2,?2,?3)",
-                    params![id.to_string(), path, trim_text(&text, MAX_SEARCH_BODY_BYTES)],
-                )?;
-            }
+        Ok(())
+    }
+
+    fn insert_document_search_rows(&self, ids: &[i64]) -> Result<()> {
+        for id in ids {
+            let (path, text): (String, String) =
+                self.db
+                    .query_row("SELECT path,text FROM documents WHERE id=?1", [id], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })?;
+            self.db.execute(
+                "INSERT INTO search_index(entity_type,entity_id,title,path,body) VALUES ('document',?1,?2,?2,?3)",
+                params![id.to_string(), path, trim_text(&text, MAX_SEARCH_BODY_BYTES)],
+            )?;
         }
+        Ok(())
+    }
+
+    fn insert_commit_search_rows(&self) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO search_index(entity_type,entity_id,title,path,body) SELECT 'commit',hash,subject,'',author FROM commits",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn insert_memory_search_rows(&self) -> Result<()> {
         self.db.execute(
             "INSERT INTO search_index(entity_type,entity_id,title,path,body) SELECT 'decision',id,title,'',rationale || ' ' || applies_to || ' ' || consequences FROM decisions",
             [],
@@ -1394,10 +1542,6 @@ impl Service {
             "INSERT INTO search_index(entity_type,entity_id,title,path,body) SELECT 'work',id,title,scope_json,evidence_json || ' ' || acceptance_json || ' ' || verification_json FROM work_items",
             [],
         )?;
-        self.db.execute(
-            "INSERT INTO search_index(entity_type,entity_id,title,path,body) SELECT 'commit',hash,subject,'',author FROM commits",
-            [],
-        )?;
         quality::append_search_index(&self.db)?;
         Ok(())
     }
@@ -1408,6 +1552,39 @@ impl Service {
         entity_type: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Value>> {
+        Ok(self
+            .search_candidates(query, entity_type, limit)?
+            .into_iter()
+            .map(|(hit, _, _)| hit)
+            .collect())
+    }
+
+    /// Full-text hits that are about the query rather than sharing one
+    /// incidental word with it: each must match enough distinct meaningful
+    /// terms and rank close to the best hit. Consultation uses this; broad
+    /// discovery keeps `search_hits`.
+    fn relevant_hits(
+        &self,
+        query: &[String],
+        entity_type: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Value>> {
+        let matcher = relevance::TermMatcher::new(query);
+        if matcher.is_empty() {
+            return Ok(Vec::new());
+        }
+        let candidates =
+            self.search_candidates(query, entity_type, limit.saturating_mul(4).max(16))?;
+        Ok(relevance::retain_relevant(candidates, &matcher, limit))
+    }
+
+    /// Ranked FTS rows as `(hit, bm25, matchable text)`.
+    fn search_candidates(
+        &self,
+        query: &[String],
+        entity_type: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(Value, f64, String)>> {
         if query.iter().all(String::is_empty) {
             return Ok(Vec::new());
         }
@@ -1419,22 +1596,52 @@ impl Service {
         )?;
         Ok(statement
             .query_map(params![fts, entity_type, limit as i64], |row| {
+                let title: String = row.get(2)?;
+                let path: String = row.get(3)?;
                 let body: String = row.get(4)?;
-                Ok(json!({
-                    "entity_type": row.get::<_, String>(0)?,
-                    "entity_id": row.get::<_, String>(1)?,
-                    "title": row.get::<_, String>(2)?,
-                    "path": row.get::<_, String>(3)?,
-                    "evidence": trim_text(&body, 420),
-                    "score": row.get::<_, f64>(5)?,
-                    "provenance": "SQLiteFTS5",
-                }))
+                let score: f64 = row.get(5)?;
+                let text = format!("{title} {path} {body}");
+                Ok((
+                    json!({
+                        "entity_type": row.get::<_, String>(0)?,
+                        "entity_id": row.get::<_, String>(1)?,
+                        "title": title,
+                        "path": path,
+                        "evidence": trim_text(&body, 420),
+                        "score": score,
+                        "provenance": "SQLiteFTS5",
+                    }),
+                    score,
+                    text,
+                ))
             })?
             .collect::<rusqlite::Result<_>>()?)
     }
 
     fn search_contract_artifacts(&self, query: &str, limit: usize) -> Result<Vec<Value>> {
+        Ok(self
+            .contract_candidates(&terms(query), limit)?
+            .into_iter()
+            .map(|(hit, _, _)| hit)
+            .collect())
+    }
+
+    /// Runtime contracts that are about `query`; see `relevant_hits`.
+    fn relevant_contract_artifacts(&self, query: &str, limit: usize) -> Result<Vec<Value>> {
         let query = terms(query);
+        let matcher = relevance::TermMatcher::new(&query);
+        if matcher.is_empty() {
+            return Ok(Vec::new());
+        }
+        let candidates = self.contract_candidates(&query, limit.saturating_mul(4).max(16))?;
+        Ok(relevance::retain_relevant(candidates, &matcher, limit))
+    }
+
+    fn contract_candidates(
+        &self,
+        query: &[String],
+        limit: usize,
+    ) -> Result<Vec<(Value, f64, String)>> {
         if query.iter().all(String::is_empty) {
             return Ok(Vec::new());
         }
@@ -1444,15 +1651,23 @@ impl Service {
              WHERE search_index MATCH ?1 AND d.kind='runtime_contract' ORDER BY score LIMIT ?2",
         )?;
         Ok(statement
-            .query_map(params![fts_query(&query), limit as i64], |row| {
-                Ok(json!({
-                    "kind": row.get::<_, String>(0)?,
-                    "path": row.get::<_, String>(1)?,
-                    "evidence": trim_text(&row.get::<_, String>(2)?, 420),
-                    "score": row.get::<_, f64>(3)?,
-                    "provenance": "SQLiteFTS5",
-                    "verification": "Search evidence only; validate the artifact and its runtime consumer separately.",
-                }))
+            .query_map(params![fts_query(query), limit as i64], |row| {
+                let path: String = row.get(1)?;
+                let text: String = row.get(2)?;
+                let score: f64 = row.get(3)?;
+                let matchable = format!("{path} {text}");
+                Ok((
+                    json!({
+                        "kind": row.get::<_, String>(0)?,
+                        "path": path,
+                        "evidence": trim_text(&text, 420),
+                        "score": score,
+                        "provenance": "SQLiteFTS5",
+                        "verification": "Search evidence only; validate the artifact and its runtime consumer separately.",
+                    }),
+                    score,
+                    matchable,
+                ))
             })?
             .collect::<rusqlite::Result<_>>()?)
     }
@@ -1492,14 +1707,14 @@ impl Service {
         Ok(output)
     }
 
-    fn symbol_card(&self, node: &Node) -> Result<SymbolCard> {
-        let source = self
-            .source_slice(node, "embedding card", "EMBEDS")
-            .map(|slice| trim_text(&slice.source, 8_000))
+    fn symbol_card(&self, node: &Node, sources: &mut SourceCache) -> Result<SymbolCard> {
+        let source = sources
+            .slice(&self.root, node)
+            .map(|source| trim_text(&source, 8_000))
             .unwrap_or_default();
         let relationships = self
             .db
-            .prepare(
+            .prepare_cached(
                 "SELECT CASE WHEN edge.src=?1 THEN 'outgoing' ELSE 'incoming' END, \
                         edge.kind, related.canonical_name \
                  FROM edges edge \
@@ -1543,15 +1758,57 @@ impl Service {
         Ok(SymbolCard { text, hash })
     }
 
+    /// Vectors of the current embedding model keyed by symbol-card hash,
+    /// optionally limited to the given nodes. Vectors are content-addressed: a
+    /// card with the same hash has the same vector regardless of node id.
+    fn reusable_embeddings(&self, nodes: Option<&[i64]>) -> Result<HashMap<String, Vec<u8>>> {
+        let base = format!(
+            "SELECT content_hash,vector FROM symbol_embeddings WHERE model='{EMBEDDING_MODEL}' AND dimensions={EMBEDDING_DIMENSIONS}"
+        );
+        let mut reusable = HashMap::new();
+        let mut collect = |sql: &str, ids: &[i64]| -> Result<()> {
+            let mut statement = self.db.prepare(sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(ids), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            for row in rows {
+                let (hash, vector) = row?;
+                reusable.insert(hash, vector);
+            }
+            Ok(())
+        };
+        match nodes {
+            None => collect(&base, &[])?,
+            Some(ids) => {
+                for chunk in ids.chunks(SQL_CHUNK) {
+                    collect(
+                        &format!("{base} AND node_id IN ({})", placeholders(chunk.len())),
+                        chunk,
+                    )?;
+                }
+            }
+        }
+        Ok(reusable)
+    }
+
+    /// Builds symbol cards for `nodes` and stores their vectors. A node whose
+    /// stored card hash is unchanged keeps its row; otherwise a vector stored
+    /// under the same card hash in `reusable` is reused, and only genuinely
+    /// new cards are embedded.
     fn rebuild_symbol_embeddings(
         &self,
         nodes: &[Node],
         snapshot_id: &str,
+        reusable: &HashMap<String, Vec<u8>>,
     ) -> Result<EmbeddingBuildStats> {
         *self.embedding_cache.borrow_mut() = None;
-        let mut stats = EmbeddingBuildStats::default();
+        let mut stats = EmbeddingBuildStats {
+            cards: nodes.len(),
+            ..EmbeddingBuildStats::default()
+        };
+        let mut sources = SourceCache::default();
         for node in nodes {
-            let card = self.symbol_card(node)?;
+            let card = self.symbol_card(node, &mut sources)?;
             let existing: Option<(String, usize, String)> = self
                 .db
                 .query_row(
@@ -1572,21 +1829,34 @@ impl Service {
                 stats.reused += 1;
                 continue;
             }
-            let vector = embed_text(&card.text);
+            let vector = match reusable.get(&card.hash) {
+                Some(vector) => {
+                    stats.reused += 1;
+                    vector.clone()
+                }
+                None => {
+                    stats.embedded += 1;
+                    encode_vector(&embed_text(&card.text))
+                }
+            };
             self.db.execute(
                 "INSERT INTO symbol_embeddings(node_id,model,dimensions,vector,content_hash,semantic_snapshot) \
                  VALUES (?1,?2,?3,?4,?5,?6) \
                  ON CONFLICT(node_id) DO UPDATE SET model=excluded.model,dimensions=excluded.dimensions,vector=excluded.vector,content_hash=excluded.content_hash,semantic_snapshot=excluded.semantic_snapshot",
-                params![node.id,EMBEDDING_MODEL,EMBEDDING_DIMENSIONS,encode_vector(&vector),card.hash,snapshot_id],
+                params![node.id,EMBEDDING_MODEL,EMBEDDING_DIMENSIONS,vector,card.hash,snapshot_id],
             )?;
-            stats.embedded += 1;
         }
+        Ok(stats)
+    }
+
+    fn record_embedding_stats(&self, stats: &EmbeddingBuildStats) -> Result<()> {
         for (key, value) in [
             ("embedding_model", EMBEDDING_MODEL.to_owned()),
             ("embedding_dimensions", EMBEDDING_DIMENSIONS.to_string()),
             ("embedding_card_version", SYMBOL_CARD_VERSION.to_owned()),
             ("embedding_recomputed", stats.embedded.to_string()),
             ("embedding_reused", stats.reused.to_string()),
+            ("embedding_cards_built", stats.cards.to_string()),
             ("embedding_updated_at", Utc::now().to_rfc3339()),
         ] {
             self.db.execute(
@@ -1594,7 +1864,7 @@ impl Service {
                 params![key, value],
             )?;
         }
-        Ok(stats)
+        Ok(())
     }
 
     fn vector_nodes(&self, query: &str, limit: usize) -> Result<Vec<VectorHit>> {
@@ -1815,10 +2085,7 @@ impl Service {
         );
         let decisions = budget_values(self.decisions_for(query)?, &mut used, max_bytes);
         let steerings = budget_values(
-            self.steering_list(Some(query), 12)?["steerings"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default(),
+            self.matching_steerings(query, steering::SteeringStatus::Active, 12, false)?,
             &mut used,
             max_bytes,
         );
@@ -1850,11 +2117,17 @@ impl Service {
         ))
     }
 
-    fn refresh_git(&self, revision: &str) -> Result<()> {
+    /// Re-reads Git history and records the head it describes. History has its
+    /// own head marker: refreshing it alone never claims that the published
+    /// symbol generation matches the new head.
+    fn refresh_git(&self, revision: &str, head: Option<&str>) -> Result<()> {
         self.db.execute("DELETE FROM commits", [])?;
         self.db.execute("DELETE FROM commit_files", [])?;
         self.db.execute("DELETE FROM co_changes", [])?;
-        self.index_git(revision)
+        self.db
+            .execute("DELETE FROM search_index WHERE entity_type='commit'", [])?;
+        self.index_git(revision, head)?;
+        self.insert_commit_search_rows()
     }
 
     fn relink_decision_targets(&self) -> Result<()> {
@@ -1885,42 +2158,15 @@ impl Service {
         let mut nodes = Vec::new();
         let mut unreadable = Vec::new();
         for path in paths {
-            let relative = relative(&self.root, path);
             // An unreadable or non-UTF-8 file is recorded and skipped. Reading
             // it as an empty string silently removed every one of its symbols
             // while `index_inputs` still hashed it as healthy and current.
-            let Some(text) = read_source_text(path) else {
-                unreadable.push(relative);
+            let Some(symbols) = self.parse_source_file(path, packages) else {
+                unreadable.push(relative(&self.root, path));
                 continue;
             };
-            let lines: Vec<_> = text.lines().collect();
-            let crate_name = crate_for_file(packages, path);
-            let parsed = parse_rust_symbols(&text).unwrap_or_else(|| regex_symbols(&lines));
-            for symbol in parsed {
-                let start = symbol.start_line.max(1).min(lines.len().max(1));
-                let end = symbol.end_line.max(start).min(lines.len());
-                let mut canonical_parts = vec![relative.trim_end_matches(".rs").replace('/', "::")];
-                canonical_parts.extend(symbol.scope);
-                canonical_parts.push(symbol.name);
-                let canonical_name = canonical_parts.join("::");
-                let hash = format!(
-                    "b3:{}",
-                    blake3::hash(lines[start.saturating_sub(1)..end].join("\n").as_bytes())
-                        .to_hex()
-                );
-                self.db.execute("INSERT INTO nodes(kind, canonical_name, crate_name, file, start_line, end_line, visibility, content_hash, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", params![symbol.kind, canonical_name, crate_name, relative, start, end, symbol.visibility, hash, json!({"parser":symbol.parser}).to_string()])?;
-                let id = self.db.last_insert_rowid();
-                nodes.push(Node {
-                    id,
-                    kind: symbol.kind,
-                    canonical_name,
-                    crate_name: crate_name.clone(),
-                    file: relative.clone(),
-                    start_line: start,
-                    end_line: end,
-                    visibility: symbol.visibility,
-                    content_hash: hash,
-                });
+            for symbol in symbols {
+                nodes.push(self.insert_node(symbol)?);
             }
         }
         // Surfaced by `status()` as a degraded area rather than being silent.
@@ -1931,21 +2177,99 @@ impl Service {
         Ok(nodes)
     }
 
-    fn index_static_references(&self, nodes: &[Node], revision: &str) -> Result<()> {
+    /// Parses one Rust file into node rows, or `None` when it cannot be read.
+    fn parse_source_file(
+        &self,
+        path: &Path,
+        packages: &[(String, String, String)],
+    ) -> Option<Vec<IndexedSymbol>> {
+        let relative = relative(&self.root, path);
+        let text = read_source_text(path)?;
+        let lines: Vec<_> = text.lines().collect();
+        let crate_name = crate_for_file(packages, path);
+        let parsed = parse_rust_symbols(&text).unwrap_or_else(|| regex_symbols(&lines));
+        Some(
+            parsed
+                .into_iter()
+                .map(|symbol| {
+                    let start = symbol.start_line.max(1).min(lines.len().max(1));
+                    let end = symbol.end_line.max(start).min(lines.len());
+                    let mut canonical_parts =
+                        vec![relative.trim_end_matches(".rs").replace('/', "::")];
+                    canonical_parts.extend(symbol.scope);
+                    canonical_parts.push(symbol.name);
+                    let content_hash = format!(
+                        "b3:{}",
+                        blake3::hash(lines[start.saturating_sub(1)..end].join("\n").as_bytes())
+                            .to_hex()
+                    );
+                    IndexedSymbol {
+                        kind: symbol.kind,
+                        canonical_name: canonical_parts.join("::"),
+                        crate_name: crate_name.clone(),
+                        file: relative.clone(),
+                        start_line: start,
+                        end_line: end,
+                        visibility: symbol.visibility,
+                        content_hash,
+                        parser: symbol.parser,
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    fn insert_node(&self, symbol: IndexedSymbol) -> Result<Node> {
+        self.db.execute("INSERT INTO nodes(kind, canonical_name, crate_name, file, start_line, end_line, visibility, content_hash, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", params![symbol.kind, symbol.canonical_name, symbol.crate_name, symbol.file, symbol.start_line, symbol.end_line, symbol.visibility, symbol.content_hash, json!({"parser":symbol.parser}).to_string()])?;
+        Ok(Node {
+            id: self.db.last_insert_rowid(),
+            kind: symbol.kind,
+            canonical_name: symbol.canonical_name,
+            crate_name: symbol.crate_name,
+            file: symbol.file,
+            start_line: symbol.start_line,
+            end_line: symbol.end_line,
+            visibility: symbol.visibility,
+            content_hash: symbol.content_hash,
+        })
+    }
+
+    /// Moves an existing node to its re-parsed location and content, keeping
+    /// its id and everything attached to it.
+    fn update_node(&self, id: i64, symbol: &IndexedSymbol) -> Result<()> {
+        self.db.execute(
+            "UPDATE nodes SET crate_name=?1,start_line=?2,end_line=?3,visibility=?4,content_hash=?5,metadata=?6 WHERE id=?7",
+            params![symbol.crate_name, symbol.start_line, symbol.end_line, symbol.visibility, symbol.content_hash, json!({"parser":symbol.parser}).to_string(), id],
+        )?;
+        Ok(())
+    }
+
+    /// Records syntax reference edges originating in `files` (every Rust file
+    /// when `None`), resolving targets against all `nodes`.
+    fn index_static_references(
+        &self,
+        nodes: &[Node],
+        files: Option<&BTreeSet<String>>,
+        revision: &str,
+    ) -> Result<()> {
         let mut targets_by_name: HashMap<&str, Vec<&Node>> = HashMap::new();
+        let mut nodes_by_file: HashMap<&str, Vec<&Node>> = HashMap::new();
         for node in nodes {
             targets_by_name
                 .entry(short_name(&node.canonical_name))
                 .or_default()
                 .push(node);
+            nodes_by_file.entry(&node.file).or_default().push(node);
         }
-        self.db.execute("DELETE FROM unresolved_references", [])?;
-        for file in rust_files(&self.root) {
+        if files.is_none() {
+            self.db.execute("DELETE FROM unresolved_references", [])?;
+        }
+        for file in self.selected_rust_files(files) {
             let Some(text) = read_source_text(&file) else {
                 continue;
             };
             let rel = relative(&self.root, &file);
-            let file_nodes: Vec<&Node> = nodes.iter().filter(|node| node.file == rel).collect();
+            let file_nodes = nodes_by_file.get(rel.as_str()).cloned().unwrap_or_default();
             let mut edges = BTreeSet::new();
             let Some(references) = syntax_references(&text) else {
                 continue;
@@ -1956,7 +2280,7 @@ impl Service {
                     .iter()
                     .copied()
                     .filter(|node| node.start_line <= line_number && line_number <= node.end_line)
-                    .min_by_key(|node| node.end_line.saturating_sub(node.start_line));
+                    .min_by_key(|node| innermost_key(node));
                 let Some(source) = source else { continue };
                 let Some(name) = reference.path.last() else {
                     continue;
@@ -2008,17 +2332,31 @@ impl Service {
         Ok(())
     }
 
-    fn index_structural_edges(&self, nodes: &[Node], revision: &str) -> Result<()> {
-        for child in nodes {
-            if let Some(parent) = nodes
+    /// Records containment, implementation, and import edges derived from
+    /// `files` (every Rust file when `None`).
+    fn index_structural_edges(
+        &self,
+        nodes: &[Node],
+        files: Option<&BTreeSet<String>>,
+        revision: &str,
+    ) -> Result<()> {
+        let mut nodes_by_file: HashMap<&str, Vec<&Node>> = HashMap::new();
+        for node in nodes {
+            nodes_by_file.entry(&node.file).or_default().push(node);
+        }
+        for child in nodes
+            .iter()
+            .filter(|node| files.is_none_or(|files| files.contains(&node.file)))
+        {
+            if let Some(parent) = nodes_by_file[child.file.as_str()]
                 .iter()
+                .copied()
                 .filter(|parent| {
                     parent.id != child.id
-                        && parent.file == child.file
                         && parent.start_line <= child.start_line
                         && parent.end_line >= child.end_line
                 })
-                .min_by_key(|parent| parent.end_line.saturating_sub(parent.start_line))
+                .min_by_key(|parent| innermost_key(parent))
             {
                 self.insert_edge(EdgeRecord {
                     source: parent.id,
@@ -2035,7 +2373,7 @@ impl Service {
             r"(?m)^\s*impl(?:\s*<[^>{}]*>)?\s+([A-Za-z_][A-Za-z0-9_:]*)\s+for\s+([A-Za-z_][A-Za-z0-9_:]*)",
         )?;
         let use_pattern = Regex::new(r"(?m)^\s*(?:pub\s+)?use\s+([^;]+);")?;
-        for file in rust_files(&self.root) {
+        for file in self.selected_rust_files(files) {
             let Some(text) = read_source_text(&file) else {
                 continue;
             };
@@ -2046,23 +2384,15 @@ impl Service {
                 let (Some(trait_name), Some(type_name)) = (trait_name, type_name) else {
                     continue;
                 };
-                let source = nodes.iter().find(|node| {
+                let source = first_by_location(nodes.iter().filter(|node| {
                     short_name(&node.canonical_name) == type_name
                         && matches!(node.kind.as_str(), "struct" | "enum" | "type")
-                });
-                let target = nodes.iter().find(|node| {
+                }));
+                let target = first_by_location(nodes.iter().filter(|node| {
                     short_name(&node.canonical_name) == trait_name && node.kind == "trait"
-                });
+                }));
                 if let (Some(source), Some(target)) = (source, target) {
-                    self.insert_edge(EdgeRecord {
-                        source: source.id,
-                        target: target.id,
-                        kind: "IMPLEMENTS",
-                        confidence: 0.85,
-                        provenance: "Syntax",
-                        revision,
-                        metadata: json!({"file":rel}),
-                    })?;
+                    self.add_implements_contributor(source.id, target.id, &rel, revision)?;
                 }
             }
             for capture in use_pattern.captures_iter(&text) {
@@ -2073,13 +2403,14 @@ impl Service {
                     .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
                     .rfind(|part| !part.is_empty() && *part != "self");
                 let Some(imported) = imported else { continue };
-                let target = nodes
-                    .iter()
-                    .find(|node| short_name(&node.canonical_name) == imported);
-                let source = nodes
-                    .iter()
-                    .filter(|node| node.file == rel)
-                    .min_by_key(|node| node.start_line);
+                let target = first_by_location(
+                    nodes
+                        .iter()
+                        .filter(|node| short_name(&node.canonical_name) == imported),
+                );
+                let source = nodes_by_file
+                    .get(rel.as_str())
+                    .and_then(|file_nodes| first_by_location(file_nodes.iter().copied()));
                 if let (Some(source), Some(target)) = (source, target)
                     && source.id != target.id
                 {
@@ -2096,6 +2427,64 @@ impl Service {
             }
         }
         Ok(())
+    }
+
+    /// Absolute paths of the selected Rust files, or of every workspace Rust
+    /// file when `files` is `None`.
+    fn selected_rust_files(&self, files: Option<&BTreeSet<String>>) -> Vec<PathBuf> {
+        match files {
+            Some(files) => files
+                .iter()
+                .filter(|file| file.ends_with(".rs"))
+                .map(|file| self.root.join(file))
+                .filter(|path| path.is_file())
+                .collect(),
+            None => rust_files(&self.root),
+        }
+    }
+
+    /// Records `file` as one producer of an IMPLEMENTS edge.
+    ///
+    /// Impl headers resolve their type and trait by short name, so several
+    /// files can yield the same edge. The edge keeps every contributing file
+    /// (sorted; `file` names the first) and an incremental refresh removes it
+    /// only once no contributor yields it any more. Recording only the first
+    /// file used to drop a still-justified edge when that file was re-indexed.
+    fn add_implements_contributor(
+        &self,
+        source: i64,
+        target: i64,
+        file: &str,
+        revision: &str,
+    ) -> Result<()> {
+        let existing: Option<(i64, String)> = self
+            .db
+            .query_row(
+                "SELECT id,metadata FROM edges WHERE src=?1 AND dst=?2 AND kind='IMPLEMENTS' AND provenance='Syntax'",
+                params![source, target],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match existing {
+            Some((id, metadata)) => {
+                let mut files = edge_contributors(&metadata);
+                files.insert(file.to_owned());
+                self.db.execute(
+                    "UPDATE edges SET revision=?1,metadata=?2 WHERE id=?3",
+                    params![revision, contributors_metadata(&files).to_string(), id],
+                )?;
+                Ok(())
+            }
+            None => self.insert_edge(EdgeRecord {
+                source,
+                target,
+                kind: "IMPLEMENTS",
+                confidence: 0.85,
+                provenance: "Syntax",
+                revision,
+                metadata: contributors_metadata(&BTreeSet::from([file.to_owned()])),
+            }),
+        }
     }
 
     fn insert_edge(&self, edge: EdgeRecord<'_>) -> Result<()> {
@@ -2153,8 +2542,14 @@ impl Service {
 
     /// Index only explicit lifecycle statements. Naming conventions create a
     /// low-confidence *candidate*, never a claim that deletion is safe.
-    fn index_lifecycle_evidence(&self, nodes: &[Node], revision: &str) -> Result<()> {
-        self.db.execute("DELETE FROM lifecycle_edges", [])?;
+    /// `candidates` are scanned; replacement names resolve against all `nodes`.
+    /// Callers remove the candidates' previous evidence first.
+    fn index_lifecycle_evidence(
+        &self,
+        candidates: &[Node],
+        nodes: &[Node],
+        revision: &str,
+    ) -> Result<()> {
         let explicit = Regex::new(
             r"(?i)(?:deprecated|legacy|compat(?:ibility)?|fallback|superseded|replaced)\D{0,80}(?:use|with|by|replace(?:d)?\s+(?:with\s+)?)\s*`?([A-Za-z_][A-Za-z0-9_]*)`?",
         )?;
@@ -2169,25 +2564,23 @@ impl Service {
         )?;
         // An excerpt only contributes when it carries an explicit marker.
         let explicit_marker = Regex::new(r"#\[deprecated|#\[allow\(deprecated\)\]")?;
-        for node in nodes {
-            let Some(text) = read_source_text(&self.root.join(&node.file)) else {
+        let mut sources = SourceCache::default();
+        for node in candidates {
+            let Some(lines) = sources.lines(&self.root, &node.file) else {
                 continue;
             };
-            let start = node.start_line.saturating_sub(5);
-            let excerpt = text
-                .lines()
-                .skip(start)
-                .take(28)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let start = node.start_line.saturating_sub(5).min(lines.len());
+            let excerpt = lines[start..(start + 28).min(lines.len())].join("\n");
             let replacement = explicit
                 .captures(&excerpt)
                 .and_then(|capture| capture.get(1))
                 .map(|capture| capture.as_str())
                 .and_then(|name| {
-                    nodes
-                        .iter()
-                        .find(|other| short_name(&other.canonical_name) == name)
+                    first_by_location(
+                        nodes
+                            .iter()
+                            .filter(|other| short_name(&other.canonical_name) == name),
+                    )
                 });
             let inferred_lifecycle = lifecycle_name.is_match(short_name(&node.canonical_name))
                 || explicit_marker.is_match(&excerpt);
@@ -2206,17 +2599,48 @@ impl Service {
         Ok(())
     }
 
-    fn index_proposed_work(&self, revision: &str) -> Result<()> {
+    /// Scans TODO/FIXME markers in `paths` (every text input when `None`).
+    /// Items of unscanned files keep their evidence and are re-validated
+    /// against `revision`.
+    fn index_proposed_work(&self, paths: Option<&BTreeSet<String>>, revision: &str) -> Result<()> {
         let marker = Regex::new(r"(?i)\b(TODO|FIXME|XXX)\b\s*[:\-]?\s*(.+)")?;
         let indexed_at = Utc::now().to_rfc3339();
+        let absent = json!([
+            "Source marker absent at the current snapshot; review or remove this proposed item."
+        ])
+        .to_string();
         // Preserve the item for architectural history, but make disappearing
         // automatic evidence visibly stale instead of silently trusting it.
-        self.db.execute(
-            "UPDATE work_items SET evidence_json=?1, confidence=0.20, last_validated_snapshot=?2, updated_at=?3 \
-             WHERE provenance='SourceDoc' AND discovered_from='TODO/FIXME scanner' AND status='proposed'",
-            params![json!(["Source marker absent at the current snapshot; review or remove this proposed item."]).to_string(), revision, indexed_at],
-        )?;
-        for path in all_text_files(&self.root) {
+        let files = match paths {
+            None => {
+                self.db.execute(
+                    "UPDATE work_items SET evidence_json=?1, confidence=0.20, last_validated_snapshot=?2, updated_at=?3 \
+                     WHERE provenance='SourceDoc' AND discovered_from='TODO/FIXME scanner' AND status='proposed'",
+                    params![absent, revision, indexed_at],
+                )?;
+                all_text_files(&self.root)
+            }
+            Some(paths) => {
+                self.db.execute(
+                    "UPDATE work_items SET last_validated_snapshot=?1 \
+                     WHERE provenance='SourceDoc' AND discovered_from='TODO/FIXME scanner' AND status='proposed'",
+                    [revision],
+                )?;
+                for path in paths {
+                    self.db.execute(
+                        "UPDATE work_items SET evidence_json=?1, confidence=0.20, updated_at=?2 \
+                         WHERE provenance='SourceDoc' AND discovered_from='TODO/FIXME scanner' AND status='proposed' AND scope_json=?3",
+                        params![absent, indexed_at, json!([path]).to_string()],
+                    )?;
+                }
+                paths
+                    .iter()
+                    .map(|path| self.root.join(path))
+                    .filter(|path| path.is_file() && input_kind(path).is_some())
+                    .collect()
+            }
+        };
+        for path in files {
             let relative_path = relative(&self.root, &path);
             let Some(text) = read_source_text(&path) else {
                 continue;
@@ -2248,7 +2672,11 @@ impl Service {
         Ok(())
     }
 
-    fn index_git(&self, revision: &str) -> Result<()> {
+    fn index_git(&self, revision: &str, head: Option<&str>) -> Result<()> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES ('git_history_head', ?1)",
+            [head.unwrap_or_default()],
+        )?;
         let Some(log) = git_output(
             &self.root,
             &[
@@ -2324,9 +2752,11 @@ impl Service {
         Ok(())
     }
 
-    fn index_documents_and_use_cases(&self, nodes: &[Node], revision: &str) -> Result<()> {
-        for path in all_text_files(&self.root) {
-            let Some(input_kind) = input_kind(&path) else {
+    /// Stores non-source text inputs among `paths` and returns their row ids.
+    fn index_documents(&self, paths: &[PathBuf], revision: &str) -> Result<Vec<i64>> {
+        let mut inserted = Vec::new();
+        for path in paths {
+            let Some(input_kind) = input_kind(path) else {
                 continue;
             };
             if input_kind == "source" {
@@ -2337,7 +2767,7 @@ impl Service {
                 "configuration" | "cargo" => "configuration",
                 _ => "source_doc",
             };
-            let Some(text) = read_source_text(&path) else {
+            let Some(text) = read_source_text(path) else {
                 continue;
             };
             // Documents are stored whole; cap them so one checked-in dump
@@ -2345,16 +2775,25 @@ impl Service {
             let text = trim_text(&text, MAX_DOCUMENT_BYTES);
             self.db.execute(
                 "INSERT INTO documents(kind, path, text, revision) VALUES (?1, ?2, ?3, ?4)",
-                params![kind, relative(&self.root, &path), text, revision],
+                params![kind, relative(&self.root, path), text, revision],
             )?;
+            inserted.push(self.db.last_insert_rowid());
         }
+        Ok(inserted)
+    }
+
+    /// Infers use cases from the test symbols among `nodes`.
+    fn index_use_cases(&self, nodes: &[Node], revision: &str) -> Result<()> {
         for node in nodes.iter().filter(|node| {
             node.file.contains("test") || short_name(&node.canonical_name).starts_with("test_")
         }) {
             let name = short_name(&node.canonical_name).replace('_', " ");
             let id = format!("usecase:{}", slug(&format!("{}-{}", node.file, name)));
+            // An upsert, not a replace: replacing the row cascaded away the
+            // links of every other test that shares the use case.
             self.db.execute(
-                "INSERT OR REPLACE INTO use_cases(id, name, description, provenance, confidence, revision) VALUES (?1, ?2, ?3, 'AgentInference', 0.60, ?4)",
+                "INSERT INTO use_cases(id, name, description, provenance, confidence, revision) VALUES (?1, ?2, ?3, 'AgentInference', 0.60, ?4) \
+                 ON CONFLICT(id) DO UPDATE SET name=excluded.name,description=excluded.description,confidence=excluded.confidence,revision=excluded.revision",
                 params![id, name, format!("Behavior exercised by {}", node.canonical_name), revision],
             )?;
             self.db.execute(
@@ -2892,6 +3331,11 @@ impl Service {
     }
 
     pub fn record_decision(&self, input: RecordDecision) -> Result<Value> {
+        let result = self.with_memory_write(|| self.record_decision_inner(&input))?;
+        Ok(self.record_decision_materialization(&input, result))
+    }
+
+    fn record_decision_inner(&self, input: &RecordDecision) -> Result<Value> {
         quality::validate_choice("decision status", &input.status, DECISION_STATUSES)?;
         let mut supersedes: Vec<String> = Vec::new();
         for id in input.supersedes.iter().map(|id| id.trim()) {
@@ -2927,7 +3371,6 @@ impl Service {
                 "superseded",
                 input.recorded_by.trim(),
                 &format!("superseded by {id}"),
-                &format!("superseded by {id}"),
                 &now,
             )?;
         }
@@ -2942,49 +3385,29 @@ impl Service {
                 params![id, node_id, target],
             )?;
         }
-        self.db.execute(
-            "INSERT OR REPLACE INTO metadata(key, value) VALUES ('revision', ?1)",
-            [serde_json::to_string(&self.revision())?],
-        )?;
-        let path = if input.materialize {
-            let dir = self.root.join("docs/decisions");
-            fs::create_dir_all(&dir)?;
-            let path = dir.join(format!("{:04}-{}.md", next, slug(&input.title)));
-            fs::write(&path, decision_markdown(&id, &input, &supersedes))?;
-            Some(relative(&self.root, &path))
-        } else {
-            None
-        };
-        self.rebuild_search_index()?;
+        self.refresh_memory_search_rows()?;
         Ok(
-            json!({"id":id,"status":input.status,"supersedes":supersedes,"resource_uri":format!("rustrepo://decision/{id}"),"materialized_path":path,"revision":self.revision()}),
+            json!({"id":id,"status":input.status,"supersedes":supersedes,"resource_uri":format!("rustrepo://decision/{id}"),"materialized_path":null,"committed":true,"revision":self.revision()}),
         )
     }
 
     /// Retires an accepted decision without replacing it. The record stays in
     /// the ledger as history; only a new decision can take its place.
     pub fn retire_decision(&self, input: RetireDecision) -> Result<Value> {
+        let result = self.with_memory_write(|| self.retire_decision_inner(&input))?;
+        Ok(self.retire_decision_materialization(&input, result))
+    }
+
+    fn retire_decision_inner(&self, input: &RetireDecision) -> Result<Value> {
         let id = input.id.trim();
         ensure!(!id.is_empty(), "id is required");
         let retired_by = input.retired_by.trim();
         ensure!(!retired_by.is_empty(), "retired_by is required");
         self.ensure_decision_accepted(id, "retire")?;
         let note = input.note.trim();
-        let status_line = if note.is_empty() {
-            "retired".to_owned()
-        } else {
-            format!("retired: {note}")
-        };
-        let path = self.close_decision(
-            id,
-            "retired",
-            retired_by,
-            note,
-            &status_line,
-            &Utc::now().to_rfc3339(),
-        )?;
+        self.close_decision(id, "retired", retired_by, note, &Utc::now().to_rfc3339())?;
         let mut decision = self.decision_resource(id)?;
-        decision["materialized_path"] = json!(path);
+        decision["materialized_path"] = Value::Null;
         Ok(decision)
     }
 
@@ -3007,17 +3430,15 @@ impl Service {
     }
 
     /// Moves an accepted decision to a terminal status, appends its review
-    /// history row, and rewrites the status line of its materialized markdown
-    /// when one exists. Returns the updated markdown path.
+    /// history row. Optional Markdown is exported after the database commits.
     fn close_decision(
         &self,
         id: &str,
         status: &str,
         actor: &str,
         note: &str,
-        status_line: &str,
         now: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<()> {
         self.db.execute(
             "UPDATE decisions SET status=?1 WHERE id=?2",
             params![status, id],
@@ -3026,12 +3447,7 @@ impl Service {
             "INSERT INTO decision_reviews(decision_id,action,actor,note,created_at) VALUES (?1,?2,?3,?4,?5)",
             params![id, status, actor, note, now],
         )?;
-        let sequence: i64 =
-            self.db
-                .query_row("SELECT sequence FROM decisions WHERE id=?1", [id], |row| {
-                    row.get(0)
-                })?;
-        self.update_materialized_decision(sequence, status_line)
+        Ok(())
     }
 
     /// Rewrites the `Status:` line of a decision materialized under
@@ -3078,56 +3494,6 @@ impl Service {
         Ok(Some(relative(&self.root, &path)))
     }
 
-    pub fn record_steering(&self, input: RecordSteering) -> Result<Value> {
-        quality::validate_choice("steering status", &input.status, STEERING_STATUSES)?;
-        if let Some(expires_at) = input.expires_at.as_deref() {
-            // An unparsable expiry used to be stored and then read as "never
-            // expires", so a typo silently made a steering permanent.
-            chrono::DateTime::parse_from_rfc3339(expires_at).with_context(|| {
-                format!("expires_at `{expires_at}` is not an RFC 3339 timestamp")
-            })?;
-        }
-        let next: i64 = self.db.query_row(
-            "SELECT COALESCE(MAX(sequence),0)+1 FROM steerings",
-            [],
-            |row| row.get(0),
-        )?;
-        let id = format!("STR-{next:04}");
-        let revision = self.revision();
-        self.db.execute(
-            "INSERT INTO steerings(id,sequence,status,priority,title,instruction,scope,expires_at,revision,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![id,next,input.status,input.priority,input.title,input.instruction,serde_json::to_string(&input.scope)?,input.expires_at,revision.workspace_digest,Utc::now().to_rfc3339()],
-        )?;
-        self.rebuild_search_index()?;
-        Ok(
-            json!({"id":id,"status":input.status,"priority":input.priority,"scope":input.scope,"revision":revision}),
-        )
-    }
-
-    pub fn steering_list(&self, query: Option<&str>, limit: usize) -> Result<Value> {
-        let query = query.unwrap_or("");
-        let ids: Vec<String> = if query.is_empty() {
-            self.db
-                .prepare("SELECT id FROM steerings ORDER BY sequence DESC LIMIT ?1")?
-                .query_map([limit as i64], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?
-        } else {
-            self.search_hits(&terms(query), Some("steering"), limit)?
-                .into_iter()
-                .filter_map(|hit| hit["entity_id"].as_str().map(str::to_owned))
-                .collect()
-        };
-        let mut output = Vec::new();
-        for id in ids {
-            output.push(self.db.query_row(
-                "SELECT id,status,priority,title,instruction,scope,expires_at,revision,created_at FROM steerings WHERE id=?1",
-                [id],
-                |row| Ok(json!({"id":row.get::<_,String>(0)?,"status":row.get::<_,String>(1)?,"priority":row.get::<_,String>(2)?,"title":row.get::<_,String>(3)?,"instruction":row.get::<_,String>(4)?,"scope":serde_json::from_str::<Value>(&row.get::<_,String>(5)?).unwrap_or_else(|_|json!([])),"expires_at":row.get::<_,Option<String>>(6)?,"revision":row.get::<_,String>(7)?,"created_at":row.get::<_,String>(8)?})),
-            )?);
-        }
-        Ok(json!({"query":query,"steerings":output,"snapshot":self.snapshot()}))
-    }
-
     pub fn validate_change(
         &self,
         context_id: &str,
@@ -3137,35 +3503,58 @@ impl Service {
         let source = diff
             .map(|text| DiffSource::Inline(text.to_owned()))
             .unwrap_or(DiffSource::Pending);
-        self.validate_change_from_source(context_id, &source, run_checks)
+        self.validate_change_from_source(Some(context_id), &source, run_checks)
     }
 
     /// Validate a locally resolved patch or Git comparison. Checks and static
     /// analysis still run against the current worktree, never a checkout of HEAD.
+    ///
+    /// A prepared context may be validated any number of times, e.g. at each
+    /// milestone of a long refactor. Without one, an unprepared context is
+    /// recorded so diff-driven obligations can still be tracked and recorded;
+    /// only the before/after comparisons that need prepared evidence (the
+    /// architecture delta and the expected change surface) are unavailable.
     pub fn validate_change_from_source(
         &self,
-        context_id: &str,
+        context_id: Option<&str>,
         source: &DiffSource,
         run_checks: bool,
     ) -> Result<Value> {
-        let payload: String = self
-            .db
-            .query_row(
-                "SELECT payload FROM change_contexts WHERE id=?1",
-                [context_id],
-                |r| r.get(0),
-            )
-            .optional()?
-            .context("unknown change context")?;
-        let context: Value = serde_json::from_str(&payload)?;
+        let source_before = self.revision();
+        let index_before = index_freshness(&self.root, &self.db)?;
         let resolved = source.resolve(&self.root)?;
         let diff = resolved.text;
         let changed_files = changed_files_in_diff(&diff);
+        let (context_id, context) = match context_id {
+            Some(context_id) => {
+                let payload: String = self
+                    .db
+                    .query_row(
+                        "SELECT payload FROM change_contexts WHERE id=?1",
+                        [context_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .context("unknown change context")?;
+                (context_id.to_owned(), serde_json::from_str(&payload)?)
+            }
+            None => self.record_unprepared_context(&changed_files)?,
+        };
+        let context_id = context_id.as_str();
+        let prepared = context["prepared"] != false;
         let architecture_baseline_truncated = context
             .pointer("/architecture_guard/summary/findings_truncated")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let architecture_delta = if architecture_baseline_truncated {
+        let architecture_delta = if !prepared {
+            json!({
+                "policy":"advisory_only",
+                "available":false,
+                "status":"unavailable",
+                "reason":"no prepared context",
+                "note":"Run change.prepare before the change to capture an architecture baseline; one prepared context serves every later validation."
+            })
+        } else if architecture_baseline_truncated {
             json!({
                 "policy":"advisory_only",
                 "available":false,
@@ -3213,7 +3602,11 @@ impl Service {
             .filter_map(Value::as_str)
             .map(str::to_string)
             .collect();
-        let unmodified: Vec<_> = expected.difference(&changed_files).cloned().collect();
+        let unmodified = if prepared {
+            json!(expected.difference(&changed_files).collect::<Vec<_>>())
+        } else {
+            json!({"status":"unavailable","reason":"no prepared context"})
+        };
         self.execution.check()?;
         let verification = if run_checks {
             let coordinator = coordination::Coordinator::open(&self.root, self.execution.clone())?;
@@ -3299,6 +3692,7 @@ impl Service {
             .filter(|symbol| diff.contains(symbol))
             .collect::<Vec<_>>();
         self.execution.check()?;
+        let semantic_diagnostics = self.validation_diagnostics(&changed_files)?;
         let blocking = self.blocking_obligation_status(context_id, run_checks)?;
         let validation_status = validation_verdict(
             run_checks,
@@ -3307,9 +3701,56 @@ impl Service {
             &learned_checks,
             &blocking,
         );
+        let source_after = self.revision();
+        let index_after = index_freshness(&self.root, &self.db)?;
+        let source_unchanged = source_before == source_after;
+        let generation_unchanged = index_before.generation == index_after.generation;
+        let skipped_inputs = resolved
+            .scope
+            .pointer("/untracked/skipped")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty());
+        let review_evidence = json!({
+            "status": if !source_unchanged || !generation_unchanged { "changed_during_review" }
+                else if index_before.stale() || skipped_inputs { "incomplete" } else { "current" },
+            "source_unchanged": source_unchanged,
+            "source_before": source_before, "source_after": source_after,
+            "index": {"generation": index_before.generation, "generation_after": index_after.generation,
+                "stable_during_review": generation_unchanged, "stale": index_before.stale(),
+                "reason": index_before.reason(), "workspace_digest": index_before.workspace_digest},
+            "diff_complete": !skipped_inputs,
+            "architecture": {"authority": "advisory", "backend": "live_worktree"},
+            "semantic_correctness": "not_established",
+            "delivery_authorized": false,
+            "next": "Use live source and revision-bound verification.plan/run for supported profiles; execute applicable runtime tests and benchmarks. A completed review is not proof of semantic correctness.",
+        });
         Ok(
-            json!({"context_id":context_id,"diff_scope":resolved.scope,"analysis_target":"current_worktree","revision_before":context.get("revision"),"revision_after":self.revision(),"snapshot":self.snapshot(),"changed_files":changed_files,"expected_affected_files":expected,"unmodified_expected_callers":unmodified,"new_references":"Re-run change.prepare after signature changes to refresh static candidates.","architectural_violations":self.decision_conflicts(&diff)?,"architecture_delta":architecture_delta,"legacy_paths_touched":legacy_left,"unresolved_edges":context.get("unresolved_edges"),"recommended_tests":context.get("tests"),"recommended_commands":["Read project.contract and use verification.plan for supported profiles and current lint policy.","Run applicable artifact and human-approved specialized checks; report every unrun profile."],"validation_queue":validation_queue,"checks":checks,"artifact_checks":artifact_checks,"learned_checks":learned_checks,"validation_status":validation_status,"verification":verification,"blocking":blocking,"uncertainty":"Artifact validators and architecture detectors can identify current static evidence, but not runtime registration, generated-code drift, external-consumer compatibility, or deployment behavior."}),
+            json!({"context_id":context_id,"prepared":prepared,"diff_scope":resolved.scope,"analysis_target":"current_worktree","revision_before":context.get("revision"),"revision_after":self.revision(),"snapshot":self.snapshot(),"changed_files":changed_files,"expected_affected_files":if prepared { json!(expected) } else { json!({"status":"unavailable","reason":"no prepared context"}) },"unmodified_expected_callers":unmodified,"new_references":"Re-run change.prepare after signature changes to refresh static candidates.","architectural_violations":self.decision_conflicts(&diff)?,"architecture_delta":architecture_delta,"legacy_paths_touched":legacy_left,"unresolved_edges":context.get("unresolved_edges"),"recommended_tests":context.get("tests"),"recommended_commands":["Read project.contract and use verification.plan for supported profiles and current lint policy.","Run applicable artifact and human-approved specialized checks; report every unrun profile."],"validation_queue":validation_queue,"checks":checks,"artifact_checks":artifact_checks,"learned_checks":learned_checks,"validation_status":validation_status,"review_evidence":review_evidence,"verification":verification,"semantic_diagnostics":semantic_diagnostics,"blocking":blocking,"uncertainty":"Artifact validators and architecture detectors can identify current static evidence, but not runtime registration, generated-code drift, external-consumer compatibility, or deployment behavior."}),
         )
+    }
+
+    /// Persists a context for a validation that has no prepared one, so the
+    /// obligations activated from its diff have an owner that
+    /// `validation.record` and later validations can address. It carries no
+    /// architecture baseline or expected change surface.
+    fn record_unprepared_context(
+        &self,
+        changed_files: &BTreeSet<String>,
+    ) -> Result<(String, Value)> {
+        let context_id = format!(
+            "ctx_{}",
+            &blake3::hash(format!("unprepared:{changed_files:?}:{}", Utc::now()).as_bytes())
+                .to_hex()[..12]
+        );
+        let nodes = self
+            .all_nodes()?
+            .into_iter()
+            .filter(|node| changed_files.contains(&node.file))
+            .collect::<Vec<_>>();
+        let intent = "validation without a prepared context";
+        let payload = json!({"context_id":context_id,"intent":intent,"prepared":false,"revision":self.revision(),"snapshot":self.snapshot(),"changed_files":changed_files,"lifecycle":self.lifecycle_for(&nodes)?});
+        self.db.execute("INSERT INTO change_contexts(id, intent, payload, revision, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![context_id, intent, payload.to_string(), self.revision().workspace_digest, Utc::now().to_rfc3339()])?;
+        Ok((context_id, payload))
     }
 
     /// Reports whether any obligation a human marked `enforcement: "block"` is
@@ -3444,114 +3885,217 @@ impl Service {
     /// A bounded, read-only briefing that gives an attached agent repository
     /// guidance before it plans, answers, or acts on any repository topic.
     pub fn consult(&self, topic: &str, budget: usize) -> Result<Value> {
-        ensure!(!topic.trim().is_empty(), "topic is required");
-        let token_budget = budget.clamp(250, 20_000);
-        let max_bytes = token_budget.saturating_mul(4);
-        let mut used = 0usize;
-        let (decisions, omitted_decisions) =
-            budget_section(self.governing_decisions(topic, 20)?, &mut used, max_bytes);
-        let (steerings, omitted_steerings) =
-            budget_section(self.governing_steerings(topic, 20)?, &mut used, max_bytes);
-        let (learned_quality_constraints, omitted_constraints) = budget_section(
-            self.relevant_quality_constraints(topic)?,
-            &mut used,
-            max_bytes,
-        );
-        let (live_instructions, omitted_instructions) =
-            budget_section(self.live_instructions()?, &mut used, max_bytes);
-        let (governing_documents, omitted_documents) =
-            budget_section(self.governing_documents(topic, 12)?, &mut used, max_bytes);
-        let (known_work, omitted_work) = budget_section(
-            self.work_list(Some(topic), 12)?["items"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default(),
-            &mut used,
-            max_bytes,
-        );
-        let (lifecycle_risks, omitted_risks) = budget_section(
-            self.obsolete_candidates(Some(topic), 12)?["candidates"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default(),
-            &mut used,
-            max_bytes,
-        );
-        let (runtime_contracts, omitted_contracts) = budget_section(
-            self.search_contract_artifacts(topic, 8)?,
-            &mut used,
-            max_bytes,
-        );
-        let omitted = json!({
-            "decisions": omitted_decisions,
-            "steerings": omitted_steerings,
-            "learned_quality_constraints": omitted_constraints,
-            "governing_documents": omitted_documents,
-            "known_work": omitted_work,
-            "lifecycle_risks": omitted_risks,
-            "runtime_contracts": omitted_contracts,
-            "live_instructions": omitted_instructions,
-        });
-        let truncated = omitted_decisions
-            + omitted_steerings
-            + omitted_constraints
-            + omitted_documents
-            + omitted_work
-            + omitted_risks
-            + omitted_contracts
-            + omitted_instructions
-            > 0;
-        let mut relevant_sections = Vec::new();
-        for (name, values) in [
-            ("decisions", &decisions),
-            ("steerings", &steerings),
-            ("learned_quality_constraints", &learned_quality_constraints),
-            ("governing_documents", &governing_documents),
-            ("known_work", &known_work),
-            ("lifecycle_risks", &lifecycle_risks),
-            ("runtime_contracts", &runtime_contracts),
-            ("live_instructions", &live_instructions),
-        ] {
-            if !values.is_empty() {
-                relevant_sections.push(name);
-            }
-        }
-        Ok(response_budget::bound(
-            json!({
-                "topic": topic,
-                "consulted": true,
-                "guidance_found": !relevant_sections.is_empty(),
-                "relevant_sections": relevant_sections,
-                "snapshot": self.snapshot(),
-                "decisions": decisions,
-                "steerings": steerings,
-                "learned_quality_constraints": learned_quality_constraints,
-                "governing_documents": governing_documents,
-                "known_work": known_work,
-                "lifecycle_risks": lifecycle_risks,
-                "runtime_contracts": runtime_contracts,
-                "live_instructions": live_instructions,
-                "engineering_route":guidance::guidance_hint(topic),
-                "next_steps": [
-                    "Apply relevant human guidance before continuing.",
-                    "If the request will modify repository files, call change.prepare before the first edit and change.validate after the edits.",
-                    "Use repo.context when the consultation identifies a concept that needs deeper repository evidence."
-                ],
-                "authority": "Human decisions and steering govern. Indexed documents and relationships are freshness-labelled guidance; current source and runtime/compiler behavior remain authoritative.",
-                "context_budget": {
-                    "tokens": token_budget,
-                    "estimated_tokens": used.div_ceil(4),
-                    "truncated": truncated,
-                    "omitted": omitted,
-                    "note": "Sections are filled in authority order until the budget is spent. Omitted counts name matching guidance that did not fit; raise budget or call repo.constraints to read the unbudgeted set.",
-                },
-            }),
-            token_budget,
-        ))
+        self.consult_within(topic, budget, None, Vec::new())
     }
 
+    /// `consult` budgeted as one response: with `freshness`, the briefing is
+    /// returned as `{freshness, result}` and the envelope counts against the
+    /// same budget as the sections.
+    pub(crate) fn consult_within(
+        &self,
+        topic: &str,
+        budget: usize,
+        freshness: Option<Value>,
+        approved_models: Vec<Value>,
+    ) -> Result<Value> {
+        ensure!(!topic.trim().is_empty(), "topic is required");
+        let token_budget = budget.clamp(250, 20_000);
+        let instructions = self.consult_instructions(topic)?;
+        let live_paths = instructions
+            .iter()
+            .filter_map(|(full, _)| full["path"].as_str().map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        let decisions = self.governing_decisions(topic, 20)?;
+        let steerings = self.governing_steerings(topic, 20)?;
+        // Agents must not retire human guidance on their own initiative, so a
+        // stale or apparently replaced record only produces a hint to ask.
+        let cleanup = decisions
+            .iter()
+            .chain(&steerings)
+            .filter(|record| steering::needs_cleanup(record))
+            .filter_map(|record| record["id"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        let sections = vec![
+            Section::new(
+                "decisions",
+                decisions,
+                |decision| {
+                    let mut compact = json!({"id":decision["id"],"title":decision["title"],"status":decision["status"],
+                        "applies_to":first_values(&decision["applies_to"], 4)});
+                    if steering::needs_cleanup(decision) {
+                        compact["stale_references"] =
+                            first_values(&decision["stale_references"], 3);
+                    }
+                    compact
+                },
+                "decision.list with the topic, or repo.constraints, returns full accepted decisions.",
+            ),
+            Section::with_forms(
+                "steerings",
+                steerings
+                    .into_iter()
+                    .map(steering::consultation_forms)
+                    .collect(),
+                "steering.list with the topic or scope returns the full steering and its history.",
+            ),
+            Section::new(
+                "approved_models",
+                approved_models,
+                |model| json!({"id":model["id"],"title":model["title"],"status":model["status"]}),
+                "Approved domain models are listed by id; read the full contract before changing a concept owner.",
+            ),
+            Section::new(
+                "learned_quality_constraints",
+                self.relevant_quality_constraints(topic)?,
+                |item| {
+                    let constraint = &item["constraint"];
+                    json!({"constraint":{"id":constraint["id"],"rule":trim_text(constraint["rule"].as_str().unwrap_or(""), 200),
+                        "enforcement":constraint["enforcement"],"status":constraint["status"]},
+                        "match":{"matched":item["match"]["matched"]}})
+                },
+                "quality.get with an id, or repo.constraints, returns the full constraint and match.",
+            ),
+            Section::with_forms(
+                "live_instructions",
+                instructions,
+                "Read each listed instruction file directly before acting in its scope.",
+            ),
+            Section::new(
+                "governing_documents",
+                self.governing_documents(topic, 12, &live_paths)?,
+                |document| json!({"path":document["path"],"relevance":document["relevance"]}),
+                "Read the listed paths directly, or call repo.search for the topic.",
+            ),
+            Section::new(
+                "known_work",
+                self.work_matches(Some(topic), 12, true)?["items"]
+                    .as_array()
+                    .map(|items| items.iter().map(relevance::work_brief).collect())
+                    .unwrap_or_default(),
+                |work| json!({"id":work["id"],"title":work["title"],"status":work["status"]}),
+                "work.get with an id returns evidence, acceptance criteria, and verification; work.list lists more.",
+            ),
+            Section::new(
+                "lifecycle_risks",
+                self.obsolete_candidates(Some(topic), 12)?["candidates"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default(),
+                |risk| {
+                    json!({"classification":risk["classification"],"symbol":risk["symbol"],
+                        "file":risk["file"],"replacement":risk["replacement"]})
+                },
+                "repo.obsolete_candidates with the topic returns the full removal slices.",
+            ),
+            Section::new(
+                "runtime_contracts",
+                self.relevant_contract_artifacts(topic, 8)?,
+                |contract| json!({"kind":contract["kind"],"path":contract["path"]}),
+                "Read the listed contract paths directly, or call repo.search for the topic.",
+            ),
+        ];
+        let relevant_sections = sections
+            .iter()
+            .filter(|section| !section.is_empty())
+            .map(Section::name)
+            .collect::<Vec<_>>();
+        // The full snapshot repeats index internals that `index.status`
+        // reports; consultation carries only what dates its guidance.
+        let snapshot = self.snapshot();
+        let snapshot = json!({
+            "branch": snapshot["branch"],
+            "generation": snapshot["generation"],
+            "revision": snapshot["revision"],
+            "indexing_timestamp": snapshot["indexing_timestamp"],
+        });
+        let mut next_steps = vec![
+            "Apply relevant human guidance before continuing.".to_owned(),
+            "If the request will modify repository files, call change.prepare before the first edit and change.validate after the edits.".to_owned(),
+            "Use repo.context when the consultation identifies a concept that needs deeper repository evidence.".to_owned(),
+        ];
+        next_steps.extend(self.semantic_hint());
+        if !cleanup.is_empty() {
+            next_steps.push(format!(
+                "{} name missing paths (stale_references) or appear replaced by a newer steering (possibly_superseded_by). Tell the user and ask a human to retire or supersede them (steering.retire, steering.record with supersedes, decision.retire); do not retire them yourself.",
+                cleanup.join(", ")
+            ));
+        }
+        let body = json!({
+            "topic": topic,
+            "consulted": true,
+            "guidance_found": !relevant_sections.is_empty(),
+            "relevant_sections": relevant_sections,
+            "snapshot": snapshot,
+            "engineering_route": guidance::guidance_hint(topic),
+            "next_steps": next_steps,
+            "authority": "Human decisions and steering govern. Indexed documents and relationships are freshness-labelled guidance; current source and runtime/compiler behavior remain authoritative.",
+        });
+        let value = match freshness {
+            Some(freshness) => json!({"freshness": freshness, "result": body}),
+            None => body,
+        };
+        let packed = response_budget::pack(
+            value,
+            sections,
+            &[
+                ("next_steps", None),
+                ("authority", None),
+                ("snapshot", None),
+            ],
+            token_budget,
+        );
+        // Only an envelope larger than the whole budget reaches this net.
+        Ok(response_budget::bound(packed, token_budget))
+    }
+
+    /// Live instruction files as `(consultation form, stub)`. Root and
+    /// topic-path-ancestor files are inlined when they fit; others are always
+    /// stubs, so every instruction file stays discoverable within the budget.
+    fn consult_instructions(&self, topic: &str) -> Result<Vec<(Value, Value)>> {
+        let paths = relevance::topic_paths(topic);
+        Ok(self
+            .live_instructions()?
+            .into_iter()
+            .map(|mut document| {
+                let Some(path) = document["path"].as_str().map(str::to_owned) else {
+                    return (document.clone(), document);
+                };
+                let scope = document["scope"].as_str().unwrap_or("").to_owned();
+                let stub = json!({
+                    "path": path,
+                    "scope": scope,
+                    "bytes": document["bytes"],
+                    "content_digest": document["content_digest"],
+                    "inlined": false,
+                    "note": "Read this file before acting in its scope.",
+                });
+                let governs = scope.is_empty()
+                    || paths
+                        .iter()
+                        .any(|topic_path| relevance::path_contains(&scope, topic_path));
+                if governs {
+                    document["inlined"] = json!(true);
+                    (document, stub)
+                } else {
+                    (stub.clone(), stub)
+                }
+            })
+            .collect())
+    }
+
+    /// Accepted decisions that are about `topic`, then every global one.
+    /// Unlike `decisions_for`, a decision sharing one incidental word with a
+    /// long intent does not govern it.
     fn governing_decisions(&self, topic: &str, limit: usize) -> Result<Vec<Value>> {
-        let mut decisions = self.decisions_for(topic)?;
+        let mut decisions = Vec::new();
+        for hit in self.relevant_hits(&terms(topic), Some("decision"), MAX_DECISION_HITS)? {
+            if let Some(id) = hit["entity_id"].as_str() {
+                let decision = self.decision_resource(id)?;
+                if decision["status"] == "accepted" {
+                    decisions.push(decision);
+                }
+            }
+        }
         let global_ids = self
             .db
             .prepare("SELECT id FROM decisions WHERE status='accepted' AND json_array_length(applies_to)=0 ORDER BY sequence DESC LIMIT ?1")?
@@ -3570,49 +4114,40 @@ impl Service {
         Ok(decisions)
     }
 
-    fn governing_steerings(&self, topic: &str, limit: usize) -> Result<Vec<Value>> {
-        let mut steerings = self.steering_list(Some(topic), limit)?["steerings"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        let global = self
-            .db
-            .prepare("SELECT id,status,priority,title,instruction,scope,expires_at,revision,created_at FROM steerings WHERE status='active' AND json_array_length(scope)=0 ORDER BY sequence DESC LIMIT ?1")?
-            .query_map([limit as i64], |row| {
-                Ok(json!({
-                    "id": row.get::<_, String>(0)?,
-                    "status": row.get::<_, String>(1)?,
-                    "priority": row.get::<_, String>(2)?,
-                    "title": row.get::<_, String>(3)?,
-                    "instruction": row.get::<_, String>(4)?,
-                    "scope": serde_json::from_str::<Value>(&row.get::<_, String>(5)?)
-                        .unwrap_or_else(|_| json!([])),
-                    "expires_at": row.get::<_, Option<String>>(6)?,
-                    "revision": row.get::<_, String>(7)?,
-                    "created_at": row.get::<_, String>(8)?,
-                }))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        steerings.extend(global);
-        let mut seen = BTreeSet::new();
-        steerings.retain(|steering| {
-            steering_is_active(steering)
-                && steering["id"]
-                    .as_str()
-                    .is_some_and(|id| seen.insert(id.to_owned()))
-        });
-        steerings.truncate(limit);
-        Ok(steerings)
-    }
-
-    fn governing_documents(&self, topic: &str, limit: usize) -> Result<Vec<Value>> {
+    /// Documents that govern `topic`: topical full-text hits first, then prose
+    /// policy documents. Instruction files are reported by `live_instructions`
+    /// and never repeated here, and CI/workflow configuration appears only when
+    /// the topic is about CI, workflows, or configuration.
+    fn governing_documents(
+        &self,
+        topic: &str,
+        limit: usize,
+        live_paths: &BTreeSet<String>,
+    ) -> Result<Vec<Value>> {
+        let concerns_ci = relevance::topic_concerns_ci(topic);
+        let admissible = |path: &str| {
+            !live_paths.contains(path)
+                && !is_instruction_file(path)
+                && (concerns_ci || !relevance::is_ci_configuration(path))
+        };
         let mut documents = Vec::new();
+        for mut hit in
+            self.relevant_hits(&terms(topic), Some("document"), limit.saturating_mul(2))?
+        {
+            let path = hit["path"].as_str().unwrap_or("").to_owned();
+            if !admissible(&path) {
+                continue;
+            }
+            hit["relevance"] = json!(if relevance::is_ci_configuration(&path) {
+                "ci_configuration_for_topic"
+            } else {
+                "topic_match"
+            });
+            documents.push(hit);
+        }
         let mut statement = self.db.prepare(
             "SELECT kind,path,text FROM documents \
-             WHERE lower(path)='agents.md' OR lower(path) LIKE '%/agents.md' \
-                OR lower(path)='context.md' OR lower(path) LIKE '%/context.md' \
-                OR lower(path)='contributing.md' OR lower(path) LIKE '%/contributing.md' \
-                OR lower(path)='design.md' OR lower(path) LIKE '%/design.md' \
+             WHERE lower(path)='design.md' OR lower(path) LIKE '%/design.md' \
                 OR lower(path)='style.md' OR lower(path) LIKE '%/style.md' \
                 OR lower(path)='theme.md' OR lower(path) LIKE '%/theme.md' \
                 OR lower(path) LIKE 'workflow%' \
@@ -3622,22 +4157,33 @@ impl Service {
                 OR lower(path) LIKE '%/guideline%' \
                 OR lower(path) LIKE 'policy%' \
                 OR lower(path) LIKE '%/policy%' \
-             ORDER BY path LIMIT ?1",
+             ORDER BY path LIMIT 200",
         )?;
-        documents.extend(
-            statement
-                .query_map([limit as i64], |row| {
-                    Ok(json!({
-                        "kind": row.get::<_, String>(0)?,
-                        "path": row.get::<_, String>(1)?,
-                        "evidence": trim_text(&row.get::<_, String>(2)?, 700),
-                        "provenance": "PublishedDocument",
-                        "relevance": "repository_governance",
-                    }))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?,
-        );
-        documents.extend(self.search_hits(&terms(topic), Some("document"), limit)?);
+        let policies = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (kind, path, text) in policies {
+            let ci = relevance::is_ci_configuration(&path);
+            let prose = [".md", ".markdown", ".mdx", ".txt"]
+                .iter()
+                .any(|extension| path.to_lowercase().ends_with(extension));
+            if !admissible(&path) || !(prose || ci && concerns_ci) {
+                continue;
+            }
+            documents.push(json!({
+                "kind": kind,
+                "path": path,
+                "evidence": trim_text(&text, 420),
+                "provenance": "PublishedDocument",
+                "relevance": if ci { "ci_configuration_for_topic" } else { "repository_policy" },
+            }));
+        }
         let mut seen = BTreeSet::new();
         documents.retain(|document| {
             document["path"]
@@ -3668,10 +4214,7 @@ impl Service {
             }
             let entry = entry?;
             if !entry.file_type().is_file()
-                || !matches!(
-                    entry.file_name().to_str(),
-                    Some("AGENTS.md" | "CLAUDE.md" | "CONTEXT.md" | "CONTRIBUTING.md")
-                )
+                || !entry.file_name().to_str().is_some_and(is_instruction_file)
             {
                 continue;
             }
@@ -3680,6 +4223,7 @@ impl Service {
                 .strip_prefix(&self.root)?
                 .to_string_lossy()
                 .into_owned();
+            let size = entry.metadata()?.len();
             let mut bytes = Vec::new();
             File::open(entry.path())?
                 .take(64_001)
@@ -3688,7 +4232,7 @@ impl Service {
             bytes.truncate(64_000);
             let source = String::from_utf8_lossy(&bytes);
             documents.push(json!({"path":path,"scope":entry.path().parent().unwrap_or(&self.root).strip_prefix(&self.root)?.to_string_lossy(),
-                "evidence":source,"content_digest":format!("b3:{}",blake3::hash(&bytes).to_hex()),"digest_scope":if complete {"file"} else {"captured_prefix"},"complete":complete,"provenance":"LiveInstructionFile"}));
+                "evidence":source,"content_digest":format!("b3:{}",blake3::hash(&bytes).to_hex()),"digest_scope":if complete {"file"} else {"captured_prefix"},"complete":complete,"bytes":size,"provenance":"LiveInstructionFile"}));
             if documents.len() >= 100 {
                 documents.push(json!({"complete":false,"provenance":"LiveInstructionScanLimit","next":"Read additional scoped instructions directly; more than 100 documents were encountered."}));
                 break;
@@ -3762,25 +4306,40 @@ impl Service {
     }
 
     pub fn work_list(&self, query: Option<&str>, limit: usize) -> Result<Value> {
-        if let Some(work) = observatory::relevant_work(&self.root, query, limit)? {
+        self.work_matches(query, limit, false)
+    }
+
+    /// Work relevant to `query`, best match first; see `WorkQuery::score`.
+    /// `open_only` drops closed work and stale source-discovered proposals,
+    /// which is what consultation reports as known work.
+    fn work_matches(&self, query: Option<&str>, limit: usize, open_only: bool) -> Result<Value> {
+        if let Some(work) = observatory::relevant_work(&self.root, query, limit, open_only)? {
             return Ok(work);
         }
-        let query = query.unwrap_or("").to_lowercase();
-        let mut statement = self.db.prepare("SELECT id,title,status,priority,kind,scope_json,evidence_json,depends_json,blocked_json,acceptance_json,verification_json,discovered_from,provenance,confidence,last_validated_snapshot,updated_at FROM work_items WHERE (lower(title) LIKE ?1 OR lower(scope_json) LIKE ?1 OR ?1='%%') AND (?3=1 OR provenance!='SourceDoc' OR status!='proposed' OR confidence>=0.5) ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, updated_at DESC LIMIT ?2")?;
-        let items = statement
-            .query_map(
-                params![
-                    if query.is_empty() {
-                        "%%".to_owned()
-                    } else {
-                        format!("%{query}%")
-                    },
-                    limit as i64,
-                    i64::from(!query.is_empty()),
-                ],
-                work_row,
-            )?
+        let query = query.unwrap_or("").trim().to_lowercase();
+        let scorer = relevance::WorkQuery::new(&query);
+        let mut statement = self.db.prepare("SELECT id,title,status,priority,kind,scope_json,evidence_json,depends_json,blocked_json,acceptance_json,verification_json,discovered_from,provenance,confidence,last_validated_snapshot,updated_at FROM work_items ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, updated_at DESC")?;
+        let mut scored = statement
+            .query_map([], work_row)?
             .filter_map(Result::ok)
+            .filter(|item| {
+                // Unqueried listings and consultation hide source-comment proposals whose
+                // source evidence has gone stale; an explicit query finds them.
+                let stale_proposal = item["provenance"] == "SourceDoc"
+                    && item["status"] == "proposed"
+                    && item["confidence"].as_f64().unwrap_or(0.0) < 0.5;
+                !(stale_proposal && (query.is_empty() || open_only))
+                    && (!open_only
+                        || relevance::work_status_is_open(item["status"].as_str().unwrap_or("")))
+            })
+            .filter_map(|item| scorer.score(&item).map(|score| (score, item)))
+            .collect::<Vec<_>>();
+        // Stable: equal scores keep the priority and recency order.
+        scored.sort_by(|left, right| right.0.total_cmp(&left.0));
+        let items = scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, item)| item)
             .collect::<Vec<_>>();
         Ok(json!({"query":query,"snapshot":self.snapshot(),"items":items}))
     }
@@ -3802,17 +4361,25 @@ impl Service {
     }
 
     pub fn work_propose(&self, input: WorkItemInput) -> Result<Value> {
+        self.with_memory_write(|| self.work_propose_inner(input))
+    }
+
+    fn work_propose_inner(&self, input: WorkItemInput) -> Result<Value> {
         let revision = self.revision();
         let identity = format!("{}:{:?}", input.title, input.scope);
         let id = format!("work_{}", &blake3::hash(identity.as_bytes()).to_hex()[..12]);
         self.db.execute("INSERT INTO work_items(id,title,status,priority,kind,scope_json,evidence_json,depends_json,blocked_json,acceptance_json,verification_json,discovered_from,provenance,confidence,last_validated_snapshot,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'explicit MCP proposal','HumanDecision',1.0,?12,?13,?13) ON CONFLICT(id) DO UPDATE SET title=excluded.title,status=excluded.status,priority=excluded.priority,kind=excluded.kind,scope_json=excluded.scope_json,evidence_json=excluded.evidence_json,depends_json=excluded.depends_json,blocked_json=excluded.blocked_json,acceptance_json=excluded.acceptance_json,verification_json=excluded.verification_json,last_validated_snapshot=excluded.last_validated_snapshot,updated_at=excluded.updated_at", params![id,input.title,input.status,input.priority,input.kind,serde_json::to_string(&input.scope)?,serde_json::to_string(&input.evidence)?,serde_json::to_string(&input.depends_on)?,serde_json::to_string(&input.blocked_by)?,serde_json::to_string(&input.acceptance_criteria)?,serde_json::to_string(&input.verification)?,revision.workspace_digest,Utc::now().to_rfc3339()])?;
-        self.rebuild_search_index()?;
+        self.refresh_memory_search_rows()?;
         Ok(
             json!({"id":id,"snapshot":self.snapshot(),"status":input.status,"provenance":"HumanDecision"}),
         )
     }
 
     pub fn work_update(&self, id: &str, patch: &Value) -> Result<Value> {
+        self.with_memory_write(|| self.work_update_inner(id, patch))
+    }
+
+    fn work_update_inner(&self, id: &str, patch: &Value) -> Result<Value> {
         let current = self.db.query_row("SELECT status,priority,kind,scope_json,evidence_json,depends_json,blocked_json,acceptance_json,verification_json FROM work_items WHERE id=?1",[id],|row|Ok(json!({"status":row.get::<_,String>(0)?,"priority":row.get::<_,String>(1)?,"kind":row.get::<_,String>(2)?,"scope":serde_json::from_str::<Value>(&row.get::<_,String>(3)?).unwrap_or(json!([])),"evidence":serde_json::from_str::<Value>(&row.get::<_,String>(4)?).unwrap_or(json!([])),"depends_on":serde_json::from_str::<Value>(&row.get::<_,String>(5)?).unwrap_or(json!([])),"blocked_by":serde_json::from_str::<Value>(&row.get::<_,String>(6)?).unwrap_or(json!([])),"acceptance_criteria":serde_json::from_str::<Value>(&row.get::<_,String>(7)?).unwrap_or(json!([])),"verification":serde_json::from_str::<Value>(&row.get::<_,String>(8)?).unwrap_or(json!([]))})))?;
         let field = |name: &str| {
             patch
@@ -3821,14 +4388,23 @@ impl Service {
                 .unwrap_or_else(|| current[name].clone())
         };
         self.db.execute("UPDATE work_items SET status=?1,priority=?2,kind=?3,scope_json=?4,evidence_json=?5,depends_json=?6,blocked_json=?7,acceptance_json=?8,verification_json=?9,last_validated_snapshot=?10,updated_at=?11 WHERE id=?12",params![field("status").as_str(),field("priority").as_str(),field("kind").as_str(),field("scope").to_string(),field("evidence").to_string(),field("depends_on").to_string(),field("blocked_by").to_string(),field("acceptance_criteria").to_string(),field("verification").to_string(),self.revision().workspace_digest,Utc::now().to_rfc3339(),id])?;
-        self.rebuild_search_index()?;
+        self.refresh_memory_search_rows()?;
         Ok(json!({"id":id,"snapshot":self.snapshot(),"updated":true}))
     }
 
+    /// Store contents plus whether the published generation is stale, judged
+    /// exactly as the freshness envelope judges it.
     pub fn status(&self) -> Result<Value> {
-        let current_revision = self.revision();
-        let indexed_revision = self.indexed_revision();
-        let stale = indexed_revision.as_ref() != Some(&current_revision);
+        let freshness = index_freshness(&self.root, &self.db)?;
+        let mut status = self.index_summary()?;
+        status["stale"] = Value::from(freshness.stale());
+        status["freshness_reason"] = Value::from(freshness.reason());
+        Ok(status)
+    }
+
+    /// Snapshot identity, counts, and degradation notes for `index.status`,
+    /// without a freshness judgement or backend details.
+    pub fn index_summary(&self) -> Result<Value> {
         let nodes: i64 = self
             .db
             .query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))?;
@@ -3902,7 +4478,7 @@ impl Service {
             )));
         }
         Ok(
-            json!({"snapshot":self.snapshot(),"current_revision":current_revision,"stale":stale,"index":self.index_status(),"counts":{"nodes":nodes,"edges":edges,"semantic_edges":semantic_edges,"unresolved_static_references":unresolved_static_references,"runtime_contract_artifacts":runtime_contracts,"embeddings":embeddings,"lifecycle_evidence":lifecycle,"work_items":work,"actionable_work_items":actionable_work,"package_targets":package_targets,"package_features":package_features,"architecture_reports":architecture_reports},"quality_memory":quality_memory,"unreadable_inputs":unreadable,"degraded_areas":degraded,"cache":"rebuildable SQLite cache with atomic published generations; architecture audits retain the newest 20 snapshot-scoped reports."}),
+            json!({"snapshot":self.snapshot(),"counts":{"nodes":nodes,"edges":edges,"semantic_edges":semantic_edges,"unresolved_static_references":unresolved_static_references,"runtime_contract_artifacts":runtime_contracts,"embeddings":embeddings,"lifecycle_evidence":lifecycle,"work_items":work,"actionable_work_items":actionable_work,"package_targets":package_targets,"package_features":package_features,"architecture_reports":architecture_reports},"quality_memory":quality_memory,"unreadable_inputs":unreadable,"degraded_areas":degraded,"cache":"rebuildable SQLite cache with atomic published generations; architecture audits retain the newest 20 snapshot-scoped reports."}),
         )
     }
 
@@ -3967,28 +4543,101 @@ impl Service {
         )
     }
 
+    /// Refreshes the derived index under the publisher lease.
+    ///
+    /// `incremental` (the default) re-indexes only what changed since the
+    /// published generation and falls back to a full rebuild only for a store
+    /// that was never indexed or was written by another indexer version.
+    /// `workspace` (alias `full`, and `cargo`) rebuilds everything. `git`
+    /// re-reads commit history only; it publishes no generation, so freshness
+    /// stays stale until an incremental or full refresh indexes the sources.
+    ///
+    /// Returns a compact summary (generation, counts, timing, reused versus
+    /// recomputed vectors); `status` describes the whole store.
     pub fn refresh(&mut self, scope: Option<&str>) -> Result<Value> {
-        match scope.unwrap_or("workspace") {
-            "workspace" | "cargo" => self.reindex()?,
+        let started = Instant::now();
+        let scope = scope.unwrap_or("incremental");
+        let previous_generation = self.active_generation();
+        self.last_refresh_timings = Value::Null;
+        let outcome = match scope {
+            "incremental" => self.refresh_if_stale()?,
+            "workspace" | "full" | "cargo" => {
+                let _publisher_lease = self.acquire_publisher_lease()?;
+                self.reindex_unlocked()?
+            }
             "git" => {
                 let _publisher_lease = self.acquire_publisher_lease()?;
                 let revision = self.revision();
-                self.with_savepoint("git_only_refresh", |service| {
-                    service.refresh_git(&revision.workspace_digest)?;
-                    service.rebuild_search_index()?;
-                    service.db.execute(
-                        "INSERT OR REPLACE INTO metadata(key,value) VALUES ('git_indexed_head',?1)",
-                        [revision.head.clone().unwrap_or_default()],
-                    )?;
-                    Ok(())
+                self.with_index_build(|service| {
+                    service.refresh_git(&revision.workspace_digest, revision.head.as_deref())
                 })?;
+                RefreshOutcome {
+                    mode: "git_history",
+                    published: false,
+                    changed_inputs: 0,
+                }
             }
-            "incremental" => self.refresh_if_stale()?,
             other => bail!(
-                "unsupported refresh scope `{other}`; use workspace, cargo, git, or incremental"
+                "unsupported refresh scope `{other}`; use incremental, workspace (full), cargo, or git"
             ),
-        }
-        self.status()
+        };
+        self.refresh_summary(scope, outcome, previous_generation, started)
+    }
+
+    fn refresh_summary(
+        &self,
+        scope: &str,
+        outcome: RefreshOutcome,
+        previous_generation: Option<i64>,
+        started: Instant,
+    ) -> Result<Value> {
+        let count = |table: &str| -> Result<i64> {
+            Ok(self
+                .db
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })?)
+        };
+        let metadata_count = |key: &str| -> Result<Option<i64>> {
+            Ok(self
+                .metadata_value(key)?
+                .and_then(|value| value.parse().ok()))
+        };
+        // Vector statistics describe the last build, so they are reported only
+        // when this refresh produced one.
+        let embeddings = if outcome.published {
+            json!({
+                "recomputed": metadata_count("embedding_recomputed")?,
+                "reused": metadata_count("embedding_reused")?,
+            })
+        } else {
+            Value::Null
+        };
+        let mut timings = self
+            .last_refresh_timings
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        timings.insert(
+            "total_ms".into(),
+            json!(started.elapsed().as_secs_f64() * 1000.0),
+        );
+        Ok(json!({
+            "scope": scope,
+            "mode": outcome.mode,
+            "published": outcome.published,
+            "generation": self.active_generation(),
+            "previous_generation": previous_generation,
+            "changed_inputs": outcome.changed_inputs,
+            "counts": {
+                "nodes": count("nodes")?,
+                "edges": count("edges")?,
+                "documents": count("documents")?,
+                "inputs": count("input_state")?,
+            },
+            "embeddings": embeddings,
+            "timings": timings,
+        }))
     }
 
     fn acquire_publisher_lease(&self) -> Result<PublisherLease> {
@@ -4034,8 +4683,8 @@ impl Service {
     }
 
     pub fn index_status(&self) -> Value {
-        let backend = self.ra.lock().unwrap_or_else(|error| error.into_inner());
-        json!({"semantic_engine":"rust-analyzer LSP companion (opt-in, on-demand, persisted by semantic snapshot)","rust_analyzer_enabled":self.ra_enabled,"rust_analyzer_running":backend.client.is_some(),"rust_analyzer_start_attempted":backend.start_attempted,"rust_analyzer_program":self.ra_program.to_string_lossy(),"rust_analyzer_error":backend.start_error,"filesystem_watcher":self.watcher.is_some(),"fallback":"AST Syntax index with ambiguity suppression; unresolved candidates are reported separately","embedding_model":EMBEDDING_MODEL,"embedding_dimensions":EMBEDDING_DIMENSIONS,"embedding_card_version":SYMBOL_CARD_VERSION,"embedding":self.embedding_index_status(),"retrieval":"BM25 + embedding + typed graph RRF","store":"SQLite FTS5 + graph + vectors"})
+        let analyzer = self.ra.index_facts(self.ra_enabled, &self.ra_program);
+        json!({"semantic_engine":"rust-analyzer LSP companion (off until semantic.enable, warmed in the background when enabled, persisted by semantic snapshot)","rust_analyzer_enabled":self.ra_enabled,"rust_analyzer_state":analyzer["state"],"rust_analyzer_running":analyzer["running"],"rust_analyzer_start_attempted":analyzer["start_attempted"],"rust_analyzer_program":self.ra_program.to_string_lossy(),"rust_analyzer_program_found":analyzer["program_found"],"rust_analyzer_error":analyzer["error"],"rust_analyzer_restarts":analyzer["restarts"],"rust_analyzer_hint":analyzer["hint"],"fallback":"AST Syntax index with ambiguity suppression; unresolved candidates are reported separately","embedding_model":EMBEDDING_MODEL,"embedding_dimensions":EMBEDDING_DIMENSIONS,"embedding_card_version":SYMBOL_CARD_VERSION,"embedding":self.embedding_index_status(),"retrieval":"BM25 + embedding + typed graph RRF","store":"SQLite FTS5 + graph + vectors"})
     }
 
     fn embedding_index_status(&self) -> Value {
@@ -4080,7 +4729,7 @@ impl Service {
             .get("target_triple")
             .cloned()
             .unwrap_or(Value::Null);
-        json!({"repository":self.root.to_string_lossy(),"branch":command_text(&self.root,&["branch","--show-current"]),"revision":self.indexed_revision(),"generation":self.active_generation(),"semantic_snapshot":semantic,"indexing_timestamp":self.db.query_row("SELECT value FROM metadata WHERE key='indexed_at'",[],|row|row.get::<_,String>(0)).optional().ok().flatten(),"indexer_version":self.db.query_row("SELECT value FROM metadata WHERE key='indexer_version'",[],|row|row.get::<_,String>(0)).optional().ok().flatten(),"cargo_assumptions":{"features":feature_profile,"target_triple":target_triple,"package_targets":self.db.query_row("SELECT COUNT(*) FROM package_targets",[],|row|row.get::<_,i64>(0)).unwrap_or(0),"package_features":self.db.query_row("SELECT COUNT(*) FROM package_features",[],|row|row.get::<_,i64>(0)).unwrap_or(0)},"index":self.index_status()})
+        json!({"repository":self.root.to_string_lossy(),"branch":command_text(&self.root,&["branch","--show-current"]),"revision":self.indexed_revision(),"generation":self.active_generation(),"semantic_snapshot":semantic,"indexing_timestamp":self.db.query_row("SELECT value FROM metadata WHERE key='indexed_at'",[],|row|row.get::<_,String>(0)).optional().ok().flatten(),"indexer_version":self.db.query_row("SELECT value FROM metadata WHERE key='indexer_version'",[],|row|row.get::<_,String>(0)).optional().ok().flatten(),"cargo_assumptions":{"features":feature_profile,"target_triple":target_triple,"package_targets":self.db.query_row("SELECT COUNT(*) FROM package_targets",[],|row|row.get::<_,i64>(0)).unwrap_or(0),"package_features":self.db.query_row("SELECT COUNT(*) FROM package_features",[],|row|row.get::<_,i64>(0)).unwrap_or(0)}})
     }
 
     fn indexed_revision(&self) -> Option<Revision> {
@@ -4204,9 +4853,15 @@ impl Service {
         let Some(snapshot) = self.active_semantic_snapshot_id() else {
             return Vec::new();
         };
-        let snapshot_current = self.indexed_revision().as_ref() == Some(&self.revision())
-            && self.semantic_snapshot(&index_inputs(&self.root)).id == snapshot;
+        // A fresh generation means the live inputs equal the stored ones, so
+        // the semantic identity is computed without re-hashing the workspace.
+        let snapshot_current = index_freshness(&self.root, &self.db)
+            .is_ok_and(|freshness| !freshness.stale())
+            && self
+                .stored_inputs()
+                .is_ok_and(|inputs| self.semantic_snapshot(&inputs).id == snapshot);
         let mut slices = Vec::new();
+        let mut analyzer = None;
         for target in targets.iter().take(8) {
             if snapshot_current
                 && let Some(cached) = self.cached_semantic_slices(target, relation, &snapshot)
@@ -4231,23 +4886,36 @@ impl Service {
                 continue;
             };
             let character = line[..byte].encode_utf16().count();
-            let uri = format!("file://{}", path.display());
-            let locations = {
-                self.start_rust_analyzer_if_enabled();
-                let Ok(mut backend) = self.ra.lock() else {
-                    continue;
-                };
-                let Some(client) = backend.client.as_mut() else {
-                    continue;
-                };
-                client.did_change(&uri, &text);
-                if relation == "implementations" {
-                    client.implementations(&uri, target.start_line - 1, character)
-                } else {
-                    client.references(&uri, target.start_line - 1, character)
-                }
+            // The analyzer is acquired once, and only when a target misses the cache.
+            let Some(process) = analyzer
+                .get_or_insert_with(|| self.analyzer_for_index())
+                .as_mut()
+            else {
+                continue;
             };
-            let Some(locations) = locations else {
+            let Ok(client) = process.client() else {
+                continue;
+            };
+            if client.sync_document(&path, &text).is_err() {
+                continue;
+            }
+            let method = if relation == "implementations" {
+                "textDocument/implementation"
+            } else {
+                "textDocument/references"
+            };
+            let Some(locations) = client
+                .request(
+                    method,
+                    json!({"textDocument":{"uri":live_semantics::file_uri(&path)},
+                        "position":{"line":target.start_line - 1,"character":character},
+                        "context":{"includeDeclaration":true}}),
+                    Duration::from_secs(10),
+                    &self.execution,
+                )
+                .ok()
+                .and_then(|result| result.as_array().cloned())
+            else {
                 continue;
             };
             let mut persisted = 0usize;
@@ -4259,7 +4927,7 @@ impl Service {
                 else {
                     continue;
                 };
-                let Some(path) = uri.strip_prefix("file://").map(PathBuf::from) else {
+                let Some(path) = rust_analyzer::uri_to_path(uri) else {
                     continue;
                 };
                 if !path.starts_with(&self.root) {
@@ -4534,8 +5202,18 @@ impl Service {
                 }))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        let stale = self.stale_references(
+            decision["rationale"].as_str().into_iter().chain(
+                decision["applies_to"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
+            ),
+        );
         decision["superseded_by"] = json!(superseded_by);
         decision["history"] = json!(history);
+        decision["stale_references"] = json!(stale);
         Ok(decision)
     }
     fn decision_conflicts(&self, diff: &str) -> Result<Vec<Value>> {
@@ -4638,8 +5316,58 @@ CREATE INDEX IF NOT EXISTS architecture_reports_created ON architecture_reports(
 CREATE TABLE IF NOT EXISTS input_state(path TEXT PRIMARY KEY,kind TEXT NOT NULL,content_hash TEXT NOT NULL,revision TEXT NOT NULL);
 ";
 
+/// Bump when a migration step outside the schema texts changes (the edge
+/// de-duplication below, `steering::migrate`, or `normalize_supersedes`), so a
+/// store already stamped with the current fingerprint runs the migrations once
+/// more. Changes to `SCHEMA` or `quality::SCHEMA` change the fingerprint by
+/// themselves.
+const MIGRATION_REVISION: &str = "1";
+
+/// Identity of the schema and migrations this build expects.
+fn schema_fingerprint() -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in [SCHEMA_VERSION, MIGRATION_REVISION, SCHEMA, quality::SCHEMA] {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!("b3:{}", hasher.finalize().to_hex())
+}
+
+/// Whether the store already carries this build's schema. Read-only: a
+/// connection that answers `true` performs no write while opening.
+fn schema_is_current(db: &Connection, fingerprint: &str) -> bool {
+    db.query_row(
+        "SELECT (SELECT value FROM metadata WHERE key='schema_version'),\
+                (SELECT value FROM metadata WHERE key='schema_fingerprint')",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        },
+    )
+    .is_ok_and(|(version, stamped)| {
+        version.as_deref() == Some(SCHEMA_VERSION) && stamped.as_deref() == Some(fingerprint)
+    })
+}
+
+/// Opens the index schema for one connection.
+///
+/// Every tool call opens a fresh `Service`, and migration used to run on each
+/// open: it wrote unconditionally (duplicate-edge collapse, schema stamp), so
+/// an ordinary read waited up to the busy timeout behind a refresh holding the
+/// write transaction. Migration now runs only while the store's fingerprint
+/// differs from this build's — once per store and schema, in whichever
+/// process opens it first — and every other open only sets connection
+/// pragmas, so readers see the last committed generation without waiting.
 fn initialize_schema(db: &Connection) -> Result<()> {
-    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    db.execute_batch("PRAGMA foreign_keys=ON;")?;
+    let fingerprint = schema_fingerprint();
+    if schema_is_current(db, &fingerprint) {
+        return Ok(());
+    }
+    db.execute_batch("PRAGMA journal_mode=WAL;")?;
     let metadata_exists: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='metadata')",
         [],
@@ -4699,11 +5427,16 @@ fn initialize_schema(db: &Connection) -> Result<()> {
         )?;
     }
     db.execute_batch(SCHEMA)?;
+    steering::migrate(db)?;
     normalize_supersedes(db)?;
     quality::initialize(db)?;
     db.execute(
         "INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?1)",
         [SCHEMA_VERSION],
+    )?;
+    db.execute(
+        "INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_fingerprint', ?1)",
+        [fingerprint],
     )?;
     Ok(())
 }
@@ -4880,26 +5613,250 @@ fn all_text_files(root: &Path) -> Vec<PathBuf> {
         .filter(|path| input_kind(path).is_some())
         .collect()
 }
+/// How the published generation relates to the live workspace.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IndexFreshness {
+    pub(crate) generation: Option<i64>,
+    pub(crate) published_at: Option<String>,
+    pub(crate) workspace_digest: Option<String>,
+    pub(crate) indexed_head: Option<String>,
+    pub(crate) live_head: Option<String>,
+    /// Inputs whose live content differs from the published input state.
+    pub(crate) changed_inputs: Vec<String>,
+    /// Live inputs that differ from `HEAD`, indexed or not.
+    pub(crate) dirty_inputs: usize,
+    /// The generation was written by another indexer version.
+    pub(crate) indexer_outdated: bool,
+}
+
+impl IndexFreshness {
+    /// `never_published`, `indexer_outdated`, `head_moved`,
+    /// `worktree_changed`, or `ok`.
+    pub(crate) fn reason(&self) -> &'static str {
+        if self.generation.is_none() {
+            "never_published"
+        } else if self.indexer_outdated {
+            "indexer_outdated"
+        } else if self.live_head != self.indexed_head {
+            "head_moved"
+        } else if !self.changed_inputs.is_empty() {
+            "worktree_changed"
+        } else {
+            "ok"
+        }
+    }
+
+    pub(crate) fn stale(&self) -> bool {
+        self.reason() != "ok"
+    }
+}
+
+/// Compares the live workspace with the generation published in `db`.
+///
+/// Inside Git this costs `rev-parse`, one `git status`, and hashing only the
+/// inputs that are dirty now or were dirty when indexed: every other input is
+/// clean, so it equals its blob at `HEAD`, and an unchanged head means it
+/// equals what was indexed. A dirty tree that was refreshed therefore reads
+/// fresh, and files that are not inputs (Crusty's state, `target/`, editor
+/// droppings) never make it stale. Outside Git, or for a store that never
+/// recorded its dirty inputs, every input is re-hashed.
+pub(crate) fn index_freshness(root: &Path, db: &Connection) -> Result<IndexFreshness> {
+    let mut freshness = IndexFreshness::default();
+    let Some((generation, digest, published_at)) = db
+        .query_row(
+            "SELECT id,workspace_digest,published_at FROM index_generations WHERE status='published' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)),
+        )
+        .optional()?
+    else {
+        return Ok(freshness);
+    };
+    freshness.generation = Some(generation);
+    freshness.workspace_digest = Some(digest);
+    freshness.published_at = published_at;
+    let metadata = |key: &str| -> Result<Option<String>> {
+        Ok(db
+            .query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?)
+    };
+    freshness.indexed_head = metadata("git_indexed_head")?.filter(|head| !head.is_empty());
+    // An older indexer's generation lacks evidence this build records, so it
+    // is stale even when every input is unchanged.
+    freshness.indexer_outdated = metadata("indexer_version")?.as_deref() != Some(INDEXER_VERSION);
+    freshness.live_head = command_text(root, &["rev-parse", "HEAD"]);
+    let live_dirty = git_dirty_paths(root).map(|paths| {
+        paths
+            .into_iter()
+            .filter(|path| is_input_path(root, path))
+            .collect::<BTreeSet<_>>()
+    });
+    freshness.dirty_inputs = live_dirty.as_ref().map_or(0, BTreeSet::len);
+    match (live_dirty, stored_worktree_inputs(db)?) {
+        (Some(live_dirty), Some(indexed_dirty)) => {
+            let candidates = live_dirty
+                .union(&indexed_dirty)
+                .cloned()
+                .collect::<Vec<_>>();
+            let existing = candidates
+                .iter()
+                .filter(|path| root.join(path).is_file())
+                .cloned()
+                .collect::<Vec<_>>();
+            let live = content_hashes(root, &existing, true);
+            let mut statement = db.prepare("SELECT content_hash FROM input_state WHERE path=?1")?;
+            for path in candidates {
+                let indexed = statement
+                    .query_row([&path], |row| row.get::<_, String>(0))
+                    .optional()?;
+                if live.get(&path) != indexed.as_ref() {
+                    freshness.changed_inputs.push(path);
+                }
+            }
+        }
+        _ => {
+            let indexed = db
+                .prepare("SELECT path, kind, content_hash FROM input_state")?
+                .query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?
+                .collect::<rusqlite::Result<BTreeMap<String, (String, String)>>>()?;
+            freshness.changed_inputs = changed_inputs(&indexed, &index_inputs(root))
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect();
+        }
+    }
+    Ok(freshness)
+}
+
+fn stored_worktree_inputs(db: &Connection) -> Result<Option<BTreeSet<String>>> {
+    let value = db
+        .query_row(
+            "SELECT value FROM metadata WHERE key='indexed_worktree_inputs'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(match value {
+        Some(value) => Some(serde_json::from_str(&value)?),
+        None => None,
+    })
+}
+
+/// Content identity of every index input, keyed by repository-relative path.
+///
+/// Inside a Git work tree every input is identified by its Git blob id: clean
+/// tracked files take it from the index without reading them, while dirty and
+/// untracked files are hashed with `git hash-object`. Identical content
+/// therefore has one identity whether it is committed, modified, or untracked;
+/// clean files used to be `git:<oid>` and dirty ones `b3:<hash>`, so merely
+/// committing an indexed edit looked like a change to every committed file.
+/// Outside Git the identity is a BLAKE3 content hash.
 fn index_inputs(root: &Path) -> BTreeMap<String, (String, String)> {
+    index_inputs_with_worktree(root).0
+}
+
+/// `index_inputs` together with the input paths Git reported as differing from
+/// `HEAD` (modified, staged, untracked, or deleted) before they were hashed.
+fn index_inputs_with_worktree(
+    root: &Path,
+) -> (BTreeMap<String, (String, String)>, BTreeSet<String>) {
     let blob_ids = git_tracked_blob_ids(root);
-    let dirty_paths = git_dirty_paths(root);
-    workspace_files(root)
+    let dirty_paths = git_dirty_paths(root).unwrap_or_default();
+    let mut inputs = BTreeMap::new();
+    let mut unhashed = Vec::new();
+    for path in workspace_files(root) {
+        let Some(kind) = input_kind(&path) else {
+            continue;
+        };
+        let relative_path = relative(root, &path);
+        match blob_ids
+            .as_ref()
+            .and_then(|ids| ids.get(&relative_path))
+            .filter(|_| !dirty_paths.contains(&relative_path))
+        {
+            Some(oid) => {
+                inputs.insert(relative_path, (kind.to_owned(), format!("git:{oid}")));
+            }
+            None => unhashed.push((relative_path, kind)),
+        }
+    }
+    let paths = unhashed
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    let mut hashes = content_hashes(root, &paths, blob_ids.is_some());
+    for (path, kind) in unhashed {
+        if let Some(hash) = hashes.remove(&path) {
+            inputs.insert(path, (kind.to_owned(), hash));
+        }
+    }
+    let worktree = dirty_paths
         .into_iter()
-        .filter_map(|path| {
-            let kind = input_kind(&path)?;
-            let relative_path = relative(root, &path);
-            let hash = blob_ids
-                .get(&relative_path)
-                .filter(|_| !dirty_paths.contains(&relative_path))
-                .map(|oid| format!("git:{oid}"))
-                .or_else(|| {
-                    fs::read(&path)
-                        .ok()
-                        .map(|bytes| format!("b3:{}", blake3::hash(&bytes).to_hex()))
-                })?;
-            Some((relative_path, (kind.to_owned(), hash)))
-        })
-        .collect()
+        .filter(|path| is_input_path(root, path))
+        .collect();
+    (inputs, worktree)
+}
+
+/// Whether a repository-relative path can be an index input: it has an input
+/// kind and lies outside Crusty's state directory and Cargo target directories.
+fn is_input_path(root: &Path, path: &str) -> bool {
+    input_kind(Path::new(path)).is_some() && !excluded_from_inputs(root, path)
+}
+
+/// Crusty's own state directory (at any depth, since a server once started in
+/// a subdirectory left one there) and Cargo target directories never hold
+/// inputs, even in repositories that do not ignore them. A `target` directory
+/// counts only beside a `Cargo.toml`, so a source module named `target` stays.
+pub(crate) fn excluded_from_inputs(root: &Path, path: &str) -> bool {
+    let mut parent = root.to_path_buf();
+    let components = path.split('/').collect::<Vec<_>>();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        if *component == INDEX_DIRECTORY
+            || *component == ".git"
+            || (*component == "target" && parent.join("Cargo.toml").is_file())
+        {
+            return true;
+        }
+        parent.push(component);
+    }
+    false
+}
+
+/// Hashes files on disk with the identity scheme of `index_inputs`. Files that
+/// cannot be read are absent from the result.
+fn content_hashes(root: &Path, paths: &[String], git: bool) -> HashMap<String, String> {
+    let mut hashes = HashMap::new();
+    if git {
+        for chunk in paths.chunks(256) {
+            let mut args = vec!["hash-object", "--"];
+            args.extend(chunk.iter().map(String::as_str));
+            // One unreadable path fails the whole invocation; that chunk then
+            // falls back to BLAKE3, which costs at most one re-indexing of it.
+            let Some(output) = git_output(root, &args) else {
+                continue;
+            };
+            let output = String::from_utf8_lossy(&output);
+            let ids = output.lines().collect::<Vec<_>>();
+            if ids.len() == chunk.len() {
+                for (path, id) in chunk.iter().zip(ids) {
+                    hashes.insert(path.clone(), format!("git:{}", id.trim()));
+                }
+            }
+        }
+    }
+    for path in paths {
+        if !hashes.contains_key(path)
+            && let Ok(bytes) = fs::read(root.join(path))
+        {
+            hashes.insert(
+                path.clone(),
+                format!("b3:{}", blake3::hash(&bytes).to_hex()),
+            );
+        }
+    }
+    hashes
 }
 
 fn input_kind(path: &Path) -> Option<&'static str> {
@@ -4929,103 +5886,109 @@ fn input_kind(path: &Path) -> Option<&'static str> {
     }
 }
 
-fn watch_path_relevant(root: &Path, path: &Path) -> bool {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    };
-    let Ok(relative_path) = absolute.strip_prefix(root) else {
-        return false;
-    };
-    !relative_path.starts_with(INDEX_DIRECTORY)
-        && !relative_path.starts_with(".git")
-        && !relative_path.starts_with("target")
-        && (absolute.is_dir() || input_kind(&absolute).is_some() || !absolute.exists())
-}
-
-fn inputs_from_watch_paths(
-    root: &Path,
-    previous: &BTreeMap<String, (String, String)>,
-    paths: &BTreeSet<PathBuf>,
-) -> BTreeMap<String, (String, String)> {
-    let mut inputs = previous.clone();
-    for path in paths {
-        let absolute = if path.is_absolute() {
-            path.clone()
-        } else {
-            root.join(path)
-        };
-        let Ok(relative_path) = absolute.strip_prefix(root) else {
-            continue;
-        };
-        if relative_path.starts_with(INDEX_DIRECTORY)
-            || relative_path.starts_with(".git")
-            || relative_path.starts_with("target")
-        {
-            continue;
-        }
-        let relative_path = relative(root, &absolute);
-        if absolute.is_dir() {
-            for nested in workspace_files(&absolute) {
-                let Some(kind) = input_kind(&nested) else {
-                    continue;
-                };
-                if let Ok(bytes) = fs::read(&nested) {
-                    inputs.insert(
-                        relative(root, &nested),
-                        (kind.into(), format!("b3:{}", blake3::hash(&bytes).to_hex())),
-                    );
-                }
-            }
-        } else if absolute.exists() {
-            let Some(kind) = input_kind(&absolute) else {
-                continue;
-            };
-            if let Ok(bytes) = fs::read(&absolute) {
-                inputs.insert(
-                    relative_path,
-                    (kind.into(), format!("b3:{}", blake3::hash(&bytes).to_hex())),
-                );
-            }
-        } else {
-            inputs.retain(|candidate, _| {
-                candidate != &relative_path
-                    && !Path::new(candidate).starts_with(Path::new(&relative_path))
-            });
-        }
-    }
-    inputs
-}
-
 fn changed_inputs_still_match(
     root: &Path,
     inputs: &BTreeMap<String, (String, String)>,
     changed: &[(String, String)],
 ) -> bool {
-    changed.iter().all(|(path, _)| {
-        let absolute = root.join(path);
-        let Some((_, expected)) = inputs.get(path) else {
-            return !absolute.exists();
-        };
-        if let Some(expected) = expected.strip_prefix("b3:") {
-            return fs::read(&absolute)
-                .ok()
-                .is_some_and(|bytes| blake3::hash(&bytes).to_hex().as_str() == expected);
-        }
-        if let Some(expected) = expected.strip_prefix("git:") {
-            return command_text(root, &["hash-object", "--", path])
-                .is_some_and(|actual| actual == expected);
-        }
-        false
+    // Each input is re-hashed with the scheme that produced its identity.
+    let (git, other): (Vec<String>, Vec<String>) = changed
+        .iter()
+        .filter(|(path, _)| inputs.contains_key(path))
+        .map(|(path, _)| path.clone())
+        .partition(|path| inputs[path].1.starts_with("git:"));
+    let mut current = content_hashes(root, &git, true);
+    current.extend(content_hashes(root, &other, false));
+    changed.iter().all(|(path, _)| match inputs.get(path) {
+        None => !root.join(path).exists(),
+        Some((_, expected)) => current.get(path) == Some(expected),
     })
 }
 
-fn git_tracked_blob_ids(root: &Path) -> HashMap<String, String> {
-    let Some(output) = git_output(root, &["ls-files", "-s", "-z"]) else {
-        return HashMap::new();
+/// Inputs added, modified, or removed between two input states, with their
+/// kind (the previous kind for removed inputs).
+fn changed_inputs(
+    previous: &BTreeMap<String, (String, String)>,
+    inputs: &BTreeMap<String, (String, String)>,
+) -> Vec<(String, String)> {
+    inputs
+        .iter()
+        .filter(|(path, input)| previous.get(*path) != Some(*input))
+        .map(|(path, (kind, _))| (path.clone(), kind.clone()))
+        .chain(
+            previous
+                .iter()
+                .filter(|(path, _)| !inputs.contains_key(*path))
+                .map(|(path, (kind, _))| (path.clone(), kind.clone())),
+        )
+        .collect()
+}
+
+/// Files recorded as producing a syntax edge: `files` when present (edges a
+/// short-name collision lets several files yield), otherwise `file`.
+fn edge_contributors(metadata: &str) -> BTreeSet<String> {
+    let Ok(value) = serde_json::from_str::<Value>(metadata) else {
+        return BTreeSet::new();
     };
-    output
+    match value.get("files").and_then(Value::as_array) {
+        Some(files) => files
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        None => value
+            .get("file")
+            .and_then(Value::as_str)
+            .map(|file| BTreeSet::from([file.to_owned()]))
+            .unwrap_or_default(),
+    }
+}
+
+fn contributors_metadata(files: &BTreeSet<String>) -> Value {
+    json!({"file": files.first(), "files": files})
+}
+
+/// Among same-named candidates, the first by location. Short-name lookups used
+/// to take the lowest node id, which depends on which symbols an incremental
+/// refresh re-inserted, so incremental and full results could differ.
+fn first_by_location<'a>(candidates: impl Iterator<Item = &'a Node>) -> Option<&'a Node> {
+    candidates.min_by(|left, right| {
+        (
+            left.file.as_str(),
+            left.start_line,
+            left.canonical_name.as_str(),
+        )
+            .cmp(&(
+                right.file.as_str(),
+                right.start_line,
+                right.canonical_name.as_str(),
+            ))
+    })
+}
+
+/// Orders enclosing candidates innermost first, breaking ties by location
+/// rather than by node id.
+fn innermost_key(node: &Node) -> (usize, usize, &str) {
+    (
+        node.end_line.saturating_sub(node.start_line),
+        node.start_line,
+        node.canonical_name.as_str(),
+    )
+}
+
+/// Numbered SQL parameters `?1,…,?count`; a numbered parameter may appear
+/// several times in one statement while being bound once.
+fn placeholders(count: usize) -> String {
+    (1..=count)
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Index blob ids of tracked files, or `None` outside a Git work tree.
+fn git_tracked_blob_ids(root: &Path) -> Option<HashMap<String, String>> {
+    let output = git_output(root, &["ls-files", "-s", "-z"])?;
+    let ids = output
         .split(|byte| *byte == 0)
         .filter_map(|record| {
             let record = String::from_utf8_lossy(record);
@@ -5036,16 +5999,29 @@ fn git_tracked_blob_ids(root: &Path) -> HashMap<String, String> {
             let stage = fields.next()?;
             (stage == "0").then(|| (path.to_owned(), oid.to_owned()))
         })
-        .collect()
+        .collect();
+    Some(ids)
 }
 
-fn git_dirty_paths(root: &Path) -> BTreeSet<String> {
-    let Some(output) = git_output(
+/// Paths `git status` reports as differing from `HEAD`, including untracked
+/// files and both sides of a rename, or `None` outside a Git work tree.
+///
+/// Porcelain paths are relative to the repository top level while every other
+/// input path is relative to `root`, so a root below the top level has its
+/// prefix stripped and paths outside it dropped.
+fn git_dirty_paths(root: &Path) -> Option<BTreeSet<String>> {
+    let prefix = command_text(root, &["rev-parse", "--show-prefix"])?;
+    let output = git_output(
         root,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    ) else {
-        return BTreeSet::new();
-    };
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            ".",
+        ],
+    )?;
     let mut dirty = BTreeSet::new();
     let mut expect_rename_source = false;
     for record in output
@@ -5065,7 +6041,15 @@ fn git_dirty_paths(root: &Path) -> BTreeSet<String> {
         dirty.insert(record[3..].to_owned());
         expect_rename_source = status.contains('R') || status.contains('C');
     }
-    dirty
+    if prefix.is_empty() {
+        return Some(dirty);
+    }
+    Some(
+        dirty
+            .into_iter()
+            .filter_map(|path| path.strip_prefix(&prefix).map(str::to_owned))
+            .collect(),
+    )
 }
 
 fn workspace_files(root: &Path) -> Vec<PathBuf> {
@@ -5082,7 +6066,9 @@ fn workspace_files(root: &Path) -> Vec<PathBuf> {
         return output
             .split(|byte| *byte == 0)
             .filter(|path| !path.is_empty())
-            .map(|path| root.join(String::from_utf8_lossy(path).as_ref()))
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .filter(|path| !excluded_from_inputs(root, path))
+            .map(|path| root.join(path))
             .filter(|path| path.is_file())
             .collect();
     }
@@ -5113,14 +6099,6 @@ fn rustc_host_triple() -> Option<String> {
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .find_map(|line| line.strip_prefix("host: ").map(str::to_owned))
-}
-
-fn rust_analyzer_version(program: &Path) -> Option<String> {
-    let output = Command::new(program).arg("--version").output().ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
@@ -5176,11 +6154,6 @@ fn validate_checkpoint_ref(reference: &str) -> Result<()> {
         "invalid checkpoint reference"
     );
     Ok(())
-}
-fn cargo_packages(root: &Path) -> Vec<(String, String, String)> {
-    cargo_metadata(root)
-        .map(|metadata| cargo_packages_from_metadata(&metadata))
-        .unwrap_or_default()
 }
 fn cargo_metadata(root: &Path) -> Result<Value> {
     let output = Command::new("cargo")
@@ -5693,7 +6666,9 @@ fn terms(input: &str) -> Vec<String> {
     if values.is_empty() {
         vec!["".into()]
     } else {
-        values
+        // Stopwords and single letters OR-ed into the FTS query matched almost
+        // every row; they are dropped unless nothing else remains.
+        relevance::meaningful_terms(values)
     }
 }
 
@@ -5803,16 +6778,6 @@ fn add_rrf_hit(
     hit.channels.insert(channel.to_owned());
 }
 
-/// Keeps the prefix of `values` that fits the remaining byte budget and reports
-/// how many were dropped, so a consultation can say what it left out instead
-/// of truncating silently.
-fn budget_section(values: Vec<Value>, used: &mut usize, max_bytes: usize) -> (Vec<Value>, usize) {
-    let total = values.len();
-    let kept = budget_values(values, used, max_bytes);
-    let omitted = total - kept.len();
-    (kept, omitted)
-}
-
 /// Reads the `supersedes` column, a JSON array of decision IDs. Databases
 /// written before multi-target supersession stored one bare ID;
 /// `initialize_schema` rewrites those, and this tolerates one that slipped
@@ -5851,15 +6816,22 @@ fn fts_query(query: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(" OR ")
 }
-fn steering_is_active(steering: &Value) -> bool {
-    if steering["status"] != "active" {
-        return false;
-    }
-    steering["expires_at"]
-        .as_str()
-        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-        .is_none_or(|expires_at| expires_at > Utc::now())
+/// Agent and contributor instruction files that `live_instructions` reads live.
+const INSTRUCTION_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", "CONTEXT.md", "CONTRIBUTING.md"];
+
+fn is_instruction_file(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    INSTRUCTION_FILES.contains(&name)
 }
+
+/// The first `count` entries of a JSON array, or the value itself.
+fn first_values(value: &Value, count: usize) -> Value {
+    match value.as_array() {
+        Some(values) => json!(values.iter().take(count).collect::<Vec<_>>()),
+        None => value.clone(),
+    }
+}
+
 fn dedupe_nodes(nodes: &mut Vec<Node>) {
     let mut seen = BTreeSet::new();
     nodes.retain(|n| seen.insert(n.id));
@@ -6050,37 +7022,38 @@ mod tests {
     }
 
     #[test]
-    fn rust_analyzer_uses_bounded_background_resources() {
-        let options = rust_analyzer_initialization_options();
-        assert_eq!(options["numThreads"], RUST_ANALYZER_THREADS);
-        assert_eq!(options["cachePriming"]["enable"], false);
-        assert_eq!(
-            options["cargo"]["extraEnv"]["CARGO_BUILD_JOBS"],
-            RUST_ANALYZER_THREADS.to_string()
-        );
-        assert_eq!(options["checkOnSave"], false);
-    }
-
-    #[test]
-    fn rust_analyzer_requires_explicit_opt_in() {
-        assert!(!rust_analyzer_enabled(None));
-        assert!(!rust_analyzer_enabled(Some("0")));
-        assert!(!rust_analyzer_enabled(Some("false")));
-        assert!(rust_analyzer_enabled(Some("1")));
-        assert!(rust_analyzer_enabled(Some("TRUE")));
-        assert!(rust_analyzer_enabled(Some(" yes ")));
-    }
-
-    #[test]
     fn opening_service_does_not_start_rust_analyzer() {
         let d = fixture();
-        let service = Service::open(d.path()).unwrap();
+        let mut service = Service::open(d.path()).unwrap();
+        service.ra_enabled = false;
         assert_eq!(service.index_status()["rust_analyzer_running"], false);
         assert_eq!(
             service.index_status()["rust_analyzer_start_attempted"],
             false
         );
         assert!(service.index_status()["rust_analyzer_program"].is_string());
+        assert_eq!(service.index_status()["rust_analyzer_state"], "disabled");
+        assert!(
+            service.index_status()["rust_analyzer_hint"]
+                .as_str()
+                .unwrap()
+                .contains("semantic.enable")
+        );
+    }
+
+    #[test]
+    fn consultation_says_how_to_enable_a_disabled_rust_analyzer() {
+        let d = fixture();
+        let mut service = Service::open(d.path()).unwrap();
+        let hinted = |service: &Service| {
+            service.consult("Rename the store", 3_000).unwrap()["next_steps"]
+                .to_string()
+                .contains("semantic.enable")
+        };
+        service.ra_enabled = false;
+        assert!(hinted(&service));
+        service.ra_enabled = true;
+        assert!(!hinted(&service));
     }
 
     #[test]
@@ -6089,21 +7062,29 @@ mod tests {
         let mut service = Service::open(d.path()).unwrap();
         service.ra_enabled = true;
         service.ra_program = PathBuf::from("/definitely/missing/rust-analyzer");
-        service.start_rust_analyzer_if_enabled();
-        service.start_rust_analyzer_if_enabled();
+        assert!(service.analyzer_for_index().is_none());
+        assert!(service.analyzer_for_index().is_none());
         let status = service.index_status();
         assert_eq!(status["rust_analyzer_start_attempted"], true);
         assert_eq!(status["rust_analyzer_running"], false);
+        assert_eq!(status["rust_analyzer_program_found"], false);
+        assert!(
+            status["rust_analyzer_hint"]
+                .as_str()
+                .unwrap()
+                .contains("was not found")
+        );
         assert!(
             status["rust_analyzer_error"]
                 .as_str()
                 .unwrap()
                 .contains("starting rust-analyzer")
         );
-        assert_eq!(
-            rust_analyzer_program(Some(OsString::from("/custom/rust-analyzer"))),
-            PathBuf::from("/custom/rust-analyzer")
-        );
+        // The first failure retries at once; repeated failures back off.
+        assert_eq!(status["rust_analyzer_state"], "restarting");
+        assert_eq!(service.semantic_status().unwrap()["starts"], 2);
+        assert!(service.analyzer_for_index().is_none());
+        assert_eq!(service.semantic_status().unwrap()["starts"], 2);
     }
 
     #[test]
@@ -6319,6 +7300,8 @@ mod tests {
                     priority: "high".into(),
                     status: "active".into(),
                     expires_at: None,
+                    supersedes: vec![],
+                    recorded_by: String::new(),
                 })
                 .unwrap();
             service
@@ -6447,7 +7430,7 @@ mod tests {
         fs::write(d.path().join("staged.txt"), "staged\n").unwrap();
         git(d.path(), &["add", "staged.txt"]);
         fs::write(d.path().join("src/lib.rs"), "pub struct Pending;\n").unwrap();
-        fs::write(d.path().join("untracked.txt"), "excluded\n").unwrap();
+        fs::write(d.path().join("untracked.txt"), "only pending\n").unwrap();
         // Local validation must not invoke configured external diff programs.
         git(
             d.path(),
@@ -6455,7 +7438,7 @@ mod tests {
         );
         let committed = service
             .validate_change_from_source(
-                context_id,
+                Some(context_id),
                 &DiffSource::GitComparison {
                     base_ref: base.clone(),
                     target: DiffTarget::Head,
@@ -6477,7 +7460,7 @@ mod tests {
         assert_eq!(committed["analysis_target"], "current_worktree");
         let combined = service
             .validate_change_from_source(
-                context_id,
+                Some(context_id),
                 &DiffSource::GitComparison {
                     base_ref: base,
                     target: DiffTarget::Worktree,
@@ -6498,12 +7481,105 @@ mod tests {
         );
         assert_eq!(combined["diff_scope"]["head_commit"], head);
         assert!(combined["diff_scope"]["target_commit"].is_null());
+        // Only the default pending diff includes untracked, non-ignored files
+        // (the fixture never commits its Cargo.lock); the explicit comparisons
+        // above keep excluding them.
         let pending = service.validate_change(context_id, None, false).unwrap();
         assert_eq!(
             pending["changed_files"],
-            json!(["src/lib.rs", "staged.txt"])
+            json!(["Cargo.lock", "src/lib.rs", "staged.txt", "untracked.txt"])
         );
         assert_eq!(pending["diff_scope"]["source"], "pending");
+        assert_eq!(pending["diff_scope"]["tracked_only"], false);
+        assert_eq!(
+            pending["diff_scope"]["untracked"]["paths"],
+            json!(["Cargo.lock", "untracked.txt"])
+        );
+        assert!(
+            pending["diff_scope"]["untracked"]["paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|path| !path
+                    .as_str()
+                    .unwrap()
+                    .starts_with(".rust-repo-intelligence/"))
+        );
+    }
+
+    #[test]
+    fn validation_without_a_prepared_context_reports_only_what_needs_one_as_unavailable() {
+        let d = git_fixture();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        fs::write(d.path().join("src/lib.rs"), "pub struct Unprepared;\n").unwrap();
+        fs::write(d.path().join("notes.md"), "new file\n").unwrap();
+        let report = service
+            .validate_change_from_source(None, &DiffSource::Pending, false)
+            .unwrap();
+        assert_eq!(report["prepared"], false);
+        assert!(
+            report["changed_files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|file| file == "src/lib.rs")
+        );
+        assert!(
+            report["changed_files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|file| file == "notes.md")
+        );
+        for field in ["architecture_delta", "unmodified_expected_callers"] {
+            assert_eq!(report[field]["status"], "unavailable", "{field}");
+            assert_eq!(report[field]["reason"], "no prepared context", "{field}");
+        }
+        // Diff-driven checks still run.
+        assert!(report["architectural_violations"].is_array());
+        assert!(report["legacy_paths_touched"].is_array());
+        assert_eq!(report["validation_status"]["verdict"], "not_run");
+        assert_eq!(report["blocking"]["blocked"], false);
+        // The recorded context owns the activated obligations and can be
+        // validated again by id.
+        let context_id = report["context_id"].as_str().unwrap();
+        assert!(context_id.starts_with("ctx_"));
+        assert!(service.quality_validation_queue(context_id).is_ok());
+        let again = service.validate_change(context_id, None, false).unwrap();
+        assert_eq!(again["prepared"], false);
+        assert_eq!(again["architecture_delta"]["reason"], "no prepared context");
+    }
+
+    #[test]
+    fn one_prepared_context_serves_every_validation_of_a_long_change() {
+        let d = git_fixture();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        let context = service
+            .prepare_change("Iterative refactor", &[], 1, Some(1_000))
+            .unwrap();
+        let context_id = context["context_id"].as_str().unwrap();
+        let mut seen = Vec::new();
+        for (step, file) in ["first.rs", "second.rs", "third.rs"].iter().enumerate() {
+            fs::write(
+                d.path().join("src").join(file),
+                format!("pub fn step{step}() {{}}\n"),
+            )
+            .unwrap();
+            let report = service.validate_change(context_id, None, false).unwrap();
+            assert_eq!(report["context_id"], context_id);
+            assert_eq!(report["prepared"], true);
+            assert_ne!(report["architecture_delta"]["status"], "unavailable");
+            assert!(report["unmodified_expected_callers"].is_array());
+            seen.push(format!("src/{file}"));
+            let changed = report["changed_files"].as_array().unwrap();
+            assert!(
+                seen.iter()
+                    .all(|file| changed.iter().any(|changed| changed == file)),
+                "milestone {step} must cover every file changed so far: {changed:?}"
+            );
+        }
     }
 
     #[test]
@@ -6533,11 +7609,11 @@ mod tests {
         assert!(resolved.text.len() > 890_000);
         fs::write(d.path().join("validation.patch"), &resolved.text).unwrap();
         let git_report = service
-            .validate_change_from_source(context_id, &source, false)
+            .validate_change_from_source(Some(context_id), &source, false)
             .unwrap();
         let file_report = service
             .validate_change_from_source(
-                context_id,
+                Some(context_id),
                 &DiffSource::PatchFile("validation.patch".into()),
                 false,
             )
@@ -6582,7 +7658,11 @@ mod tests {
         let resolved = source.resolve(d.path()).unwrap();
         assert!(resolved.text.contains("GIT binary patch"));
         let report = service
-            .validate_change_from_source(context["context_id"].as_str().unwrap(), &source, false)
+            .validate_change_from_source(
+                Some(context["context_id"].as_str().unwrap()),
+                &source,
+                false,
+            )
             .unwrap();
         assert_eq!(
             report["changed_files"],
@@ -6945,7 +8025,7 @@ mod tests {
             .db
             .query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))
             .unwrap();
-        let result: Result<()> = service.with_savepoint("rollback_test", |service| {
+        let result: Result<()> = service.with_index_build(|service| {
             service.db.execute("DELETE FROM nodes", [])?;
             bail!("injected failure")
         });
@@ -6981,9 +8061,13 @@ mod tests {
                 priority: "high".into(),
                 status: "active".into(),
                 expires_at: None,
+                supersedes: vec![],
+                recorded_by: String::new(),
             })
             .unwrap();
-        let listed = service.steering_list(Some("injectable Store"), 10).unwrap();
+        let listed = service
+            .steering_list(Some("injectable Store"), None, 10)
+            .unwrap();
         assert_eq!(listed["steerings"][0]["priority"], "high");
         let context = service
             .prepare_change("change Store", &["Store".into()], 1, Some(500))
@@ -7042,6 +8126,12 @@ mod tests {
             "# Interface policy\nUse the ocean theme and run the accessibility workflow for UI designs.\n",
         )
         .unwrap();
+        fs::create_dir_all(d.path().join("docs")).unwrap();
+        fs::write(
+            d.path().join("docs/design.md"),
+            "# Design policy\nEvery settings screen uses the shared form layout.\n",
+        )
+        .unwrap();
         let mut service = Service::open(d.path()).unwrap();
         service.refresh_if_stale().unwrap();
         service
@@ -7064,6 +8154,8 @@ mod tests {
                 priority: "high".into(),
                 status: "active".into(),
                 expires_at: None,
+                supersedes: vec![],
+                recorded_by: String::new(),
             })
             .unwrap();
 
@@ -7084,18 +8176,235 @@ mod tests {
                 .iter()
                 .any(|steering| steering["title"] == "Use established visual language")
         );
+        // Instruction files are read live and inlined once, not repeated as
+        // indexed governing documents.
+        let instructions = consultation["live_instructions"].as_array().unwrap();
+        let agents = instructions
+            .iter()
+            .find(|document| document["path"] == "AGENTS.md")
+            .unwrap();
+        assert_eq!(agents["inlined"], true);
+        assert!(agents["evidence"].as_str().unwrap().contains("ocean theme"));
+        let documents = consultation["governing_documents"].as_array().unwrap();
         assert!(
-            consultation["governing_documents"]
-                .as_array()
-                .unwrap()
+            documents
                 .iter()
-                .any(|document| document["path"] == "AGENTS.md")
+                .all(|document| document["path"] != "AGENTS.md")
         );
+        let design = documents
+            .iter()
+            .find(|document| document["path"] == "docs/design.md")
+            .unwrap();
+        assert!(matches!(
+            design["relevance"].as_str(),
+            Some("topic_match" | "repository_policy")
+        ));
         assert!(
             consultation["context_budget"]["estimated_tokens"]
                 .as_u64()
                 .unwrap()
                 <= 4_000
+        );
+    }
+
+    fn propose_work(service: &Service, title: &str, status: &str, scope: &[&str]) -> String {
+        let input: WorkItemInput = serde_json::from_value(json!({
+            "title": title,
+            "status": status,
+            "scope": scope,
+            "evidence": ["x".repeat(400)],
+            "acceptance_criteria": [format!("{title} is verified")],
+        }))
+        .unwrap();
+        service.work_propose(input).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn ids(values: &Value) -> Vec<String> {
+        values
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value["id"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn consultation_reports_only_relevant_open_work_compactly() {
+        let d = fixture();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        let relevant = propose_work(&service, "Consult budget packing", "accepted", &[]);
+        let done = propose_work(&service, "Consult budget packing cleanup", "done", &[]);
+        let unrelated = propose_work(
+            &service,
+            "Refresh the logo on the marketing page",
+            "proposed",
+            &["web/site"],
+        );
+        let same_path = propose_work(
+            &service,
+            "Tune consult budget packing",
+            "in_progress",
+            &["crates/core"],
+        );
+        let other_path = propose_work(
+            &service,
+            "Tune consult budget packing elsewhere",
+            "accepted",
+            &["crates/other/src/budget.rs"],
+        );
+
+        let topic = "Please improve the consult budget packing for the settings page in crates/core/src/budget.rs";
+        let consultation = service.consult(topic, 4_000).unwrap();
+        let work = ids(&consultation["known_work"]);
+        assert!(work.contains(&relevant), "{work:?}");
+        assert!(work.contains(&same_path), "{work:?}");
+        for excluded in [&done, &unrelated, &other_path] {
+            assert!(!work.contains(excluded), "{excluded} in {work:?}");
+        }
+        // A path-related item outranks one that only shares vocabulary.
+        assert_eq!(work[0], same_path);
+        let brief = &consultation["known_work"][0];
+        assert_eq!(brief["detail"], "work.get");
+        assert_eq!(brief["status"], "in_progress");
+        assert!(brief.get("evidence").is_none());
+        assert!(brief["summary"].as_str().unwrap().ends_with("is verified"));
+
+        // work.list keeps full rows and every status, ranked by the same rules.
+        let listed = service.work_list(Some(topic), 10).unwrap();
+        let listed_ids = ids(&listed["items"]);
+        assert!(listed_ids.contains(&done));
+        assert!(!listed_ids.contains(&unrelated));
+        assert!(!listed_ids.contains(&other_path));
+        assert!(listed["items"][0].get("evidence").is_some());
+    }
+
+    #[test]
+    fn consultation_keeps_ci_configuration_to_ci_topics() {
+        let d = fixture();
+        fs::create_dir_all(d.path().join(".github/workflows")).unwrap();
+        fs::write(
+            d.path().join(".github/workflows/ci.yml"),
+            "name: CI\njobs:\n  settings:\n    steps:\n      - run: cargo test settings feature\n",
+        )
+        .unwrap();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        let ci_paths = |topic: &str| {
+            service.consult(topic, 4_000).unwrap()["governing_documents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|document| document["path"] == ".github/workflows/ci.yml")
+                .map(|document| document["relevance"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(ci_paths("Design a settings feature").is_empty());
+        assert_eq!(
+            ci_paths("Fix the CI workflow for the settings tests"),
+            [json!("ci_configuration_for_topic")]
+        );
+    }
+
+    #[test]
+    fn consultation_compacts_before_dropping_and_says_how_to_read_the_rest() {
+        let d = fixture();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh_if_stale().unwrap();
+        for index in 0..4 {
+            let mut global = decision(&format!("Global rule {index}"), &[]);
+            global.reason = "r".repeat(900);
+            service.record_decision(global).unwrap();
+        }
+        for index in 0..10 {
+            service
+                .record_steering(RecordSteering {
+                    title: format!("Steer {index}"),
+                    instruction: "s".repeat(900),
+                    scope: vec![],
+                    priority: "normal".into(),
+                    status: "active".into(),
+                    expires_at: None,
+                    supersedes: vec![],
+                    recorded_by: String::new(),
+                })
+                .unwrap();
+        }
+        let work = propose_work(&service, "Settings storage migration", "accepted", &[]);
+
+        let consultation = service
+            .consult("Plan the settings storage migration", 3_000)
+            .unwrap();
+        let budget = &consultation["context_budget"];
+        assert!(budget["serialized_bytes"].as_u64().unwrap() <= 12_000);
+        assert_eq!(consultation["decisions"].as_array().unwrap().len(), 4);
+        assert_eq!(consultation["steerings"].as_array().unwrap().len(), 10);
+        assert_eq!(ids(&consultation["known_work"]), [work]);
+        assert_eq!(budget["omitted"]["steerings"], 0);
+        assert!(budget["compacted"]["steerings"].as_u64().unwrap() > 0);
+        assert!(
+            budget["fetch_more"]["steerings"]
+                .as_str()
+                .unwrap()
+                .contains("steering.list")
+        );
+        assert_eq!(budget["truncated"], true);
+        // Decisions outrank steerings when upgrading to full detail.
+        assert!(
+            consultation["decisions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|decision| decision.get("rationale").is_some())
+        );
+        assert!(consultation.get("snapshot").is_some());
+        assert!(consultation.get("next_steps").is_some());
+    }
+
+    #[test]
+    fn consultation_stubs_instruction_files_outside_the_topic_and_budget() {
+        let d = fixture();
+        fs::write(d.path().join("AGENTS.md"), "root policy\n").unwrap();
+        for directory in ["crates/core", "crates/other"] {
+            fs::create_dir_all(d.path().join(directory)).unwrap();
+            fs::write(
+                d.path().join(directory).join("AGENTS.md"),
+                format!("{directory} policy\n"),
+            )
+            .unwrap();
+        }
+        fs::write(d.path().join("CONTEXT.md"), "c".repeat(30_000)).unwrap();
+        let service = Service::open(d.path()).unwrap();
+        let consultation = service
+            .consult("Change crates/core/src/lib.rs parsing", 2_000)
+            .unwrap();
+        let instructions = consultation["live_instructions"].as_array().unwrap();
+        let find = |path: &str| {
+            instructions
+                .iter()
+                .find(|document| document["path"] == path)
+                .unwrap_or_else(|| panic!("{path} missing from {instructions:?}"))
+        };
+        assert_eq!(find("AGENTS.md")["inlined"], true);
+        assert_eq!(find("crates/core/AGENTS.md")["inlined"], true);
+        let other = find("crates/other/AGENTS.md");
+        assert_eq!(other["inlined"], false);
+        assert!(other.get("evidence").is_none());
+        assert!(other["content_digest"].as_str().unwrap().starts_with("b3:"));
+        // A root file too large for the budget is still listed, as a stub.
+        let context = find("CONTEXT.md");
+        assert_eq!(context["inlined"], false);
+        assert_eq!(context["bytes"], 30_000);
+        assert_eq!(
+            consultation["context_budget"]["omitted"]["live_instructions"],
+            0
+        );
+        assert_eq!(
+            consultation["context_budget"]["compacted"]["live_instructions"],
+            1
         );
     }
 
@@ -7186,7 +8495,6 @@ mod tests {
             "pub trait Store { fn load(&self); }\nfn uses(s: &dyn Store) { s.load(); }\npub fn newly_indexed() {}\n",
         )
         .unwrap();
-        service.watcher_trusted = false;
         service.refresh_if_stale().unwrap();
 
         let after: (Vec<u8>, String, String) = service
@@ -7262,16 +8570,761 @@ mod tests {
         assert_eq!(cached[0].provenance, "RustAnalyzerCached");
     }
 
+    fn metadata_count(service: &Service, key: &str) -> usize {
+        service
+            .metadata_value(key)
+            .unwrap()
+            .and_then(|value| value.parse().ok())
+            .unwrap()
+    }
+
+    fn node_ids(service: &Service) -> BTreeMap<String, i64> {
+        service
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .map(|node| (node.canonical_name, node.id))
+            .collect()
+    }
+
+    /// Syntax edges by endpoint names, comparable across node-id assignments.
+    fn named_edges(service: &Service) -> BTreeSet<(String, String, String)> {
+        service
+            .db
+            .prepare(
+                "SELECT s.canonical_name,d.canonical_name,e.kind FROM edges e \
+                 JOIN nodes s ON s.id=e.src JOIN nodes d ON d.id=e.dst WHERE e.provenance='Syntax'",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// Syntax edges with their evidence metadata, by endpoint names.
+    fn edge_records(service: &Service) -> BTreeSet<(String, String, String, String)> {
+        service
+            .db
+            .prepare(
+                "SELECT s.canonical_name,d.canonical_name,e.kind,e.metadata FROM edges e \
+                 JOIN nodes s ON s.id=e.src JOIN nodes d ON d.id=e.dst WHERE e.provenance='Syntax'",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn unresolved_names(service: &Service) -> BTreeSet<(String, String)> {
+        service
+            .db
+            .prepare("SELECT file,name FROM unresolved_references")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
     #[test]
-    fn watcher_hints_update_only_changed_input_hashes() {
+    fn a_full_rebuild_reuses_every_unchanged_symbol_vector() {
         let d = fixture();
-        let previous = index_inputs(d.path());
-        fs::write(d.path().join("src/lib.rs"), "pub fn watched() {}\n").unwrap();
-        let paths = BTreeSet::from([d.path().join("src/lib.rs")]);
-        let updated = inputs_from_watch_paths(d.path(), &previous, &paths);
-        assert_ne!(updated["src/lib.rs"].1, previous["src/lib.rs"].1);
-        assert!(updated["src/lib.rs"].1.starts_with("b3:"));
-        assert_eq!(updated["Cargo.toml"], previous["Cargo.toml"]);
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh(Some("workspace")).unwrap();
+        let nodes = service.all_nodes().unwrap().len();
+        assert!(nodes > 0);
+        assert_eq!(metadata_count(&service, "embedding_recomputed"), nodes);
+        service.refresh(Some("full")).unwrap();
+        // Node ids are reassigned by a full rebuild, yet every card is unchanged.
+        let status = service.embedding_index_status();
+        assert_eq!(status["last_build"]["reused"], nodes);
+        assert_eq!(status["last_build"]["recomputed"], 0);
+        assert_eq!(status["vectors"], nodes as i64);
+    }
+
+    #[test]
+    fn an_edit_reindexes_only_affected_symbols_and_matches_a_full_rebuild() {
+        let d = fixture();
+        fs::write(
+            d.path().join("src/lib.rs"),
+            "pub mod helpers;\npub mod callers;\npub mod unrelated;\n",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("src/helpers.rs"),
+            "pub fn helper() -> u8 { 1 }\npub fn untouched_helper() -> u8 { 2 }\n",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("src/callers.rs"),
+            "pub fn caller() -> u8 { helper() }\n",
+        )
+        .unwrap();
+        let mut unrelated = String::new();
+        for index in 0..40 {
+            unrelated.push_str(&format!(
+                "pub fn standalone_{index}() -> u8 {{ {index} }}\n"
+            ));
+        }
+        fs::write(d.path().join("src/unrelated.rs"), unrelated).unwrap();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh(None).unwrap();
+        let before = node_ids(&service);
+        let total = before.len();
+        assert!(named_edges(&service).contains(&(
+            "src::callers::caller".into(),
+            "src::helpers::helper".into(),
+            "CALLS_DIRECT".into()
+        )));
+
+        // A body edit plus a new symbol: only the edited file is re-parsed.
+        fs::write(
+            d.path().join("src/helpers.rs"),
+            "pub fn helper() -> u8 { 3 }\npub fn untouched_helper() -> u8 { 2 }\npub fn freshly_added_helper() -> u8 { 4 }\n",
+        )
+        .unwrap();
+        service.refresh(None).unwrap();
+        let after = node_ids(&service);
+        for (name, id) in &before {
+            assert_eq!(after.get(name), Some(id), "{name} kept its node id");
+        }
+        assert_eq!(after.len(), total + 1);
+        let cards = metadata_count(&service, "embedding_cards_built");
+        assert!(
+            cards < total / 2,
+            "built {cards} cards for a one-file edit of {total} symbols"
+        );
+        assert!(
+            !service
+                .search_nodes(&terms("freshly_added_helper"), 5)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(named_edges(&service).contains(&(
+            "src::callers::caller".into(),
+            "src::helpers::helper".into(),
+            "CALLS_DIRECT".into()
+        )));
+
+        // Removing the callee re-resolves the unchanged caller's references.
+        fs::write(
+            d.path().join("src/helpers.rs"),
+            "pub fn untouched_helper() -> u8 { 2 }\npub fn freshly_added_helper() -> u8 { 4 }\n",
+        )
+        .unwrap();
+        service.refresh(None).unwrap();
+        assert!(
+            !named_edges(&service)
+                .iter()
+                .any(|(_, target, _)| target == "src::helpers::helper")
+        );
+        assert!(
+            service
+                .search_nodes(&terms("helper"), 10)
+                .unwrap()
+                .iter()
+                .all(|node| node.canonical_name != "src::helpers::helper")
+        );
+
+        // A second definition makes the name ambiguous for the unchanged caller.
+        fs::write(
+            d.path().join("src/helpers.rs"),
+            "pub fn helper() -> u8 { 1 }\npub fn untouched_helper() -> u8 { 2 }\n",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("src/unrelated.rs"),
+            "pub fn helper() -> u8 { 9 }\n",
+        )
+        .unwrap();
+        service.refresh(None).unwrap();
+        let incremental = (edge_records(&service), unresolved_names(&service));
+        assert!(
+            incremental
+                .1
+                .contains(&("src/callers.rs".into(), "helper".into()))
+        );
+        let incremental_count = service.all_nodes().unwrap().len();
+        service.refresh(Some("workspace")).unwrap();
+        assert_eq!(
+            incremental,
+            (edge_records(&service), unresolved_names(&service))
+        );
+        assert_eq!(service.all_nodes().unwrap().len(), incremental_count);
+    }
+
+    #[test]
+    fn an_implementation_edge_from_two_colliding_files_survives_editing_either() {
+        let d = fixture();
+        fs::write(
+            d.path().join("src/lib.rs"),
+            "pub trait Backend { fn load(&self); }\npub trait Store { fn load(&self); }\npub mod one;\npub mod two;\n",
+        )
+        .unwrap();
+        // Both files define a `Disk`; both impl headers resolve, by short
+        // name, to the same (Disk, Backend) edge.
+        let colliding = "pub struct Disk;\nimpl Backend for Disk { fn load(&self) {} }\n";
+        fs::write(d.path().join("src/one.rs"), colliding).unwrap();
+        fs::write(d.path().join("src/two.rs"), colliding).unwrap();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh(None).unwrap();
+        let implements = |service: &Service| {
+            edge_records(service)
+                .into_iter()
+                .filter(|(_, _, kind, _)| kind == "IMPLEMENTS")
+                .map(|(source, target, _, metadata)| (source, target, metadata))
+                .collect::<Vec<_>>()
+        };
+        let initial = implements(&service);
+        assert_eq!(initial.len(), 1, "{initial:?}");
+        assert_eq!(
+            edge_contributors(&initial[0].2),
+            BTreeSet::from(["src/one.rs".to_owned(), "src/two.rs".to_owned()])
+        );
+        // Retarget the impl in the file recorded first without changing any
+        // symbol name (so no other file is re-scanned), edit the other file,
+        // restore, and finally drop one impl. After each incremental refresh
+        // the graph equals a fresh full rebuild.
+        for (file, text, edges) in [
+            (
+                "src/one.rs",
+                "pub struct Disk;\nimpl Store for Disk { fn load(&self) {} }\n",
+                2,
+            ),
+            (
+                "src/two.rs",
+                "pub struct Disk;\nimpl Backend for Disk { fn load(&self) { let _ = 1; } }\n",
+                2,
+            ),
+            ("src/one.rs", colliding, 1),
+            ("src/two.rs", "pub struct Disk;\n", 1),
+        ] {
+            fs::write(d.path().join(file), text).unwrap();
+            service.refresh(None).unwrap();
+            assert_eq!(implements(&service).len(), edges, "after editing {file}");
+            let incremental = (edge_records(&service), unresolved_names(&service));
+            service.refresh(Some("workspace")).unwrap();
+            assert_eq!(
+                incremental,
+                (edge_records(&service), unresolved_names(&service)),
+                "after editing {file}"
+            );
+        }
+    }
+
+    #[test]
+    fn committing_an_indexed_edit_does_not_reprocess_it() {
+        let d = git_fixture();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh(None).unwrap();
+        fs::write(
+            d.path().join("src/lib.rs"),
+            "pub trait Store { fn load(&self); }\nfn uses(s: &dyn Store) { s.load(); }\npub fn committed_later() {}\n",
+        )
+        .unwrap();
+        fs::write(d.path().join("NOTES.md"), "untracked notes\n").unwrap();
+        service.refresh(None).unwrap();
+        let input_hash = |service: &Service, path: &str| -> String {
+            service
+                .db
+                .query_row(
+                    "SELECT content_hash FROM input_state WHERE path=?1",
+                    [path],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let dirty_hash = input_hash(&service, "src/lib.rs");
+        let untracked_hash = input_hash(&service, "NOTES.md");
+        let ids = node_ids(&service);
+        git(d.path(), &["add", "src/lib.rs", "NOTES.md"]);
+        git(d.path(), &["commit", "-q", "-m", "commit the indexed edit"]);
+        let generation = service.active_generation();
+        service.refresh(None).unwrap();
+        assert_eq!(input_hash(&service, "src/lib.rs"), dirty_hash);
+        assert_eq!(input_hash(&service, "NOTES.md"), untracked_hash);
+        assert_eq!(node_ids(&service), ids);
+        assert_eq!(metadata_count(&service, "embedding_cards_built"), 0);
+        // The new head is published, so the snapshot is current again.
+        assert_ne!(service.active_generation(), generation);
+        assert_eq!(service.status().unwrap()["stale"], false);
+        assert_eq!(
+            service.metadata_value("git_indexed_head").unwrap(),
+            command_text(d.path(), &["rev-parse", "HEAD"])
+        );
+    }
+
+    #[test]
+    fn an_unchanged_workspace_publishes_nothing_by_default() {
+        let d = fixture();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh(None).unwrap();
+        let generation = service.active_generation();
+        let ids = node_ids(&service);
+        service.refresh(None).unwrap();
+        assert_eq!(service.active_generation(), generation);
+        assert_eq!(node_ids(&service), ids);
+    }
+
+    #[test]
+    fn a_git_only_refresh_leaves_the_published_generation_stale() {
+        let d = git_fixture();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh(None).unwrap();
+        let published_head = service.metadata_value("git_indexed_head").unwrap();
+        fs::write(d.path().join("src/lib.rs"), "pub fn after_commit() {}\n").unwrap();
+        git(d.path(), &["commit", "-q", "-am", "change sources"]);
+        let generation = service.active_generation();
+        service.refresh(Some("git")).unwrap();
+        assert_eq!(service.active_generation(), generation);
+        assert_eq!(
+            service.metadata_value("git_indexed_head").unwrap(),
+            published_head
+        );
+        assert_eq!(
+            service.metadata_value("git_history_head").unwrap(),
+            command_text(d.path(), &["rev-parse", "HEAD"])
+        );
+        assert_eq!(service.status().unwrap()["stale"], true);
+        service.refresh(None).unwrap();
+        assert_eq!(service.status().unwrap()["stale"], false);
+        assert!(
+            !service
+                .search_nodes(&terms("after_commit"), 1)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn semantic_profile_and_cargo_changes_refresh_without_a_rebuild() {
+        let d = fixture();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh(None).unwrap();
+        let ids = node_ids(&service);
+        let target = service.search_nodes(&terms("Store"), 1).unwrap().remove(0);
+        let source = service.search_nodes(&terms("uses"), 1).unwrap().remove(0);
+        let snapshot = service.active_semantic_snapshot_id().unwrap();
+        service
+            .insert_edge(EdgeRecord {
+                source: source.id,
+                target: target.id,
+                kind: "REFERENCES",
+                confidence: 1.0,
+                provenance: "RustAnalyzer",
+                revision: &snapshot,
+                metadata: json!({"fixture":true}),
+            })
+            .unwrap();
+        // Compiler evidence belongs to the profile it was recorded under.
+        service
+            .db
+            .execute(
+                "UPDATE semantic_snapshots SET target_triple='another-target' WHERE id=?1",
+                [&snapshot],
+            )
+            .unwrap();
+        service.refresh(None).unwrap();
+        assert_eq!(node_ids(&service), ids);
+        assert_eq!(service.status().unwrap()["counts"]["semantic_edges"], 0);
+
+        fs::write(
+            d.path().join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\nedition='2024'\n[features]\nextra=[]\n",
+        )
+        .unwrap();
+        service.refresh(None).unwrap();
+        assert_eq!(node_ids(&service), ids);
+        assert!(
+            service.matrix().unwrap()["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|feature| feature["feature"] == "extra")
+        );
+    }
+
+    #[test]
+    fn index_build_allows_memory_writes_and_preserves_them_on_publish() {
+        let d = fixture();
+        let mut publisher = Service::open(d.path()).unwrap();
+        publisher.refresh(None).unwrap();
+        let generation = publisher.active_generation();
+        publisher
+            .with_index_build(|building| {
+                building.reindex_inner()?;
+                let memory = Service::open(d.path())?;
+                memory.db.busy_timeout(Duration::from_millis(50))?;
+                assert_eq!(memory.active_generation(), generation);
+                memory.record_decision(serde_json::from_value(json!({
+                    "title": "Recorded during indexing", "applies_to": ["Store"]
+                }))?)?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(publisher.active_generation() > generation);
+        assert_eq!(
+            publisher.decision_resource("DEC-0001").unwrap()["title"],
+            "Recorded during indexing"
+        );
+        assert_eq!(
+            publisher
+                .search_hits(&terms("Recorded during indexing"), Some("decision"), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_memory_search_update_rolls_back_steering_and_problem() {
+        let d = fixture();
+        let service = Service::open(d.path()).unwrap();
+        service.db.execute_batch("DROP TABLE search_index").unwrap();
+        let steering = serde_json::from_value(
+            json!({"title":"Atomic writes", "instruction":"Keep writes atomic"}),
+        )
+        .unwrap();
+        assert!(service.record_steering(steering).is_err());
+        let problem =
+            serde_json::from_value(json!({"report":"Database writes fail during indexing"}))
+                .unwrap();
+        assert!(service.problem_record(problem).is_err());
+        for table in [
+            "steerings",
+            "problem_records",
+            "problem_occurrences",
+            "quality_constraints",
+        ] {
+            let count: i64 = service
+                .db
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "failed command left records in {table}");
+        }
+    }
+
+    #[test]
+    fn failed_optional_export_reports_the_committed_decision() {
+        let d = fixture();
+        fs::write(d.path().join("docs"), "not a directory").unwrap();
+        let service = Service::open(d.path()).unwrap();
+        let decision = service
+            .record_decision(
+                serde_json::from_value(json!({
+                    "title":"Export failure", "materialize":true
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(decision["id"], "DEC-0001");
+        assert_eq!(decision["committed"], true);
+        assert_eq!(decision["materialization"]["status"], "failed");
+        assert_eq!(decision["materialization"]["retry_record_creation"], false);
+        assert_eq!(
+            service.decision_resource("DEC-0001").unwrap()["title"],
+            "Export failure"
+        );
+    }
+
+    #[test]
+    fn publication_failure_retains_generation_and_concurrent_memory() {
+        let d = fixture();
+        let mut publisher = Service::open(d.path()).unwrap();
+        publisher.refresh(None).unwrap();
+        let generation = publisher.active_generation();
+        let result = publisher.with_index_build(|building| {
+            building.reindex_inner()?;
+            let memory = Service::open(d.path())?;
+            memory.record_decision(serde_json::from_value(json!({"title":"Survives failed publication"}))?)?;
+            memory.db.execute_batch("CREATE TRIGGER fail_publish BEFORE INSERT ON metadata WHEN NEW.key='active_generation' BEGIN SELECT RAISE(ABORT, 'injected publication failure'); END;")?;
+            Ok(())
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("injected publication failure")
+        );
+        assert_eq!(publisher.active_generation(), generation);
+        assert_eq!(
+            publisher.decision_resource("DEC-0001").unwrap()["title"],
+            "Survives failed publication"
+        );
+        assert!(publisher.db.is_autocommit());
+        assert!(
+            !fs::read_dir(d.path().join(INDEX_DIRECTORY))
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("index-build-"))
+        );
+    }
+
+    #[test]
+    fn validation_explains_stale_and_changing_evidence() {
+        let d = fixture();
+        let mut service = Service::open(d.path()).unwrap();
+        service.refresh(None).unwrap();
+        let source = DiffSource::Inline("diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n".into());
+        fs::write(d.path().join("src/lib.rs"), "pub fn edited() {}\n").unwrap();
+        let report = service
+            .validate_change_from_source(None, &source, false)
+            .unwrap();
+        assert_eq!(report["review_evidence"]["status"], "incomplete");
+        assert_eq!(
+            report["review_evidence"]["index"]["reason"],
+            "worktree_changed"
+        );
+        assert_eq!(
+            report["review_evidence"]["semantic_correctness"],
+            "not_established"
+        );
+        assert_eq!(report["validation_status"]["verdict"], "not_run");
+        let path = d.path().join("src/lib.rs");
+        service.execution = execution::ExecutionControl::new(Duration::from_secs(30), move || {
+            fs::write(&path, "pub fn changed_during_review() {}\n")?;
+            Ok(false)
+        });
+        let report = service
+            .validate_change_from_source(None, &source, false)
+            .unwrap();
+        assert_eq!(report["review_evidence"]["status"], "changed_during_review");
+        assert_eq!(report["review_evidence"]["source_unchanged"], false);
+    }
+
+    #[test]
+    fn concurrent_decision_writers_allocate_distinct_records() {
+        let d = fixture();
+        drop(Service::open(d.path()).unwrap());
+        let barrier = std::sync::Barrier::new(4);
+        let ids = std::thread::scope(|scope| {
+            let handles = (0..4)
+                .map(|index| {
+                    let barrier = &barrier;
+                    let path = d.path();
+                    scope.spawn(move || {
+                        let service = Service::open(path).unwrap();
+                        barrier.wait();
+                        service
+                            .record_decision(
+                                serde_json::from_value(json!({"title":format!("Writer {index}")}))
+                                    .unwrap(),
+                            )
+                            .unwrap()["id"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned()
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<BTreeSet<_>>()
+        });
+        assert_eq!(ids.len(), 4);
+        assert!(ids.contains("DEC-0004"));
+    }
+
+    #[test]
+    fn failed_decision_write_leaves_no_record_for_retry() {
+        let d = fixture();
+        let service = Service::open(d.path()).unwrap();
+        service.db.execute_batch("CREATE TRIGGER fail_decision_target BEFORE INSERT ON decision_targets BEGIN SELECT RAISE(ABORT, 'injected target failure'); END;").unwrap();
+        let request = || {
+            serde_json::from_value::<RecordDecision>(json!({
+                "title": "Retry safely", "applies_to": ["src/lib.rs"]
+            }))
+            .unwrap()
+        };
+        let error = service.record_decision(request()).unwrap_err();
+        assert!(error.to_string().contains("injected target failure"));
+        let count: i64 = service
+            .db
+            .query_row("SELECT COUNT(*) FROM decisions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "a failed operation must not leave a committed decision"
+        );
+        service
+            .db
+            .execute_batch("DROP TRIGGER fail_decision_target")
+            .unwrap();
+        assert_eq!(
+            service.record_decision(request()).unwrap()["id"],
+            "DEC-0001"
+        );
+    }
+
+    #[test]
+    fn reads_during_a_refresh_see_the_previous_generation_without_waiting() {
+        let d = fixture();
+        let mut writer = Service::open(d.path()).unwrap();
+        writer.refresh(None).unwrap();
+        let generation = writer.active_generation();
+        let nodes = writer.all_nodes().unwrap().len();
+        // Hold the write transaction a refresh holds while it rebuilds.
+        writer
+            .db
+            .execute_batch("SAVEPOINT long_refresh; DELETE FROM nodes; DELETE FROM metadata WHERE key='active_generation';")
+            .unwrap();
+        let started = Instant::now();
+        let reader = Service::open(d.path()).unwrap();
+        assert_eq!(reader.active_generation(), generation);
+        assert_eq!(reader.all_nodes().unwrap().len(), nodes);
+        assert_eq!(reader.status().unwrap()["counts"]["nodes"], nodes as i64);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "read waited {:?} behind the writer",
+            started.elapsed()
+        );
+        writer
+            .db
+            .execute_batch("ROLLBACK TO long_refresh; RELEASE long_refresh;")
+            .unwrap();
+    }
+
+    #[test]
+    fn schema_migration_runs_only_for_stores_without_the_current_stamp() {
+        let d = fixture();
+        drop(Service::open(d.path()).unwrap());
+        let path = d.path().join(INDEX_DIRECTORY).join("index.sqlite3");
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        // Another process's connection opening a current store never writes,
+        // so it does not contend for the held write lock.
+        let reader = Connection::open(&path).unwrap();
+        reader.busy_timeout(Duration::from_millis(50)).unwrap();
+        initialize_schema(&reader).unwrap();
+        writer.execute_batch("ROLLBACK;").unwrap();
+        // A store without the stamp (written before it existed) is migrated.
+        writer
+            .execute("DELETE FROM metadata WHERE key='schema_fingerprint'", [])
+            .unwrap();
+        initialize_schema(&reader).unwrap();
+        let stamp: String = reader
+            .query_row(
+                "SELECT value FROM metadata WHERE key='schema_fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamp, schema_fingerprint());
+    }
+
+    #[test]
+    fn state_and_target_directories_are_never_inputs() {
+        let d = git_fixture();
+        fs::create_dir_all(d.path().join(".rust-repo-intelligence")).unwrap();
+        fs::write(d.path().join(".rust-repo-intelligence/state.json"), "{}").unwrap();
+        fs::create_dir_all(d.path().join("target/debug")).unwrap();
+        fs::write(d.path().join("target/debug/build.json"), "{}").unwrap();
+        fs::create_dir_all(d.path().join("src/target")).unwrap();
+        fs::write(d.path().join("src/target/mod.rs"), "pub fn kept() {}\n").unwrap();
+        let (inputs, worktree) = index_inputs_with_worktree(d.path());
+        assert!(inputs.contains_key("src/target/mod.rs"));
+        assert!(
+            !inputs
+                .keys()
+                .any(|path| path.starts_with(".rust-repo-intelligence"))
+        );
+        assert!(!inputs.keys().any(|path| path.starts_with("target/")));
+        assert_eq!(
+            worktree,
+            BTreeSet::from(["src/target/mod.rs".to_owned()]),
+            "only input paths are recorded as dirty"
+        );
+    }
+
+    #[test]
+    fn dirty_paths_are_relative_to_a_subdirectory_root() {
+        let d = git_fixture();
+        fs::write(d.path().join("src/lib.rs"), "pub fn edited() {}\n").unwrap();
+        fs::write(d.path().join("Cargo.toml"), "[package]\nname='edited'\n").unwrap();
+        assert_eq!(
+            git_dirty_paths(&d.path().join("src")),
+            Some(BTreeSet::from(["lib.rs".to_owned()]))
+        );
+        let outside = tempdir().unwrap();
+        assert_eq!(git_dirty_paths(outside.path()), None);
+    }
+
+    #[test]
+    fn status_staleness_agrees_with_the_freshness_comparison() {
+        let d = git_fixture();
+        let mut service = Service::open(d.path()).unwrap();
+        assert_eq!(
+            service.status().unwrap()["freshness_reason"],
+            "never_published"
+        );
+        service.refresh(None).unwrap();
+        assert_eq!(service.status().unwrap()["freshness_reason"], "ok");
+        fs::write(d.path().join("src/lib.rs"), "pub fn edited() {}\n").unwrap();
+        let status = service.status().unwrap();
+        assert_eq!(status["stale"], true);
+        assert_eq!(status["freshness_reason"], "worktree_changed");
+        let summary = service.refresh(None).unwrap();
+        assert_eq!(summary["mode"], "incremental");
+        assert_eq!(summary["changed_inputs"], 1);
+        assert_eq!(service.status().unwrap()["stale"], false);
+        let unchanged = service.refresh(None).unwrap();
+        assert_eq!(unchanged["mode"], "unchanged");
+        assert_eq!(unchanged["published"], false);
+        assert_eq!(unchanged["generation"], summary["generation"]);
+        assert!(unchanged["embeddings"].is_null());
+        service
+            .db
+            .execute(
+                "UPDATE metadata SET value='8' WHERE key='indexer_version'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            service.status().unwrap()["freshness_reason"],
+            "indexer_outdated"
+        );
+        assert_eq!(service.refresh(None).unwrap()["mode"], "full");
+        assert_eq!(service.status().unwrap()["freshness_reason"], "ok");
+        // A store written before the dirty-input set was recorded falls back
+        // to a full comparison and records the set on its next refresh.
+        service
+            .db
+            .execute(
+                "DELETE FROM metadata WHERE key='indexed_worktree_inputs'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(service.status().unwrap()["stale"], false);
+        service.refresh(None).unwrap();
+        assert_eq!(
+            service.stored_worktree_inputs().unwrap(),
+            Some(BTreeSet::from([
+                "Cargo.lock".to_owned(),
+                "src/lib.rs".to_owned()
+            ]))
+        );
+    }
+
+    #[test]
+    fn identical_content_has_one_identity_whether_tracked_or_not() {
+        let d = git_fixture();
+        let committed = index_inputs(d.path());
+        assert!(committed["src/lib.rs"].1.starts_with("git:"));
+        let original = fs::read_to_string(d.path().join("src/lib.rs")).unwrap();
+        fs::write(d.path().join("src/copy.rs"), &original).unwrap();
+        fs::write(d.path().join("src/lib.rs"), "pub fn dirty() {}\n").unwrap();
+        fs::write(d.path().join("src/lib.rs"), &original).unwrap();
+        let inputs = index_inputs(d.path());
+        assert_eq!(inputs["src/copy.rs"].1, committed["src/lib.rs"].1);
+        assert_eq!(inputs["src/lib.rs"], committed["src/lib.rs"]);
     }
 
     #[test]
@@ -7896,6 +9949,8 @@ mod tests {
             priority: "normal".into(),
             status: status.into(),
             expires_at: expires_at.map(str::to_owned),
+            supersedes: vec![],
+            recorded_by: String::new(),
         };
         let error = service
             .record_steering(steering("enabled", None))
@@ -7915,7 +9970,7 @@ mod tests {
             .unwrap();
         assert!(service.decision_list("", None, 200).unwrap().is_empty());
         assert_eq!(
-            service.steering_list(None, 200).unwrap()["steerings"]
+            service.steering_list(None, None, 200).unwrap()["steerings"]
                 .as_array()
                 .map(Vec::len),
             Some(1)
@@ -7976,14 +10031,19 @@ mod tests {
             service.record_decision(global).unwrap();
         }
         let tight = service.consult("anything at all", 250).unwrap();
-        assert_eq!(tight["context_budget"]["truncated"], true);
+        let budget = &tight["context_budget"];
+        assert_eq!(budget["truncated"], true);
+        assert!(budget["serialized_bytes"].as_u64().unwrap() <= 1_000);
+        // Decisions that do not fit in full are compacted before any is dropped.
+        let reduced = budget["omitted"]["decisions"].as_u64().unwrap()
+            + budget["compacted"]["decisions"].as_u64().unwrap_or(0);
+        assert!(reduced >= 1, "{budget}");
         assert!(
-            tight["context_budget"]["omitted"]["decisions"]
-                .as_u64()
+            budget["fetch_more"]["decisions"]
+                .as_str()
                 .unwrap()
-                >= 1
+                .contains("decision.list")
         );
-        assert!(tight["decisions"].as_array().unwrap().len() < 6);
         let generous = service.consult("anything at all", 20_000).unwrap();
         assert_eq!(generous["context_budget"]["truncated"], false);
         assert_eq!(generous["context_budget"]["omitted"]["decisions"], 0);
@@ -8012,6 +10072,11 @@ mod tests {
                     "UPDATE decisions SET status='superseded' WHERE id='DEC-0001'",
                     [],
                 )
+                .unwrap();
+            // Stores written before the migration stamp carry none.
+            service
+                .db
+                .execute("DELETE FROM metadata WHERE key='schema_fingerprint'", [])
                 .unwrap();
         }
         let service = Service::open(d.path()).unwrap();

@@ -20,17 +20,15 @@ rand = "0.9"
 regex = "1.11"
 proc-macro2 = { version = "1.0", features = ["span-locations"] }
 rmcp = { version = "3.1", features = ["transport-io"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 schemars = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 syn = { version = "2.0", features = ["full", "visit"] }
 tokio = { version = "1.47", features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
 walkdir = "2.5"
+tempfile = "3.15"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1", features = ["process"] }
-
-[dev-dependencies]
-tempfile = "3.15"

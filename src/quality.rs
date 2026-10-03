@@ -406,7 +406,11 @@ impl Service {
         }))
     }
 
-    pub fn problem_record(&self, mut input: ProblemInput) -> Result<Value> {
+    pub fn problem_record(&self, input: ProblemInput) -> Result<Value> {
+        self.with_memory_write(|| self.problem_record_inner(input))
+    }
+
+    fn problem_record_inner(&self, mut input: ProblemInput) -> Result<Value> {
         ensure!(
             !input.report.trim().is_empty(),
             "problem report must not be empty"
@@ -453,7 +457,7 @@ impl Service {
                 "UPDATE problem_records SET updated_at=?1 WHERE id=?2",
                 params![Utc::now().to_rfc3339(), id],
             )?;
-            self.rebuild_search_index()?;
+            self.refresh_memory_search_rows()?;
             return Ok(json!({
                 "problem": self.problem_resource(&id)?,
                 "constraint": self.constraint_for_problem(&id)?,
@@ -479,7 +483,7 @@ impl Service {
         self.insert_problem_occurrence(&id, &report, &input.evidence)?;
         self.insert_problem_links(&id, &input.related, "related")?;
         let constraint = self.propose_constraint_from_problem(&id)?;
-        self.rebuild_search_index()?;
+        self.refresh_memory_search_rows()?;
         Ok(json!({
             "problem": self.problem_resource(&id)?,
             "constraint": constraint,
@@ -489,6 +493,10 @@ impl Service {
     }
 
     pub fn problem_update(&self, id: &str, patch: &Value) -> Result<Value> {
+        self.with_memory_write(|| self.problem_update_inner(id, patch))
+    }
+
+    fn problem_update_inner(&self, id: &str, patch: &Value) -> Result<Value> {
         let current = self.problem_resource(id)?;
         validate_patch_keys(
             patch,
@@ -551,7 +559,7 @@ impl Service {
                 .collect::<Vec<_>>();
             self.insert_problem_links(id, &ids, "related")?;
         }
-        self.rebuild_search_index()?;
+        self.refresh_memory_search_rows()?;
         Ok(json!({"problem":self.problem_resource(id)?,"snapshot":self.snapshot()}))
     }
 
@@ -574,13 +582,21 @@ impl Service {
         Ok(json!({"query":query,"problems":records,"snapshot":self.snapshot()}))
     }
 
-    pub fn quality_constraint_propose(&self, mut input: QualityConstraintInput) -> Result<Value> {
+    pub fn quality_constraint_propose(&self, input: QualityConstraintInput) -> Result<Value> {
+        self.with_memory_write(|| self.quality_constraint_propose_inner(input))
+    }
+
+    fn quality_constraint_propose_inner(&self, mut input: QualityConstraintInput) -> Result<Value> {
         input.scope.normalize();
         input.exclusions.normalize();
         self.insert_constraint(input)
     }
 
     pub fn quality_constraint_update(&self, id: &str, patch: &Value) -> Result<Value> {
+        self.with_memory_write(|| self.quality_constraint_update_inner(id, patch))
+    }
+
+    fn quality_constraint_update_inner(&self, id: &str, patch: &Value) -> Result<Value> {
         let current = self.quality_constraint_resource(id)?;
         validate_patch_keys(
             patch,
@@ -670,11 +686,24 @@ impl Service {
             params![rule,category,status,serde_json::to_string(&scope)?,serde_json::to_string(&exclusions)?,activation.to_string(),serde_json::to_string(&redact_recipe(recipe))?,enforcement,confidence,maturity,expires_at,invalidation.to_string(),self.revision().workspace_digest,Utc::now().to_rfc3339(),id],
         )?;
         self.cancel_inactive_obligations()?;
-        self.rebuild_search_index()?;
+        self.refresh_memory_search_rows()?;
         Ok(json!({"constraint":self.quality_constraint_resource(id)?,"snapshot":self.snapshot()}))
     }
 
     pub fn quality_constraint_review(
+        &self,
+        id: &str,
+        decision: &str,
+        reviewed_by: &str,
+        note: &str,
+        enforcement: Option<&str>,
+    ) -> Result<Value> {
+        self.with_memory_write(|| {
+            self.quality_constraint_review_inner(id, decision, reviewed_by, note, enforcement)
+        })
+    }
+
+    fn quality_constraint_review_inner(
         &self,
         id: &str,
         decision: &str,
@@ -695,9 +724,8 @@ impl Service {
         if let Some(enforcement) = enforcement {
             patch["enforcement"] = json!(enforcement);
         }
-        let transaction = self.db.unchecked_transaction()?;
         self.quality_constraint_update(id, &patch)?;
-        transaction.execute(
+        self.db.execute(
             "INSERT INTO quality_constraint_reviews(constraint_id,decision,reviewed_by,note,created_at) VALUES (?1,?2,?3,?4,?5)",
             params![
                 id,
@@ -707,7 +735,6 @@ impl Service {
                 Utc::now().to_rfc3339()
             ],
         )?;
-        transaction.commit()?;
         Ok(json!({
             "constraint": self.quality_constraint_resource(id)?,
             "review": {"decision":decision,"reviewed_by":redact_text(reviewed_by.trim())},
@@ -716,6 +743,10 @@ impl Service {
     }
 
     pub fn quality_constraint_merge(&self, source: &str, target: &str) -> Result<Value> {
+        self.with_memory_write(|| self.quality_constraint_merge_inner(source, target))
+    }
+
+    fn quality_constraint_merge_inner(&self, source: &str, target: &str) -> Result<Value> {
         ensure!(source != target, "cannot merge a constraint into itself");
         self.quality_constraint_resource(source)?;
         self.quality_constraint_resource(target)?;
@@ -728,7 +759,7 @@ impl Service {
             params![target,Utc::now().to_rfc3339(),source],
         )?;
         self.cancel_inactive_obligations()?;
-        self.rebuild_search_index()?;
+        self.refresh_memory_search_rows()?;
         Ok(
             json!({"source":self.quality_constraint_resource(source)?,"target":self.quality_constraint_resource(target)?,"snapshot":self.snapshot()}),
         )
@@ -782,6 +813,10 @@ impl Service {
     }
 
     pub fn quality_validation_record(&self, input: ValidationOutcomeInput) -> Result<Value> {
+        self.with_memory_write(|| self.quality_validation_record_inner(input))
+    }
+
+    fn quality_validation_record_inner(&self, input: ValidationOutcomeInput) -> Result<Value> {
         validate_choice(
             "validation status",
             &input.status,
@@ -1096,7 +1131,7 @@ impl Service {
                 params![problem_id, id],
             )?;
         }
-        self.rebuild_search_index()?;
+        self.refresh_memory_search_rows()?;
         Ok(
             json!({"constraint":self.quality_constraint_resource(&id)?,"deduplicated":false,"snapshot":self.snapshot()}),
         )

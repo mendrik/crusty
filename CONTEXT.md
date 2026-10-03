@@ -18,6 +18,10 @@ _Avoid_: File lock, deletion proof, merge conflict
 A proposed grouping of a session's owned changes into cohesive commits, bound to the observed branch, head, and file contents.
 _Avoid_: Staging area, completed commit, work chunk
 
+**Implicit commit session**:
+The ephemeral coding session Crusty registers for a single agent's commit plan when no other session is active; it owns exactly the planned paths and ends with the delivery.
+_Avoid_: Anonymous session, bypassed ownership
+
 **Work chunk**:
 A coherent deliverable connecting accepted intent, participating sessions, commits, verification evidence, and its eventual pull request.
 _Avoid_: Finding, single commit, arbitrary batch
@@ -77,7 +81,7 @@ The last atomically committed derived-index generation available to readers.
 _Avoid_: Latest source, refresh result
 
 **Freshness envelope**:
-The live and indexed revisions, generation, backend, staleness, and confidence attached to an answer.
+The live and indexed revisions, generation, backend, staleness with its reason, refresh activity, and confidence attached to an answer. Staleness compares live index inputs with those the published generation indexed, not whether the worktree is clean.
 _Avoid_: Cache status, version
 
 **Publisher lease**:
@@ -96,6 +100,18 @@ _Avoid_: Semantic proof, vector search
 The model, card version, snapshot, ranking channel, and structural evidence that explain why a repository candidate was returned.
 _Avoid_: Confidence score, proof
 
+**Semantic companion**:
+The one rust-analyzer process a Crusty server keeps for live position queries and diagnostics; it is off until `semantic.enable`, is then warmed in the background and restarted with backoff when it dies, and `semantic.disable` stops it.
+_Avoid_: Language server session, index backend
+
+**Analyzer profile**:
+The inputs whose change restarts the semantic companion: analyzer version, initialization options, toolchain, and Cargo configuration (manifests, lockfile, `.cargo/config`, toolchain files). Source contents are not part of it; edits are synchronised into the running companion.
+_Avoid_: Semantic snapshot, workspace fingerprint
+
+**Captured diagnostics**:
+Diagnostics the semantic companion published, kept per file with the document version and content hash they describe, so each is labelled fresh, stale, unconfirmed, or pending against the file on disk.
+_Avoid_: Compiler result, verification
+
 **Repository consultation**:
 A bounded, read-only briefing of global and topical repository guidance requested before an attached agent plans, answers, or acts.
 _Avoid_: Change preparation, repository search
@@ -107,16 +123,24 @@ A human architectural decision recorded in the ledger; only an `accepted` decisi
 _Avoid_: Inference, finding, suggestion
 
 **Supersession**:
-The human act of recording a new decision that replaces one or more accepted decisions, closing each with its actor and history.
+The human act of recording a new decision or steering that replaces one or more governing records of the same kind, closing each with its actor and history.
 _Avoid_: Compaction, automatic sweep, contradiction detection
 
 **Retirement**:
-The human act of closing an accepted decision without a replacement; the record stays in the ledger as history.
+The human act of closing an accepted decision or active steering without a replacement; the record stays in the ledger as history.
 _Avoid_: Deletion, archive, cleanup
 
 **Steering**:
-A durable human instruction with a scope, priority, and optional expiry that shapes later changes.
+A durable human instruction with a scope, priority, and optional expiry that shapes later changes; only an active, unexpired steering governs.
 _Avoid_: Prompt, hint, decision
+
+**Steering scope**:
+The paths, symbols, or concepts a steering governs. A path scope applies to its ancestors and descendants, never to sibling paths that merely share directory names; an empty scope applies everywhere.
+_Avoid_: Tag, keyword
+
+**Stale reference**:
+A repository path named by a steering or decision that no longer exists; it is a prompt to ask a human to retire or supersede the record, never a reason for an agent to do so itself.
+_Avoid_: Broken link, automatic cleanup
 
 ### Research and decisions
 
